@@ -91,3 +91,32 @@ test('reads HTTP repository indexes and rejects oversized responses', async () =
     await assert.rejects(registerPlugin(context.db, { url: `http://127.0.0.1:${address.port}/large` }), /too large/);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await context.close(); }
 });
+
+test('uses embedded URL credentials for HTTP authentication and preserves registered URLs', async () => {
+  const context = await setup();
+  const requests: { path: string | undefined; authorization: string | undefined }[] = [];
+  const pluginUrl = 'https://x-access-token:sample-token@example.com/plugin.js';
+  const server = createServer((request, response) => {
+    requests.push({ path: request.url, authorization: request.headers.authorization });
+    if (request.headers.authorization !== `Basic ${Buffer.from('x-access-token:sample@token:/+').toString('base64')}`) {
+      response.writeHead(401).end(); return;
+    }
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify([{ ...source('private'), url: pluginUrl }]));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  try {
+    const url = `http://x-access-token:${encodeURIComponent('sample@token:/+')}@127.0.0.1:${address.port}/index.json`;
+    const registered = await registerPlugin(context.db, { url });
+    assert.equal(registered.url, url);
+    assert.equal(registered.sources[0].url, pluginUrl);
+    assert.equal(requests[0].path, '/index.json');
+    assert.equal(listPlugins(context.db)[0].url, url);
+    assert.equal((await registerPlugin(context.db, { url })).id, registered.id);
+    await assert.rejects(registerPlugin(context.db, { url: `http://127.0.0.1:${address.port}/index.json` }), /HTTP 401/);
+    await assert.rejects(registerPlugin(context.db, { url: 'ftp://user:password@example.com/index.json' }), /HTTP\(S\)/);
+    assert.equal(listPlugins(context.db).length, 1);
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await context.close(); }
+});

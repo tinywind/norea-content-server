@@ -51,8 +51,8 @@ export function listPlugins(db: DatabaseSync): RegisteredPlugin[] {
 function httpUrl(value: string): string {
   let url: URL;
   try { url = new URL(value); } catch { throw problem(400, 'Repository and plugin URLs must be absolute HTTP(S) URLs.'); }
-  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
-    throw problem(400, 'Repository and plugin URLs must use HTTP(S) without embedded credentials.');
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw problem(400, 'Repository and plugin URLs must use HTTP(S).');
   }
   url.hash = '';
   return url.href;
@@ -86,7 +86,15 @@ async function readRepository(location: string): Promise<string> {
       return buffer.subarray(0, length).toString('utf8');
     } finally { await file.close(); }
   }
-  const response = await fetch(location, { signal: AbortSignal.timeout(15_000), headers: { accept: 'application/json' } });
+  const url = new URL(location);
+  const headers: Record<string, string> = { accept: 'application/json' };
+  if (url.username || url.password) {
+    const credentials = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
+    headers.authorization = `Basic ${Buffer.from(credentials).toString('base64')}`;
+    url.username = '';
+    url.password = '';
+  }
+  const response = await fetch(url, { signal: AbortSignal.timeout(15_000), headers });
   if (!response.ok) { await response.body?.cancel(); throw problem(400, `Repository returned HTTP ${response.status}.`); }
   if (Number(response.headers.get('content-length')) > MAX_INDEX_BYTES) {
     await response.body?.cancel();
