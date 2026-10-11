@@ -2,9 +2,9 @@
 
 Date: 2026-10-11
 
-Status: design draft for review. This document records the agreed direction,
-proposed behavior, and remaining decisions. It does not describe an implemented
-service or authorize implementation.
+Status: approved design direction. This document records the accepted product,
+storage, synchronization, and deployment decisions. Detailed wire schemas belong
+in the implementation plan. The service has not been implemented.
 
 Repository: <https://github.com/tinywind/norea-content-server>
 
@@ -40,16 +40,16 @@ content that no participating device has acquired and uploaded.
 - Use cross-device content identities instead of local database row IDs.
 
 A public source repository does not determine the deployed server's network
-exposure or access policy. Whether downloads require authentication remains an
-explicit deployment and product decision.
+exposure. Anonymous catalog access and downloads are enabled by default; operators
+can disable anonymous reading to require authentication.
 
 ## Boundaries
 
 The server owns the shared catalog, completed content packages, account reading
-state, and synchronization changes. A minimal implementation can use a metadata
-database and a filesystem package store. The implementation language, framework,
-database engine, authentication mechanism, and deployment packaging are not yet
-selected.
+state, and synchronization changes. Implement it in TypeScript with Fastify,
+SQLite for metadata, and a filesystem package store. The initial deployment is a
+single server instance distributed as a Linux Docker image with a persistent data
+volume. This server target does not change Norea's supported app platforms.
 
 The Norea app owns source access, local imports, local storage, reading, and the
 sync client. Source plugins continue to acquire content through Norea's existing
@@ -66,6 +66,25 @@ matching of works from different sites, and synchronization of the entire app
 database or all app settings. Independent backups remain necessary because
 synchronization can propagate unwanted changes and the server can lose data.
 
+## Accounts and access
+
+| Operation | Permission |
+| --- | --- |
+| Browse the catalog and download content | Anonymous by default; authenticated when anonymous reading is disabled |
+| Upload content | Authenticated member |
+| Read or change library membership, progress, read status, and bookmarks | The owning account |
+| Delete shared content or change its default revision | Administrator |
+| Provision accounts or reset passwords | Administrator |
+
+Provision accounts through an administrator or an administrator-controlled
+invitation. The first version excludes open registration, email delivery, and
+social login. Password recovery uses an administrator reset.
+
+Issue a separate authenticated session to each device so a lost device's session
+can be revoked independently. Use HTTPS for external connections. Expired or
+revoked sessions stop authenticated synchronization, not access to content already
+stored on that device. Source-site credentials are never server credentials.
+
 ## Data ownership
 
 | Data | Scope | Behavior |
@@ -75,58 +94,77 @@ synchronization can propagate unwanted changes and the server can lose data.
 | Downloaded files, local paths, storage usage, download selection | Device | Independently managed on each device |
 | Pending transfers, credentials, local database IDs | Device | Never treated as shared content |
 
-Account-scoped library membership and bookmarks are proposed alongside reading
-position; reading position isolation is an explicit requirement. Device-specific
-reader appearance settings should remain local in the first version.
+Library membership, reading position, read status, and bookmarks are all part of
+the first version. Reader appearance settings, including fonts, margins, and
+orientation, remain local, as do automatic download selections.
 
 Content access must not expose another account's reading records. A shared content
 package contains no account state, source credentials, or device-specific paths.
-Signing in must not silently replace existing offline reading state; the initial
-association of local state with an account needs a defined merge flow.
+At first sign-in, offer an explicit choice between merging existing local reading
+state and using server reading state. Do not upload existing local records before
+that choice. Switching accounts must not merge the previous account's state into
+the new account. These choices concern personal records, not deletion of local
+content files.
 
 ## Content identity and revisions
 
 Use separate identities for the logical work, logical chapter, and content
 revision. Local numeric database IDs are only mappings within a device.
 
-For source content, the proposed external identity is a stable source namespace
+For source content, the external identity is a stable source namespace
 plus the source's work ID, followed by its chapter ID. Where a plugin supplies no
 stable ID, use its existing work or chapter path as the fallback. A display name,
 chapter number, or sanitized storage directory is not a reliable identity.
 
-Initially, existing plugin IDs can help identify the source namespace, but plugin
-renames and site domain changes need explicit aliases or migrations. Do not
-silently strip URL components or merge similarly named works. Source identity
-extraction must be defined with the Norea plugin contract before implementation.
+Keep the source namespace separate from display names and current domains.
+Existing plugin IDs can seed the namespace; preserve that identity through domain
+changes and provide explicit aliases for plugin replacements or renames. Do not
+silently strip URL components or merge similarly named works. Document the exact
+identity fields and path fallback behavior with the Norea plugin contract during
+implementation planning.
 
 For local imports, the original file's SHA-256 digest detects identical imported
 files. A work and its extracted chapters also need identities that survive
 reordering. Derive initial chapter identity from a stable entry in the imported
 file where available, then preserve it. Independent imports with different file
-bytes remain distinct unless the user explicitly associates them.
+bytes remain distinct. Automatic recognition of a revised local book is outside
+the first version.
 
 Represent a changed body or asset set as a new revision of the same chapter.
 Reading state continues to refer to the logical chapter, with the content revision
 recorded when necessary to interpret its position. Do not overwrite one complete
-revision with a different upload solely because it arrived later.
+revision with a different upload solely because it arrived later. The first
+complete revision becomes the default for new downloads. Further revisions are
+retained, and only an administrator can select a different default. A default
+change does not automatically replace content already downloaded to a device.
 
-A canonical manifest of relative file names, sizes, and content hashes can
-identify a revision. The ZIP itself has a separate checksum for transfer
-verification: ZIP timestamps or entry ordering can change its bytes without
-changing the underlying content. Manifest serialization and identity versions
-must be specified before interoperable clients are implemented.
+A canonical manifest of relative file names, sizes, and content hashes identifies
+a revision. Use RFC 8785 JSON canonicalization and SHA-256 for the content
+manifest. Exclude uploader identity, transfer timestamps, and other operational
+metadata from the content digest. The ZIP itself has a separate checksum for
+transfer verification: ZIP timestamps or entry ordering can change its bytes without
+changing the underlying content. Specify the exact manifest fields and file-list
+ordering in the versioned package schema before implementing interoperable clients.
 
 ## Complete ZIP packages
 
-The proposed transfer unit is one chapter with its body and required assets.
+The transfer unit is one chapter with its body and required assets.
 This avoids repackaging a whole novel when a chapter is added or changed. Local
 imports should use the same readable chapter boundary where possible; a PDF
 represented as one chapter can remain one package.
 
-Each package carries a versioned manifest, sufficient work and chapter metadata
-for restoration, the stored content type, the body, and its required assets.
-Internal references use portable relative paths. Work cover handling and any
-assets shared by multiple chapters still need a precise format decision.
+Each package carries a versioned `manifest.json`, sufficient work and chapter
+metadata for restoration, the stored content type, the body, and its required assets.
+Internal references use portable relative paths. Store work covers separately at
+work scope and cache them locally when needed. Include every asset required to
+read a chapter in that chapter's ZIP, even if another chapter uses the same asset.
+Avoid cross-package asset dependencies in the first version.
+
+Initial configurable package limits are 512 MiB of ZIP data, 2 GiB of expanded
+data, and 10,000 files. These are provisional operating defaults, not measured
+capacity claims; validate them with representative content during implementation.
+Reject an oversized package explicitly rather than truncating it or accepting a
+partial chapter.
 
 Publication follows this sequence:
 
@@ -141,8 +179,10 @@ Publication follows this sequence:
 Readers must never discover a package that has only partially uploaded. A repeated
 upload of the same revision must be safe and must not create duplicate chapters.
 Interrupted or rejected uploads stay unpublished and can be retried or cleaned up.
-The specific byte-resume protocol is not selected; retry safety is required even
-if the first implementation restarts an individual package transfer.
+The first version restarts an interrupted upload of an individual ZIP. Downloads
+support resuming from an offset only after confirming that the stored partial
+download belongs to the same immutable ZIP. If that cannot be confirmed, restart
+the download. Retrying the same revision remains idempotent.
 
 Downloading follows the same completion boundary: receive into temporary storage,
 verify, install the body and assets, then mark the chapter locally available.
@@ -165,13 +205,13 @@ A server lookup has a bounded wait so an unavailable server does not stall sourc
 acquisition. Once a valid local copy exists, the reader must not stream its normal
 content from the server or require the server to renew access to that copy.
 
-The proposed sync loop exchanges catalog changes and account state independently
+The sync loop exchanges catalog changes and account state independently
 from large packages. It uses persistent pending operations, idempotent writes,
 and a server change cursor so reconnecting does not require transferring every
 file. An empty response or connection failure is never interpreted as deletion.
 
-Synchronize on explicit request and suitable app activity or reconnection. Do not
-promise continuous synchronization while a mobile app is suspended. Persist enough
+Synchronize on explicit request, app startup, foreground return, and reconnection.
+Do not promise continuous synchronization while a mobile app is suspended. Persist enough
 state to recover after the app or device restarts, and make pending or failed
 work visible without interrupting reading.
 
@@ -192,24 +232,32 @@ failed. A cached server availability indicator must not imply a live guarantee.
 | Remove from my library | Change account membership; do not delete shared content |
 | Delete server copy | Remove server availability; leave existing device copies intact |
 
-The proposed UI offers `Remove download from this device` when content is local,
+The UI offers `Remove download from this device` when content is local,
 and a distinct `Delete server copy` action when permitted. A second tap on an
 unchanged button must not silently escalate local removal into shared deletion.
 Server deletion should explain that other users will lose the ability to obtain
 that server copy. Deleting every device's copy is outside the initial scope.
 
-Restricting shared deletion to administrators is the initial recommendation, not
-an approved access-control decision. Download permission must not imply shared
-deletion permission.
+Only administrators can delete shared content. Support deleting an individual
+chapter or a whole work. Existing device copies and personal reading records
+remain intact. Download permission never implies shared deletion permission.
 
 Server deletion creates a persistent deletion record. Old queued uploads and
 devices returning after a long offline period must not resurrect the content.
-Republication requires an explicit operation against the current deletion state.
-Deletion must also invalidate any pending publication for the affected item.
+Republication requires an explicit administrator restoration or permission to
+re-upload against the current deletion state. Deletion must also invalidate any
+pending publication for the affected item.
 
-Logical unavailability can precede physical file cleanup. Retention, revision
-purging, and deletion-record lifetime must be defined together; removing a
-deletion record too early can allow a stale device to restore deleted content.
+Deletion blocks new downloads immediately and retains the files in a trash area
+for 30 days by default. An administrator can permanently delete the files earlier.
+Retain the small deletion record indefinitely, including after the files are
+purged, so a stale device cannot resurrect the content.
+
+Do not automatically purge older revisions of otherwise available content in the
+first version. Administrators can inspect storage usage and explicitly remove
+obsolete revisions. Deleted revisions must remain protected against stale
+re-uploads. Storage exhaustion rejects new uploads instead of silently evicting
+existing content. File cleanup must respect an active backup snapshot.
 
 ## Account reading state and conflicts
 
@@ -222,17 +270,27 @@ progress percentage. Rereading and moving backward are valid actions. Device
 clocks and server arrival order alone also cannot reliably establish reading order
 after independent offline sessions.
 
-The proposed policy is to apply causally newer changes automatically and preserve
-concurrent reading positions for a user choice. A small versioned state protocol
-should be evaluated before introducing a general collaboration framework. The
-exact conflict representation remains an implementation prerequisite.
+Attach the last server state version observed by the device to each change.
+Apply one-sided changes automatically and merge changes to independent items.
+When devices concurrently change the reading position of the same work, retain
+both candidates and let the user choose when opening that work. Present the
+device associated with each candidate. Use a small versioned-state protocol;
+a general CRDT synchronization framework is outside the first version.
+
+Merge library membership and bookmarks per item. Concurrent addition and removal
+of the same item resolve to removal; a subsequent explicit addition is allowed.
+Preserve conflicting read/unread changes separately for resolution. In particular,
+an old automatic completion record must not erase an explicit unread action.
+Detailed operation schemas must distinguish concurrency from later intentional
+changes and handle repeated operations without creating new conflicts.
 
 Receiving a remote position must not move an actively displayed chapter without
 the user's action. Offer to continue from the other device when appropriate.
-Use a content-relative locator rather than a viewport page number where possible,
-since layout differs between a PC and tablet. When a content revision changes,
-validate the locator and use a defined fallback instead of claiming exact
-position restoration. Read status and bookmarks need their own merge rules.
+For HTML and text, store paragraph identity information and an offset within the
+paragraph. For PDF, store the document page and a position within that page. These
+locators must not depend on viewport pagination. Include the content revision
+with the position. If a changed revision prevents exact restoration, fall back to
+chapter progress and disclose that the restored position is approximate.
 
 ## Protocol and compatibility
 
@@ -241,25 +299,48 @@ backup ZIP format. Reuse existing storage and media handling where appropriate,
 but do not synchronize a live database or treat a full backup as the incremental
 sync protocol.
 
-Version the package format and API behavior explicitly. Unsupported versions must
-produce a clear sync error while local reading continues. Define the supported
-app/server combinations before release. App-side data changes must also follow
-Norea's active release-line compatibility policy.
+Use a REST API under `/api/v1` with explicit request and response schemas and an
+independently versioned package format starting with `packageVersion: 1`. Query
+supported protocol versions, package versions, and capabilities when connecting.
+Unsupported versions must produce a clear sync error while local reading
+continues. Publish the supported app/server combinations before release.
+App-side data changes must also follow Norea's active release-line compatibility
+policy.
 
 The protocol needs operations for server capabilities, shared catalog changes,
 complete package publication and retrieval, explicit deletion and republication,
-and account-scoped reading-state changes. Endpoint names and detailed request
-schemas are deferred until identity, authentication, and conflict rules are
-approved.
+and account-scoped reading-state changes. Define endpoint names and detailed
+schemas during implementation planning using the decisions in this document.
+
+## Deployment and operations
+
+Run a single Fastify instance with SQLite metadata and ZIP files on persistent
+storage. Stream large transfers between disk and network rather than buffering
+entire packages in memory. Do not add Redis, a separate queue service, or an S3
+dependency to the first version. Reconsider a client/server database such as
+PostgreSQL if deployment later requires multiple server instances or substantial
+concurrent writes.
+
+Enforce a server-wide storage limit and per-account limits on new upload data.
+An exhausted limit leaves existing content available and holds or rejects new
+uploads with a clear reason. Specific quota values depend on the deployment;
+they are separate from the package validation limits.
+
+Back up a consistent SQLite snapshot together with every ZIP and work cover it
+references. Use the SQLite backup API or an equivalent consistent snapshot
+mechanism instead of copying a live database file directly. Coordinate package
+publication and cleanup with the snapshot so referenced files remain available
+until backup completion. Keep backups independently of the live data volume and
+verify restoration before release.
 
 ## Initial delivery scope
 
-The proposed first usable version connects each app profile to one server, supports
+The first usable version connects each app profile to one server, supports
 accounts with multiple devices, transfers complete chapter packages, discovers
-shared catalog content, and synchronizes personal reading position. It includes
-explicit local removal, controlled server deletion, and recovery from interrupted
-work. Account library membership and bookmarks should be confirmed before fixing
-the first release scope.
+shared catalog content, and synchronizes personal reading position, read status,
+library membership, and bookmarks. It includes explicit local removal, controlled
+server deletion, and recovery from interrupted
+work. Reader appearance and download selection remain device-local.
 
 Implementation should first prove complete package transfer and offline reading,
 then account-state convergence and conflict handling. These are delivery steps
@@ -287,24 +368,47 @@ within the design, not a commitment to ship incomplete behavior as complete.
    paths, including when the original source plugin is unavailable.
 10. Server downtime, storage exhaustion, authentication failure, corrupt packages,
     and unsupported versions leave local reading usable and report sync status.
+11. Anonymous readers can browse and download by default but cannot upload,
+    change account records, or delete shared content. Disabling anonymous reading
+    requires authentication for catalog access and downloads.
+12. An interrupted download resumes only against the same ZIP. An interrupted
+    upload restarts safely. Package limits reject excess data without publishing
+    incomplete content.
+13. An administrator can change a chapter's default revision without replacing
+    device copies. Changed content uses an explicitly approximate position when
+    its original locator cannot be restored.
+14. Server deletion enters the 30-day trash period. Permanent file removal retains
+    deletion records, and explicit administrator restoration permits republication.
+15. First sign-in respects the selected local/server merge behavior. Switching
+    accounts and revoking one device session do not leak personal records or
+    prevent local reading.
+16. Concurrent membership or bookmark addition/removal resolves to removal, while
+    a later explicit addition succeeds. An old automatic completion record does
+    not overwrite a deliberate unread action.
+17. A restored backup contains every package and cover referenced by its database
+    snapshot, including when publication or cleanup was active during backup.
 
 These are planned acceptance checks. No server implementation or runtime
 validation has been performed for this document.
 
-## Decisions required before implementation
+## Implementation planning details
 
-- Access model: anonymous content downloads or authenticated readers; who can
-  upload; administrator-only shared deletion; account provisioning and recovery.
-- Identity contract: source namespaces, path fallback rules, source renames, and
-  stable identities for chapters created from local imports.
-- Package contract: manifest serialization, content locators, work covers,
-  supported asset references, size limits, and revision retention.
-- Reading-state contract: causal versions, concurrent-change choices, bookmark
-  and read-status merging, and first sign-in with existing local state.
-- Deletion contract: chapter versus whole-work operations, revision deletion,
-  explicit republication, and deletion-record retention.
-- Operational choices: implementation stack, deployment target, transport and
-  credential handling, quotas, server backups, and client/server version support.
+The product decisions above are accepted. The implementation plan still needs
+concrete contracts and operational configuration:
+
+- Request and response schemas, source namespace aliases, path fallback
+  encoding, local chapter IDs, and the canonical manifest field set.
+- Device session storage and expiry, password storage, administrator bootstrap,
+  account invitation/reset flow, and credential storage in the app.
+- Version preconditions, independent-item merge boundaries, conflict resolution
+  operations, and restart-safe transfer and synchronization cursors.
+- Locator encoding, cover transfer, archive validation, partial-download identity
+  checks, and recovery across filesystem/database publication boundaries.
+- Deployment-specific quota values, backup schedule and destination, and the
+  initial tested client/server compatibility matrix.
+
+These details refine the accepted behavior; they do not reopen the selected access
+model, stack, package unit, deletion scope, or first-release feature set.
 
 ## Current Norea integration references
 
@@ -323,3 +427,11 @@ references are design inputs and do not imply that synchronization exists today.
 | `docs/release-compatibility.md` | App data and release-line compatibility |
 
 Related background: [Local-first software](https://www.inkandswitch.com/essay/local-first/).
+
+Technical references:
+
+- [JSON canonicalization: RFC 8785](https://www.rfc-editor.org/info/rfc8785/)
+- [Fastify validation and serialization](https://fastify.dev/docs/latest/Reference/Validation-and-Serialization/)
+- [Fastify streaming responses](https://github.com/fastify/fastify/blob/main/docs/Reference/Reply.md)
+- [SQLite deployment guidance](https://sqlite.org/whentouse.html)
+- [SQLite backup API](https://www.sqlite.org/backup.html)
