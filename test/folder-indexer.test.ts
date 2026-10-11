@@ -9,6 +9,7 @@ import yauzl from 'yauzl';
 import { openDatabase } from '../src/db.ts';
 import { defaultLimits, deleteChapter, digest, packageStream } from '../src/packages.ts';
 import { scanFolder, type FolderIndexItem } from '../src/folder-indexer.ts';
+import { getWork } from '../src/works.ts';
 
 async function zip(entries: Record<string, string | Buffer>) {
   const archive = new ZipFile();
@@ -43,6 +44,96 @@ async function fixture() {
   const close = async () => { db.close(); await rm(temp, { recursive: true, force: true }); };
   return { temp, rootPath, dataDir, metadataDbPath, directory, db, items, run, close };
 }
+
+function workMetadata() {
+  return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/real/book?lang=ko' },
+    novel: { name: 'Portable Book', cover: 'https://example/cover.png', author: 'Writer', artist: null, summary: 'Summary', status: null, genres: null, isLocal: false },
+    chapters: [{ path: '/exact/chapter?number=1', name: 'Different name', chapterNumber: '1', position: 1, page: '1', contentType: 'html', releaseTime: null, directory: '1-First' },
+      { path: '/future', name: 'Undownloaded', chapterNumber: '2', position: 2, page: '1', contentType: 'html', releaseTime: null, directory: '2-Future' }],
+    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png' }, updatedAt: 123 };
+}
+
+test('file-only scan registers full work and cover without chapters or an app database', async () => {
+  const f = await fixture();
+  try {
+    await rm(f.directory, { recursive: true }); await rm(f.metadataDbPath);
+    const directory = join(f.rootPath, 'contents/example/Book-book');
+    await writeFile(join(directory, 'novel.json'), JSON.stringify(workMetadata())); await writeFile(join(directory, 'cover.png'), 'cover bytes');
+    const before = await snapshot(f.rootPath);
+    const result = await f.run({ metadataDbPath: undefined }); assert.equal(result.registered, 1); assert.equal(result.failed, 0); assert.equal(result.skipped, 0);
+    const id = digest(JSON.stringify(['example', '/real/book?lang=ko']));
+    const work = getWork(f.db, f.dataDir, id); assert.deepEqual(work.metadata, workMetadata()); assert.equal(work.hasCover, true);
+    assert.equal((await f.run({ metadataDbPath: undefined })).unchanged, 1); assert.equal(getWork(f.db, f.dataDir, id).sequence, work.sequence);
+    assert.deepEqual(await snapshot(f.rootPath), before);
+  } finally { await f.close(); }
+});
+
+test('novel.json identity and directories override stale DB guesses and preserve undownloaded metadata', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
+    const result = await f.run(); assert.equal(result.registered, 2);
+    const item = f.items.find(item => item.chapterId)!;
+    assert.equal(item.chapterId, digest(JSON.stringify(['example', '/real/book?lang=ko', '/exact/chapter?number=1'])));
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    const storedWork = f.db.prepare('SELECT directory FROM works').get() as { directory: string };
+    const storedChapter = f.db.prepare('SELECT directory FROM chapters').get() as { directory: string };
+    assert.equal(storedChapter.directory, join(storedWork.directory, '1-First'));
+    assert.equal(getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/real/book?lang=ko']))).metadata.chapters.length, 2);
+  } finally { await f.close(); }
+});
+
+test('invalid present novel.json never falls back to a matching app database chapter', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify({ ...workMetadata(), chapters: [{ ...workMetadata().chapters[0], directory: '../outside' }] }));
+    const result = await f.run(); assert.equal(result.registered, 0); assert.ok(result.skipped > 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+test('file metadata remains available when remote chapter media prevents a complete package', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
+    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ status: 'remote' }] } }));
+    const result = await f.run({ metadataDbPath: undefined }); assert.equal(result.registered, 1); assert.equal(result.skipped, 1);
+    assert.match(f.items.find(item => item.status === 'skipped')!.reason!, /remote assets/);
+  } finally { await f.close(); }
+});
+
+test('legacy DB-assisted scan creates portable metadata and cover without overwriting a newer server work', async () => {
+  const f = await fixture();
+  try {
+    const cover = { version: 1, sourceId: 'example', novelPath: '/book', fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png', updatedAt: 12 };
+    await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify(cover)); await writeFile(join(f.directory, '..', 'cover.png'), 'legacy image');
+    const before = await snapshot(f.rootPath);
+    assert.equal((await f.run()).registered, 1);
+    const id = digest(JSON.stringify(['example', '/book']));
+    const work = getWork(f.db, f.dataDir, id); assert.equal(work.metadata.chapters[0].path, '/first'); assert.equal(work.hasCover, true);
+    const directory = (f.db.prepare('SELECT directory FROM works WHERE id=?').get(id) as { directory: string }).directory;
+    const newer = { ...work.metadata, novel: { ...work.metadata.novel, name: 'Newer remote title' }, updatedAt: 999 };
+    await writeFile(join(f.dataDir, directory, 'novel.json'), JSON.stringify(newer));
+    await f.run(); assert.deepEqual(getWork(f.db, f.dataDir, id).metadata, newer);
+    assert.deepEqual(await snapshot(f.rootPath), before);
+  } finally { await f.close(); }
+});
+
+test('legacy work cover is registered even when no chapter directory exists', async () => {
+  const f = await fixture();
+  try {
+    await rm(f.directory, { recursive: true });
+    const directory = join(f.rootPath, 'contents/example/Book-book');
+    await writeFile(join(directory, 'cover.json'), JSON.stringify({ version: 1, fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png', updatedAt: 1 }));
+    await writeFile(join(directory, 'cover.png'), 'legacy cover');
+    const before = await snapshot(f.rootPath); let changes = 0;
+    await f.run({ onWorkChange: () => { changes++; } });
+    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
+    assert.equal(work.hasCover, true); assert.equal(work.metadata.chapters.length, 1); assert.equal(changes, 1);
+    assert.deepEqual(await snapshot(f.rootPath), before);
+  } finally { await f.close(); }
+});
 
 async function snapshot(root: string): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
@@ -138,6 +229,72 @@ test('skips missing metadata, incomplete media, and unfinished directories', asy
     await mkdir(join(f.rootPath, 'contents/example/.unfinished.tmp'), { recursive: true });
     await f.run();
     assert.ok(f.items.some(item => /unfinished/i.test(item.reason ?? '')));
+  } finally { await f.close(); }
+});
+
+test('excludes work covers and Android media markers from chapter scan results', async () => {
+  const f = await fixture();
+  try {
+    const work = join(f.rootPath, 'contents/example/Book-book');
+    for (const name of ['cover.json', 'cover.webp', 'cover.jpg', 'cover.img', '.nomedia']) {
+      await writeFile(join(work, name), name === 'cover.json' ? JSON.stringify({ version: 1, fileName: 'cover.webp', sourceId: 'example', novelPath: '/book' }) : 'cover');
+    }
+    await writeFile(join(f.rootPath, 'contents/example/.nomedia'), '');
+    const before = await snapshot(f.rootPath);
+    assert.deepEqual(await f.run(), { scanned: 1, registered: 1, unchanged: 0, skipped: 0, failed: 0, cancelled: false });
+    assert.deepEqual(f.items.map(item => item.path), [f.directory]);
+    assert.deepEqual(await snapshot(f.rootPath), before);
+  } finally { await f.close(); }
+});
+
+test('reports remote-only media before missing database identity even when the media manifest says complete', async () => {
+  const f = await fixture();
+  try {
+    await rm(join(f.directory, 'media.zip'));
+    await writeFile(join(f.directory, 'content.html'), '<img src="https://example.com/page.jpg">');
+    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ fileName: 'page.jpg', path: 'media/page.jpg', bytes: 0, status: 'remote', sourceUrl: 'https://example.com/page.jpg' }] } }));
+    const result = await f.run({ metadataDbPath: undefined });
+    assert.equal(result.registered, 0);
+    assert.equal(result.skipped, 1);
+    assert.match(f.items[0].reason!, /media.*not downloaded.*remote/i);
+  } finally { await f.close(); }
+});
+
+test('imports text-only and PDF chapter bodies without a media manifest or archive', async () => {
+  for (const contentType of ['html', 'pdf']) {
+    const f = await fixture();
+    try {
+      await rm(join(f.directory, 'manifest.json'));
+      await rm(join(f.directory, 'media.zip'));
+      await rm(join(f.directory, 'content.html'));
+      const fileName = contentType === 'pdf' ? 'content.pdf' : 'content.html';
+      const body = contentType === 'pdf' ? '%PDF-1.4\n%%EOF' : '<p>Offline text chapter</p>';
+      await writeFile(join(f.directory, fileName), body);
+      const metadata = new DatabaseSync(f.metadataDbPath);
+      metadata.prepare('UPDATE chapter SET content_type=?,stored_content_type=?').run(contentType, contentType);
+      metadata.close();
+      assert.equal((await f.run()).registered, 1, JSON.stringify(f.items));
+      const chunks: Buffer[] = [];
+      for await (const chunk of packageStream(f.db, f.dataDir, f.items[0].chapterId!).open()) chunks.push(chunk);
+      const files = await extractPackage(Buffer.concat(chunks));
+      assert.equal(files[fileName], body);
+      assert.equal(files['media-manifest.json'], undefined);
+    } finally { await f.close(); }
+  }
+});
+
+test('distinguishes missing app database identities from optional media manifests', async () => {
+  const f = await fixture();
+  try {
+    await rm(join(f.directory, 'manifest.json'));
+    await rm(join(f.directory, 'media.zip'));
+    await writeFile(join(f.directory, 'content.html'), '<p>Offline text chapter</p>');
+    const metadata = new DatabaseSync(f.metadataDbPath);
+    metadata.exec('DELETE FROM chapter'); metadata.close();
+    assert.equal((await f.run()).skipped, 1);
+    assert.match(f.items.at(-1)!.reason!, /Norea database.*no matching chapter identity/i);
+    assert.equal((await f.run({ metadataDbPath: undefined })).skipped, 1);
+    assert.match(f.items.at(-1)!.reason!, /Norea database path is not configured/i);
   } finally { await f.close(); }
 });
 

@@ -111,7 +111,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     const controller = new AbortController();
     const promise = new Promise<void>(accept => setImmediate(accept)).then(async () => {
       try {
-        job.summary = await scanFolder({ rootPath: root.path, metadataDbPath: root.metadataDbPath || undefined, dataDir, db, limits, signal: controller.signal,
+        job.summary = await scanFolder({ rootPath: root.path, metadataDbPath: root.metadataDbPath || undefined, dataDir, db, limits, signal: controller.signal, onWorkChange: context.notify,
           onItem(item: FolderIndexItem) {
             db.prepare('INSERT INTO admin_job_items(job_id,entry) VALUES(?,?)').run(job.id, JSON.stringify(item));
             job.summary.scanned++;
@@ -186,7 +186,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
   };
   app.get('/admin', async (_request, reply) => reply.redirect('/admin/'));
   for (const [url, asset] of Object.entries(assets)) app.get(url, { schema: { hide: true } }, async (_request, reply) => {
-    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+    reply.header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     reply.header('X-Content-Type-Options', 'nosniff').header('Cache-Control', 'no-store');
     try { return reply.type(asset.type).send(await readFile(asset.path)); }
     catch { return reply.code(503).type('text/plain').send('Console assets unavailable. Run pnpm build before starting the server.'); }
@@ -198,8 +198,9 @@ export async function registerAdministration(app: FastifyInstance, context: {
     api.addHook('onRoute', route => { route.schema = { ...route.schema, security: [{ bearerAuth: [] }], tags: ['Administration'] }; });
     api.get('/overview', async () => {
       const counts = db.prepare(`SELECT COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END),0) AS chapters,COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN work_id END) AS works,COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END),0) AS deletedChapters FROM chapters`).get() as object;
+      const works = (db.prepare('SELECT COUNT(*) AS n FROM (SELECT id FROM works UNION SELECT work_id FROM chapters WHERE deleted_at IS NULL)').get() as { n: number }).n;
       const packages = db.prepare("SELECT COUNT(*) AS revisions,COALESCE(SUM(json_extract(entry,'$.zipBytes')),0) AS zipBytes FROM revisions WHERE path IS NOT NULL").get() as object;
-      return { ...counts, ...packages, plugins: listPlugins(db).length, roots: roots().length, runningJobs: active.size };
+      return { ...counts, works, ...packages, plugins: listPlugins(db).length, roots: roots().length, runningJobs: active.size };
     });
     api.get('/plugins', async () => ({ items: listPlugins(db) }));
     api.post<{ Body: { url: string; name?: string } }>('/plugins', { schema: { body: { type: 'object', additionalProperties: false, required: ['url'], properties: { url: { type: 'string', minLength: 1, maxLength: 4096 }, name: { type: 'string', maxLength: 200 } } } } }, async request => registerPlugin(db, request.body));
@@ -234,9 +235,9 @@ export async function registerAdministration(app: FastifyInstance, context: {
       total: (db.prepare('SELECT COUNT(*) AS count FROM admin_job_items WHERE job_id=?').get(request.params.id) as { count: number }).count,
     }));
     api.post<{ Params: { id: string } }>('/jobs/:id/cancel', { schema: { params: identifier } }, async request => { getJob(request.params.id); const job = active.get(request.params.id); job?.controller.abort(); if (job) await job.promise; return getJob(request.params.id); });
-    api.get<{ Querystring: { search?: string; deleted?: boolean; offset: number; limit: number } }>('/chapters', { schema: { querystring: { type: 'object', properties: { ...pagination, search: { type: 'string', maxLength: 500 }, deleted: { type: 'boolean', default: false } } } } }, async request => {
-      const where = "WHERE (deleted_at IS NOT NULL)=? AND (?='' OR instr(lower(json_extract(entry,'$.manifest.novel.name') || ' ' || json_extract(entry,'$.manifest.chapter.name') || ' ' || json_extract(entry,'$.manifest.identity.pluginId')),lower(?))>0)";
-      const args = [request.query.deleted ? 1 : 0, request.query.search ?? '', request.query.search ?? ''];
+    api.get<{ Querystring: { search?: string; workId?: string; deleted?: boolean; offset: number; limit: number } }>('/chapters', { schema: { querystring: { type: 'object', properties: { ...pagination, workId: { type: 'string', pattern: '^[0-9a-f]{64}$' }, search: { type: 'string', maxLength: 500 }, deleted: { type: 'boolean', default: false } } } } }, async request => {
+      const where = "WHERE (deleted_at IS NOT NULL)=? AND (?='' OR work_id=?) AND (?='' OR instr(lower(json_extract(entry,'$.manifest.novel.name') || ' ' || json_extract(entry,'$.manifest.chapter.name') || ' ' || json_extract(entry,'$.manifest.identity.pluginId')),lower(?))>0)";
+      const args = [request.query.deleted ? 1 : 0, request.query.workId ?? '', request.query.workId ?? '', request.query.search ?? '', request.query.search ?? ''];
       const rows = db.prepare(`SELECT entry FROM chapters ${where} ORDER BY json_extract(entry,'$.manifest.novel.name'),work_id,json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string }[];
       return { items: rows.map(row => JSON.parse(row.entry) as CatalogEntry), total: (db.prepare(`SELECT COUNT(*) AS count FROM chapters ${where}`).get(...args) as { count: number }).count };
     });

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
-import { join, resolve, sep } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import { Readable, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { DatabaseSync } from 'node:sqlite';
@@ -205,7 +205,9 @@ export async function publishPackage(db: DatabaseSync, dataDir: string, input: R
       const previous = db.prepare('SELECT entry,path,deleted FROM revisions WHERE chapter_id=? AND revision=?').get(id, revision) as { entry: string; path: string | null; deleted: number } | undefined;
       if (previous?.deleted) throw problem(409, 'Revision was permanently deleted');
       if (previous?.path) return JSON.parse(previous.entry);
-      const directory = existing?.directory ?? chapterDirectory(manifest);
+      const storedWork = db.prepare('SELECT directory,entry FROM works WHERE id=?').get(work) as { directory: string; entry: string } | undefined;
+      const storedChapter = storedWork ? (JSON.parse(storedWork.entry).metadata.chapters as { path: string; directory: string }[]).find(chapter => chapter.path === manifest.identity.chapterPath) : undefined;
+      const directory = existing?.directory ?? (storedWork ? join(storedWork.directory, storedChapter?.directory ?? basename(chapterDirectory(manifest))) : chapterDirectory(manifest));
       if (!existing && db.prepare('SELECT id FROM chapters WHERE lower(directory)=lower(?) AND id<>?').get(directory, id)) throw problem(409, 'Readable chapter directory is already used by another identity');
       const file = join(directory, `${revision}.zip`);
       mkdirSync(join(dataDir, directory), { recursive: true });

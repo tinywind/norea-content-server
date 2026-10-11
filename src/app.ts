@@ -8,6 +8,7 @@ import { chapterRow, defaultLimits, deleteChapter, packageStream, publishPackage
 import type { CatalogEntry, Limits } from './packages.ts';
 import { createChangeNotifications, readChangeCursors } from './changes.ts';
 import { initializeAdministration, registerAdministration, savedAnonymousRead } from './administration.ts';
+import { rebuildWorkIndex, registerWorks } from './works.ts';
 
 const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
@@ -25,16 +26,18 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
   initializeAdministration(db);
+  try { rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
   const app = Fastify({ bodyLimit: 1024 * 1024, requestTimeout: 120000, logger: false });
   let anonymousRead = savedAnonymousRead(db, options.anonymousRead ?? true);
   const changes = createChangeNotifications(db);
-  await app.register(swagger, { openapi: { info: { title: 'Norea Content Server', version: '2.0.0' }, components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } } } });
+  await app.register(swagger, { openapi: { info: { title: 'Norea Content Server', version: '1.0.0' }, components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } } } });
   app.addContentTypeParser('application/zip', (_request, payload, done) => done(null, payload));
   app.addHook('preClose', async () => { changes.close(); });
   app.addHook('onClose', async () => { db.close(); });
   const requireRead = (request: Parameters<typeof authenticate>[1]) => { if (!anonymousRead || request.headers.authorization !== undefined) authenticate(db, request); };
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 2, packageVersion: 1, authentication: 'device-key', personalStateSync: false, anonymousRead }));
+  registerWorks(app, { db, dataDir, requireRead, notify: () => changes.notify() });
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: false, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
@@ -53,23 +56,27 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
     const items = rows.slice(0, limit).map(row => JSON.parse(row.entry) as CatalogEntry);
     return { items, cursor: items.at(-1)?.sequence ?? after, hasMore: rows.length > limit };
   });
-  app.get<{ Querystring: { catalogAfter?: number; waitSeconds?: number } }>('/api/v1/changes', { preValidation: async request => {
-    if (Object.keys(request.query).some(key => key !== 'catalogAfter' && key !== 'waitSeconds')) throw problem(400, 'Only catalogAfter and waitSeconds are accepted');
+  app.get<{ Querystring: { catalogAfter?: number; workAfter?: number; waitSeconds?: number } }>('/api/v1/changes', { preValidation: async request => {
+    if (Object.keys(request.query).some(key => !['catalogAfter', 'workAfter', 'waitSeconds'].includes(key))) throw problem(400, 'Only catalogAfter, workAfter and waitSeconds are accepted');
   }, schema: {
     security: [{ bearerAuth: [] }, {}],
     description: 'Wait up to 20 seconds for a newer durable catalog cursor. A cursor ahead of the log returns 409.',
-    querystring: { type: 'object', additionalProperties: false, properties: { catalogAfter: cursorSchema, waitSeconds: { type: 'integer', minimum: 0, maximum: 20, default: 20 } } },
-    response: { 200: { type: 'object', required: ['catalogCursor'], properties: { catalogCursor: { type: 'integer' } } } },
+    querystring: { type: 'object', additionalProperties: false, properties: { catalogAfter: cursorSchema, workAfter: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER }, waitSeconds: { type: 'integer', minimum: 0, maximum: 20, default: 20 } } },
+    response: { 200: { type: 'object', required: ['catalogCursor'], properties: { catalogCursor: { type: 'integer' }, workCursor: { type: 'integer' } } } },
   } }, async (request, reply) => {
     const authenticated = request.headers.authorization !== undefined || !anonymousRead;
     if (authenticated) authenticate(db, request);
-    const after = { catalogCursor: request.query.catalogAfter ?? 0 };
+    const after = { catalogCursor: request.query.catalogAfter ?? 0, workCursor: request.query.workAfter };
+    if (after.workCursor !== undefined) { rebuildWorkIndex(db, dataDir); changes.notify(); }
     const current = readChangeCursors(db);
     if (after.catalogCursor > current.catalogCursor) throw problem(409, 'Change cursor is ahead of the server log');
+    if (after.workCursor !== undefined && after.workCursor > current.workCursor) throw problem(409, 'Work cursor is ahead of the server log');
     const waitSeconds = request.query.waitSeconds ?? 20;
-    if (waitSeconds && current.catalogCursor === after.catalogCursor) await changes.wait(after, waitSeconds, reply.raw);
+    if (waitSeconds && current.catalogCursor === after.catalogCursor && (after.workCursor === undefined || current.workCursor === after.workCursor)) await changes.wait(after, waitSeconds, reply.raw);
     if (authenticated || !anonymousRead) authenticate(db, request);
-    return readChangeCursors(db);
+    if (after.workCursor !== undefined) { rebuildWorkIndex(db, dataDir); changes.notify(); }
+    const result = readChangeCursors(db);
+    return after.workCursor === undefined ? { catalogCursor: result.catalogCursor } : result;
   });
   app.post('/api/v1/packages', { onRequest: async request => { authenticateDevice(db, request); }, schema: { security: [{ bearerAuth: [] }], consumes: ['application/zip'], response: { 200: catalogSchema } } }, async request => {
     if (request.headers['content-type']?.split(';')[0] !== 'application/zip') throw problem(415, 'application/zip is required');

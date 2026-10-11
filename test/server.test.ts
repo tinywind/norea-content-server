@@ -42,7 +42,7 @@ test('catalog changes reject old personal cursors, invalid cursors and unavailab
     assert.equal((await s.app.inject({ url: '/api/v1/changes?catalogAfter=1&waitSeconds=0', headers })).statusCode, 409);
     assert.deepEqual((await s.app.inject({ url: '/api/v1/changes?waitSeconds=0', headers })).json(), { catalogCursor: 0 });
     const schema = (await s.app.inject('/api/v1/openapi.json')).json();
-    assert.deepEqual(schema.paths['/api/v1/changes'].get.parameters.map((parameter: { name: string }) => parameter.name).sort(), ['catalogAfter', 'waitSeconds']);
+    assert.deepEqual(schema.paths['/api/v1/changes'].get.parameters.map((parameter: { name: string }) => parameter.name).sort(), ['catalogAfter', 'waitSeconds', 'workAfter']);
     assert.ok(Object.keys(schema.paths).every(path => !/\/state|\/accounts|\/sessions/.test(path)));
   } finally { await s.close(); }
 });

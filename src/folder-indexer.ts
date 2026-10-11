@@ -9,6 +9,7 @@ import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { canonicalize } from 'json-canonicalize';
 import { digest, publishPackage, safeArchivePath, validateManifest, type Limits, type PackageManifest } from './packages.ts';
+import { coverByteLimit, metadataByteLimit, metadataWorkId, readNovelMetadata, saveWork, saveWorkCover, type NovelMetadataV1 } from './works.ts';
 
 export interface FolderIndexItem {
   path: string;
@@ -16,6 +17,7 @@ export interface FolderIndexItem {
   status: 'registered' | 'unchanged' | 'skipped' | 'failed';
   reason?: string;
   chapterId?: string;
+  workId?: string;
   revision?: string;
 }
 export interface FolderIndexSummary { scanned: number; registered: number; unchanged: number; skipped: number; failed: number; cancelled: boolean }
@@ -27,13 +29,16 @@ export interface FolderIndexOptions {
   limits: Limits;
   signal?: AbortSignal;
   onItem?: (item: FolderIndexItem) => void | Promise<void>;
+  onWorkChange?: () => void;
 }
 interface MetadataRow {
   novelId: number; chapterId: number; pluginId: string; novelPath: string; chapterPath: string;
   novelName: string; author: string | null; summary: string | null; isLocal: number;
+  cover?: string | null; artist?: string | null; status?: string | null; genres?: string | null; releaseTime?: string | null;
   chapterName: string; chapterNumber: string | null; position: number; page: string;
   contentType: PackageManifest['chapter']['contentType']; downloaded: number; repair: number;
 }
+type LegacyNovel = Pick<MetadataRow, 'novelId' | 'pluginId' | 'novelPath' | 'novelName' | 'cover' | 'author' | 'artist' | 'summary' | 'status' | 'genres' | 'isLocal'>;
 interface Snapshot { source: string; destination: string; size: number; sha256: string; signature: string }
 interface PreparedPackage { path: string; manifest: PackageManifest; snapshots: Snapshot[]; verifyInventory?: () => Promise<void> }
 const unfinished = (name: string) => name.startsWith('.') || /(?:\.tmp|\.bak|\.part|\.partial|\.norea-sync-backup)$/i.test(name);
@@ -138,8 +143,8 @@ async function verifySnapshot(files: Snapshot[], signal?: AbortSignal): Promise<
     if (size !== file.size || hash.digest('hex') !== file.sha256 || await signature(file.source) !== file.signature) fail('Source changed during indexing');
   }
 }
-async function metadataSnapshot(options: FolderIndexOptions, stage: string): Promise<{ rows: MetadataRow[] }> {
-  if (!options.metadataDbPath) return { rows: [] };
+async function metadataSnapshot(options: FolderIndexOptions, stage: string): Promise<{ rows: MetadataRow[]; novels: LegacyNovel[] }> {
+  if (!options.metadataDbPath) return { rows: [], novels: [] };
   const source = resolve(options.metadataDbPath);
   if (inside(resolve(options.dataDir), source)) fail('Metadata database overlaps server storage');
   const files = [await snapshotFile(source, join(stage, 'metadata.sqlite'), options.limits.expandedBytes, options.signal)];
@@ -154,11 +159,16 @@ async function metadataSnapshot(options: FolderIndexOptions, stage: string): Pro
   const db = new DatabaseSync(join(stage, 'metadata.sqlite'), { readOnly: true });
   try {
     db.exec('PRAGMA query_only=ON; BEGIN');
+    const novelColumns = new Set((db.prepare('PRAGMA table_info(novel)').all() as { name: string }[]).map(row => row.name));
+    const chapterColumns = new Set((db.prepare('PRAGMA table_info(chapter)').all() as { name: string }[]).map(row => row.name));
+    const optionalNovel = ['cover', 'artist', 'status', 'genres'].map(name => novelColumns.has(name) ? `n.${name}` : `NULL AS ${name}`).join(',');
+    const releaseTime = chapterColumns.has('release_time') ? 'c.release_time AS releaseTime' : 'NULL AS releaseTime';
     const rows = db.prepare(`SELECT n.id AS novelId,c.id AS chapterId,n.plugin_id AS pluginId,n.path AS novelPath,c.path AS chapterPath,
       n.name AS novelName,n.author,n.summary,n.is_local AS isLocal,c.name AS chapterName,c.chapter_number AS chapterNumber,
-      c.position,c.page,coalesce(c.stored_content_type,c.content_type) AS contentType,c.is_downloaded AS downloaded,c.media_repair_needed AS repair
+      c.position,c.page,coalesce(c.stored_content_type,c.content_type) AS contentType,c.is_downloaded AS downloaded,c.media_repair_needed AS repair,${optionalNovel},${releaseTime}
       FROM novel n JOIN chapter c ON c.novel_id=n.id`).all() as unknown as MetadataRow[];
-    db.exec('COMMIT'); return { rows };
+    const novels = db.prepare(`SELECT n.id AS novelId,n.plugin_id AS pluginId,n.path AS novelPath,n.name AS novelName,n.author,n.summary,n.is_local AS isLocal,${optionalNovel} FROM novel n`).all() as unknown as LegacyNovel[];
+    db.exec('COMMIT'); return { rows, novels };
   } finally { db.close(); }
 }
 
@@ -223,15 +233,13 @@ function convertReferences(body: string, names: Set<string>): string {
   }
   return result + body.slice(copied);
 }
-async function rawPackage(directory: string, row: MetadataRow, stage: string, options: FolderIndexOptions): Promise<PreparedPackage> {
-  if (!row.downloaded || row.repair) fail('Chapter download is incomplete or needs media repair');
-  if (!['html', 'text', 'markdown', 'pdf'].includes(row.contentType)) fail('Unsupported chapter content type');
+async function rawPackage(directory: string, row: MetadataRow | undefined, stage: string, options: FolderIndexOptions, metadataError?: string): Promise<PreparedPackage> {
   const inventory = await readdir(directory, { withFileTypes: true });
   const inventoryKey = async (path: string) => { await noLinks(path); const info = await lstat(path, { bigint: true }); return `${info.dev}:${info.ino}:${info.mtimeNs}:${info.ctimeNs}:${(await readdir(path)).sort().join('\0')}`; };
   const originalInventory = await inventoryKey(directory);
   if (inventory.some(entry => unfinished(entry.name))) fail('Unfinished chapter files are present');
   if (inventory.some(entry => entry.isSymbolicLink())) fail('Symbolic chapter files are unsupported');
-  const bodyPath = row.contentType === 'pdf' ? 'content.pdf' : 'content.html';
+  const bodyPath = row?.contentType === 'pdf' || (!row && inventory.some(entry => entry.name === 'content.pdf' && entry.isFile())) ? 'content.pdf' : 'content.html';
   if (!inventory.some(entry => entry.name === bodyPath && entry.isFile())) fail('Current chapter body is missing; legacy formats are unsupported');
   const snapshots: Snapshot[] = [];
   const portable = join(stage, 'portable'); await mkdir(portable, { recursive: true });
@@ -254,6 +262,8 @@ async function rawPackage(directory: string, row: MetadataRow, stage: string, op
     const value = JSON.parse(await readFile(snapshotManifest.destination, 'utf8'));
     if (value.version !== 1 || value.complete !== true || !Array.isArray(value.media?.files)) fail('Media manifest is incomplete or unsupported');
     if (value.media.files.length > options.limits.files - 2) fail('Media file limit exceeded');
+    const remoteFiles = value.media.files.filter((file: { status?: string } | null) => file?.status === 'remote').length;
+    if (remoteFiles) fail(`Chapter media is not downloaded: ${remoteFiles} remote assets in the media manifest`);
     const portableNames = new Set<string>();
     for (const file of value.media.files) {
       const name = file.fileName;
@@ -263,6 +273,12 @@ async function rawPackage(directory: string, row: MetadataRow, stage: string, op
     value.updatedAt = 0;
     await writeFile(join(portable, 'media-manifest.json'), canonicalize(value)); await record('media-manifest.json');
   }
+  if (media.size && !hasArchive && !hasMedia) fail('Downloaded chapter media is missing: no media.zip or media directory');
+  if (!row) return fail(metadataError ?? (options.metadataDbPath
+    ? 'Norea database has no matching chapter identity; media manifest.json contains asset metadata, not source paths'
+    : 'Norea database path is not configured; raw chapters need database identity metadata, not a media manifest'));
+  if (!row.downloaded || row.repair) fail('Chapter download is incomplete or needs media repair');
+  if (!['html', 'text', 'markdown', 'pdf'].includes(row.contentType)) fail('Unsupported chapter content type');
   if (hasArchive) {
     const archive = await snapshot('media.zip', options.limits.zipBytes); const found = new Set<string>();
     await visitZip(archive.destination, options.limits, options.signal, async (entry, stream) => {
@@ -317,11 +333,35 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
   const stage = await mkdtemp(join(dataDir, 'staging', 'folder-'));
   const report = async (item: FolderIndexItem) => { summary.scanned++; summary[item.status]++; await options.onItem?.(item); };
   try {
-    let metadata: Awaited<ReturnType<typeof metadataSnapshot>> = { rows: [] }; let metadataError: string | undefined;
+    let metadata: Awaited<ReturnType<typeof metadataSnapshot>> = { rows: [], novels: [] }; let metadataError: string | undefined;
     try { metadata = await metadataSnapshot(options, stage); }
     catch (error) { aborted(options.signal); metadataError = `Metadata unavailable: ${(error as Error).message}`; }
     const directoryMetadata = new Map<string, DirectoryMetadata>();
     const contents = join(root, 'contents'); await noLinks(contents);
+    const registerLegacyWork = async (row: LegacyNovel, directory: string) => {
+      const id = digest(JSON.stringify([row.pluginId, row.novelPath]));
+      if (options.db.prepare('SELECT id FROM works WHERE id=?').get(id)) return;
+      const value: NovelMetadataV1 = { schemaVersion: 1, identity: { pluginId: row.pluginId, novelPath: row.novelPath },
+        novel: { name: row.novelName, cover: row.cover ?? null, author: row.author, artist: row.artist ?? null, summary: row.summary, status: row.status ?? null, genres: row.genres ?? null, isLocal: !!row.isLocal },
+        chapters: metadata.rows.filter(chapter => chapter.novelId === row.novelId).map(chapter => ({ path: chapter.chapterPath, name: chapter.chapterName, chapterNumber: chapter.chapterNumber, position: chapter.position, page: chapter.page, contentType: chapter.contentType, releaseTime: chapter.releaseTime ?? null,
+          directory: [...directoryMetadata.entries()].find(([, match]) => match.row?.chapterId === chapter.chapterId)?.[0].split('/').at(-1) ?? storagePath(chapter).split('/').at(-1)! })),
+        cover: null, updatedAt: 0 };
+      const coverPath = join(directory, 'cover.json');
+      let cover: Buffer | undefined;
+      try {
+        await noLinks(coverPath);
+        if ((await lstat(coverPath)).size > 65536) fail('Cover sidecar exceeds limit');
+        const manifest = JSON.parse(await readFile(coverPath, 'utf8'));
+        if (manifest.version === 1 && (manifest.sourceId === undefined || manifest.sourceId === row.pluginId) && (manifest.novelPath === undefined || manifest.novelPath === row.novelPath) && /^cover\.(?:avif|bmp|gif|jpe?g|png|svg|webp|img)$/.test(manifest.fileName) && typeof manifest.sourceUrl === 'string') {
+          const snapshot = await snapshotFile(join(directory, manifest.fileName), join(stage, `${id}-cover`), coverByteLimit, options.signal);
+          await verifySnapshot([snapshot], options.signal); cover = await readFile(snapshot.destination);
+          value.cover = { fileName: manifest.fileName, contentType: typeof manifest.contentType === 'string' ? manifest.contentType : null, sourceUrl: manifest.sourceUrl };
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      saveWork(options.db, dataDir, value);
+      if (cover) saveWorkCover(options.db, dataDir, id, cover);
+      options.onWorkChange?.();
+    };
     const process = async (path: string, sourceFolder: string, row?: MetadataRow) => {
       let sourceId = row?.pluginId ?? sourceFolder;
       aborted(options.signal); const itemStage = await mkdtemp(join(stage, 'chapter-'));
@@ -338,10 +378,10 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
           });
           if (!manifest || segment(manifest.identity.pluginId, 'source') !== sourceFolder) fail('Package manifest source does not match its folder');
           sourceId = manifest!.identity.pluginId;
+          if (row && (manifest!.identity.pluginId !== row.pluginId || manifest!.identity.novelPath !== row.novelPath || manifest!.identity.chapterPath !== row.chapterPath)) fail('Package identity differs from novel.json chapter identity');
           prepared = { path: snapshot.destination, manifest: manifest!, snapshots: [snapshot] };
         } else {
-          if (!row) fail(metadataError ?? 'Exact chapter identity metadata is missing; folder names cannot recover source paths');
-          prepared = await rawPackage(path, row!, itemStage, options);
+          prepared = await rawPackage(path, row, itemStage, options, metadataError);
         }
         await verifySnapshot(prepared.snapshots, options.signal); await prepared.verifyInventory?.(); aborted(options.signal);
         const id = digest(JSON.stringify([prepared.manifest.identity.pluginId, prepared.manifest.identity.novelPath, prepared.manifest.identity.chapterPath]));
@@ -357,6 +397,40 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     const walk = async (directory: string, sourceId: string, depth: number): Promise<void> => {
       aborted(options.signal); await noLinks(directory);
       const entries = await readdir(directory, { withFileTypes: true });
+      if (depth === 1 && entries.some(entry => entry.name === 'novel.json')) {
+        const workStage = await mkdtemp(join(stage, 'work-'));
+        let value: NovelMetadataV1;
+        try {
+          const file = await snapshotFile(join(directory, 'novel.json'), join(workStage, 'novel.json'), metadataByteLimit, options.signal);
+          value = readNovelMetadata(file.destination);
+          if (segment(value.identity.pluginId, 'source') !== sourceId) fail('Work metadata source does not match its folder');
+          const snapshots = [file];
+          if (value.cover && entries.some(entry => entry.name === value.cover!.fileName)) snapshots.push(await snapshotFile(join(directory, value.cover.fileName), join(workStage, value.cover.fileName), coverByteLimit, options.signal));
+          await verifySnapshot(snapshots, options.signal); aborted(options.signal);
+          const id = metadataWorkId(value);
+          const previous = options.db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;
+          let work = saveWork(options.db, dataDir, value);
+          if (snapshots.length > 1) work = saveWorkCover(options.db, dataDir, id, await readFile(snapshots[1].destination));
+          await report({ path: join(directory, 'novel.json'), sourceId: value.identity.pluginId, workId: id, status: previous && JSON.parse(previous.entry).sequence === work.sequence ? 'unchanged' : 'registered' });
+        } catch (error) {
+          aborted(options.signal);
+          await report({ path: join(directory, 'novel.json'), sourceId, status: 'skipped', reason: (error as Error).message });
+          return;
+        } finally { await rm(workStage, { recursive: true, force: true }); }
+        for (const chapter of value.chapters) {
+          const entry = entries.find(entry => entry.name === chapter.directory);
+          if (!entry) continue;
+          const path = join(directory, chapter.directory);
+          if (!entry.isDirectory() || entry.isSymbolicLink()) { await report({ path, sourceId, status: 'skipped', reason: 'Chapter directory is not a regular directory' }); continue; }
+          if (chapter.contentType === 'epub') { await report({ path, sourceId, status: 'skipped', reason: 'EPUB chapters are cataloged but chapter package v1 does not support EPUB' }); continue; }
+          const row: MetadataRow = { novelId: 0, chapterId: 0, pluginId: value.identity.pluginId, novelPath: value.identity.novelPath, chapterPath: chapter.path, novelName: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal ? 1 : 0, chapterName: chapter.name, chapterNumber: chapter.chapterNumber, position: chapter.position, page: chapter.page, contentType: chapter.contentType, downloaded: 1, repair: 0 };
+          const files = await readdir(path, { withFileTypes: true });
+          const packages = files.filter(file => file.isFile() && file.name.endsWith('.zip') && file.name !== 'media.zip' && !unfinished(file.name));
+          if (files.some(file => /^content\./.test(file.name)) || packages.length === 0) await process(path, sourceId, row);
+          for (const file of packages) await process(join(path, file.name), sourceId, row);
+        }
+        return;
+      }
       if (depth === 2) {
         const key = relative(contents, directory).split(sep).join('/'); const match = directoryMetadata.get(key);
         const packages = entries.filter(entry => entry.isFile() && entry.name.endsWith('.zip') && entry.name !== 'media.zip' && !unfinished(entry.name));
@@ -367,8 +441,19 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         for (const entry of packages) await process(join(directory, entry.name), sourceId);
         return;
       }
+      if (depth === 1) {
+        const key = relative(contents, directory).split(sep).join('/');
+        const mappedIds = new Set([...directoryMetadata.entries()].filter(([path, match]) => path.startsWith(`${key}/`) && match.row).map(([, match]) => match.row!.novelId));
+        const matches = metadata.novels.filter(novel => segment(novel.pluginId, 'source') === sourceId &&
+          (mappedIds.has(novel.novelId) || key === `${sourceId}/${label(novel.novelName, 'novel')}-${segment(novel.novelPath, String(novel.novelId))}`));
+        if (matches.length === 1) {
+          try { await registerLegacyWork(matches[0], directory); }
+          catch (error) { aborted(options.signal); await report({ path: directory, sourceId, status: 'skipped', reason: `Legacy work metadata: ${(error as Error).message}` }); }
+        }
+      }
       for (const entry of entries) {
         aborted(options.signal); const path = join(directory, entry.name);
+        if (entry.isFile() && (entry.name === '.nomedia' || (depth === 1 && /^cover\.(?:json|avif|bmp|gif|jpg|jpeg|png|svg|webp|img)$/.test(entry.name)))) continue;
         if (entry.isSymbolicLink() || unfinished(entry.name)) await report({ path, sourceId, status: 'skipped', reason: 'Symbolic or unfinished entry is unsupported' });
         else if (entry.isDirectory()) await walk(path, sourceId, depth + 1);
         else if (entry.isFile() && entry.name.endsWith('.zip') && entry.name !== 'media.zip') await process(path, sourceId);
@@ -377,6 +462,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     };
     for (const source of await readdir(contents, { withFileTypes: true })) {
       aborted(options.signal); const path = join(contents, source.name);
+      if (source.isFile() && source.name === '.nomedia') continue;
       if (!source.isDirectory() || source.isSymbolicLink() || unfinished(source.name)) await report({ path, status: 'skipped', reason: 'Source entry is not a directory, is symbolic, or is unfinished' });
       else {
         const rows = metadata.rows.filter(row => typeof row.pluginId === 'string' && row.pluginId.trim() && segment(row.pluginId, 'source') === source.name);

@@ -2,11 +2,12 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { ServerResponse } from 'node:http';
 import { problem } from './db.ts';
 
-export interface ChangeCursors { catalogCursor: number }
+export interface ChangeCursors { catalogCursor: number; workCursor: number }
 
 export function readChangeCursors(db: DatabaseSync): ChangeCursors {
   const catalog = db.prepare('SELECT coalesce(max(sequence),0) AS cursor FROM catalog_changes').get() as { cursor: number };
-  return { catalogCursor: catalog.cursor };
+  const work = db.prepare('SELECT coalesce(max(sequence),0) AS cursor FROM work_changes').get() as { cursor: number };
+  return { catalogCursor: catalog.cursor, workCursor: work.cursor };
 }
 
 export function createChangeNotifications(db: DatabaseSync) {
@@ -20,7 +21,7 @@ export function createChangeNotifications(db: DatabaseSync) {
       closed = true;
       for (const waiter of pending) waiter.stop();
     },
-    wait(after: ChangeCursors, waitSeconds: number, response: ServerResponse): Promise<void> {
+    wait(after: { catalogCursor: number; workCursor?: number }, waitSeconds: number, response: ServerResponse): Promise<void> {
       if (closed) return Promise.reject(problem(503, 'Server is shutting down'));
       return new Promise((resolve, reject) => {
         const finish = (error?: Error) => {
@@ -34,7 +35,7 @@ export function createChangeNotifications(db: DatabaseSync) {
           check: () => {
             try {
               const current = readChangeCursors(db);
-              if (current.catalogCursor > after.catalogCursor) finish();
+              if (current.catalogCursor > after.catalogCursor || (after.workCursor !== undefined && current.workCursor > after.workCursor)) finish();
             } catch (error) { finish(error as Error); }
           },
           stop: () => finish(problem(503, 'Server is shutting down')),
