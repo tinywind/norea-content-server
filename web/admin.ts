@@ -4,17 +4,15 @@ type View = 'Overview' | 'Plugins' | 'Folders' | 'Content' | 'Jobs' | 'Devices' 
 type Child = Node | string | number | null | undefined;
 interface Device { id: string; deviceName: string; createdAt: number | string; lastSeenAt: number | string | null; blocked: boolean }
 interface Plugin { id: string; name: string; url: string; enabled: boolean; updatedAt: number | string; sources: { id: string; name: string; version: string; installMode?: string }[] }
-interface Root { id: string; name: string; path: string; metadataDbPath?: string | null; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
+interface Root { id: string; name: string; path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
 interface Entry { id: string; revision: string; zipSha256: string; zipBytes: number; deleted: boolean; sequence: number; manifest: { identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string } } }
 interface NovelMetadata {
   schemaVersion: 1;
   identity: { pluginId: string; novelPath: string };
-  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; genres: string | null; isLocal: boolean };
-  chapters: { path: string; name: string; chapterNumber: string | null; position: number; page: string; contentType: 'html' | 'text' | 'markdown' | 'pdf' | 'epub'; releaseTime: string | null; directory: string }[];
+  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
   cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
-  updatedAt: number;
 }
 interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount: number; downloadedChapters: number }
 interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
@@ -241,16 +239,14 @@ async function plugins(current: number) {
 function rootForm(existing: Root | undefined, saved: () => Promise<void>) {
   const form = el('form'); const errors = el('div');
   const name = input('name', 'text', existing?.name ?? ''); const path = input('path', 'text', existing?.path ?? '');
-  const metadata = input('metadataDbPath', 'text', existing?.metadataDbPath ?? '', false);
   const mode = select('mode', ['manual', 'periodic', 'changes'], existing?.mode);
   const interval = input('intervalMinutes', 'number', String(existing?.intervalMinutes ?? 15)); interval.min = '1'; interval.max = '1440'; interval.step = '1';
   const syncMode = () => { interval.disabled = mode.value === 'manual'; }; mode.addEventListener('change', syncMode); syncMode();
   form.append(el('div', 'form-grid', field('Folder name', name), field('Scan mode', mode, 'Changes mode watches files and also reconciles on the configured interval.'),
     field('Content folder on the server', path, 'Absolute server filesystem path. This is not a path on your browser’s device.', true),
-    field('Norea metadata database (optional)', metadata, 'The server reads a temporary copy to recover exact identities. The original database stays untouched.', true),
     field('Interval (minutes)', interval, 'Used by periodic and changes modes.')));
   form.append(el('div', 'form-actions', submit(form, existing ? 'Save folder' : 'Connect folder', async () => {
-    await api(`/admin/roots${existing ? `/${encodeURIComponent(existing.id)}` : ''}`, existing ? 'PATCH' : 'POST', { name: name.value.trim(), path: path.value.trim(), metadataDbPath: metadata.value.trim(), mode: mode.value, intervalMinutes: Number(interval.value) });
+    await api(`/admin/roots${existing ? `/${encodeURIComponent(existing.id)}` : ''}`, existing ? 'PATCH' : 'POST', { name: name.value.trim(), path: path.value.trim(), mode: mode.value, intervalMinutes: Number(interval.value) });
     await saved();
   }, errors)), errors); return form;
 }
@@ -258,7 +254,7 @@ async function folders(current: number) {
   const data = await api<{ items: Root[] }>('/admin/roots'); if (current !== generation) return;
   const list = panel('Connected folders', `${data.items.length} folders · Source folders are read-only`); list.body.className = '';
   list.body.append(table(['Folder', 'Schedule', 'Last scan', 'Actions'], data.items.map(root => [
-    el('div', '', el('div', 'cell-title', root.name), el('div', 'hint mono', root.path), root.metadataDbPath ? el('div', 'hint mono', `Metadata: ${root.metadataDbPath}`) : el('div', 'hint', 'No metadata database')),
+    el('div', '', el('div', 'cell-title', root.name), el('div', 'hint mono', root.path)),
     el('div', '', badge(root.enabled ? 'enabled' : 'disabled'), el('div', 'hint', `${root.mode}${root.mode === 'manual' ? '' : ` · ${root.intervalMinutes} min`}`)), date(root.lastScanAt),
     el('div', 'actions', action('Scan now', async () => { const job = await api<Job>(`/admin/roots/${encodeURIComponent(root.id)}/scan`, 'POST'); await navigate('Jobs'); notify(`Scan started for ${root.name}. Job ${job.id}.`); }, 'small primary'),
       action('Edit', () => { const modal = dialog('Edit connected folder'); modal.body.append(rootForm(root, async () => { modal.node.close(); await navigate('Folders'); })); }, 'small'),
@@ -266,7 +262,7 @@ async function folders(current: number) {
       action('Detach', async () => { if (!confirm(`Detach “${root.name}”? This stops future scans. Its source files and existing server content remain untouched.`)) return; await api(`/admin/roots/${encodeURIComponent(root.id)}`, 'DELETE'); await navigate('Folders'); }, 'small danger')),
   ]), 'No folders connected. Add a server path below.'));
   const add = panel('Connect a folder'); add.body.append(rootForm(undefined, async () => { await navigate('Folders'); notify('Folder connected. Start a scan when ready.'); }));
-  page.replaceChildren(el('div', 'notice', el('strong', '', 'Read-only access to your source library'), 'Scans use local files and metadata without checking plugins or source sites. Raw chapter folders need a Norea metadata database for exact identities; complete ZIPs carry their own manifest. Incomplete files and unknown identities are skipped. Originals stay untouched.'), list.node, add.node);
+  page.replaceChildren(el('div', 'notice', el('strong', '', 'Read-only access to your source library'), 'Scans use local files and metadata without checking plugins or source sites. Every work needs a valid novel.json with its original identity and title. Chapters are discovered from numbered folders. Incomplete files and unknown identities are skipped. Originals stay untouched.'), list.node, add.node);
 }
 
 async function loadCover(work: Work, target: HTMLElement, current: number) {
@@ -297,25 +293,19 @@ function inspectWork(work: Work) {
   const modal = dialog(`Metadata · ${novel.name}`); modal.node.classList.add('metadata-dialog');
   const values: [string, Child][] = [
     ['Title', novel.name], ['Author', novel.author ?? '—'], ['Artist', novel.artist ?? '—'],
-    ['Status', novel.status ?? '—'], ['Genres', novel.genres ?? '—'], ['Summary', el('span', 'preserve-lines', novel.summary ?? '—')],
+    ['Status', novel.status ?? '—'], ['Rating', novel.rating ?? '—'], ['Genres', novel.genres ?? '—'], ['Summary', el('span', 'preserve-lines', novel.summary ?? '—')],
     ['Local work', novel.isLocal ? 'Yes' : 'No'], ['Source cover URL', novel.cover ?? '—'],
     ['Plugin ID', el('span', 'mono', identity.pluginId)], ['Novel path', el('span', 'mono', identity.novelPath)],
     ['Cover file', cover?.fileName ?? '—'], ['Cover content type', cover?.contentType ?? '—'], ['Cover source URL', cover?.sourceUrl ?? '—'],
-    ['Stored cover', work.hasCover ? 'Available' : 'Not available'], ['Known chapters', work.chapterCount], ['Downloaded chapters', work.downloadedChapters],
-    ['Updated', date(metadata.updatedAt)], ['Schema version', metadata.schemaVersion], ['Work ID', el('span', 'mono', work.id)], ['Sequence', work.sequence],
+    ['Stored cover', work.hasCover ? 'Available' : 'Not available'], ['Downloaded chapters', work.downloadedChapters],
+    ['Schema version', metadata.schemaVersion], ['Work ID', el('span', 'mono', work.id)], ['Sequence', work.sequence],
   ];
   const json = el('details', 'metadata-json', el('summary', '', 'Full JSON'), el('pre', 'mono', JSON.stringify(metadata, null, 2)));
-  modal.body.append(details(values), el('h3', '', `Chapter list (${metadata.chapters.length.toLocaleString()})`),
-    table(['Chapter', 'Path / directory', 'Position / page', 'Format / release'], metadata.chapters.map(chapter => [
-      el('div', '', el('div', 'cell-title', chapter.name), el('div', 'hint', `Number: ${chapter.chapterNumber ?? '—'}`)),
-      el('div', '', el('div', 'mono', chapter.path), el('div', 'hint mono', chapter.directory)),
-      el('div', '', String(chapter.position), el('div', 'hint', `Page: ${chapter.page}`)),
-      el('div', '', chapter.contentType, el('div', 'hint', chapter.releaseTime ?? '—')),
-    ]), 'This work has no known chapters.'), json);
+  modal.body.append(details(values), json);
 }
 async function content(current: number, state: WorkView = { search: '', offset: 0, layout: 'grid' }) {
   clearCovers();
-  const section = panel('Works', 'Known chapters include chapters that have not been downloaded.'); section.body.className = '';
+  const section = panel('Works', 'Chapter counts include available imported or uploaded packages.'); section.body.className = '';
   const search = input('search', 'search', state.search, false); search.className = 'search-input'; search.placeholder = 'Search works'; search.setAttribute('aria-label', 'Search works');
   const errors = el('div'); errors.setAttribute('role', 'alert');
   const results = el('div'); let requestId = 0; let data: { items: Work[]; total: number } | undefined;
@@ -336,7 +326,7 @@ async function content(current: number, state: WorkView = { search: '', offset: 
       const title = action(work.metadata.novel.name, () => openChapters(work), 'work-title');
       const controls = el('div', 'actions', action('Chapters', () => openChapters(work), 'small'), action('Metadata', () => inspectWork(work), 'small'));
       const info = el('div', 'work-info', el('h3', '', title), el('p', 'hint work-author', work.metadata.novel.author || 'Unknown author'),
-        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${work.downloadedChapters.toLocaleString()} / ${work.chapterCount.toLocaleString()} chapters downloaded`), controls);
+        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${work.downloadedChapters.toLocaleString()} chapters available`), controls);
       works.append(el('article', 'work', cover, info));
       if (work.hasCover) covers.push({ work, node: cover });
     }
@@ -362,7 +352,7 @@ async function content(current: number, state: WorkView = { search: '', offset: 
 }
 async function chapters(current: number, work?: Work, back: () => Promise<void> = () => content(++generation)) {
   clearCovers();
-  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'Downloaded chapter packages and stored revisions for this work.' : 'All chapter packages, including content without work metadata.'); section.body.className = '';
+  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'Downloaded chapter packages and stored revisions for this work.' : 'All chapter packages associated with registered work metadata.'); section.body.className = '';
   const search = input('search', 'search', '', false); search.className = 'search-input'; search.placeholder = 'Search novel or chapter'; search.setAttribute('aria-label', 'Search content');
   const deleted = select('deleted', ['Active content', 'Trash']); deleted.setAttribute('aria-label', 'Content state'); deleted.className = 'button';
   const results = el('div'); let requestId = 0;
