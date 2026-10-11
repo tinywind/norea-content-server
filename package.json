@@ -1,0 +1,30 @@
+{
+  "name": "norea-content-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "admin": "node src/admin.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fastify/swagger": "^9.5.1",
+    "ajv": "^8.20.0",
+    "fastify": "^5.6.1",
+    "json-canonicalize": "^3.0.1",
+    "parse5-sax-parser": "^8.0.0",
+    "yauzl": "^3.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/yauzl": "^2.10.3",
+    "@types/yazl": "^3.3.0",
+    "typescript": "^5.9.2",
+    "yazl": "^3.3.1"
+  }
+}

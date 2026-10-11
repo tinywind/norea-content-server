@@ -1,0 +1,12 @@
+services:
+  server:
+    build: .
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - norea-data:/data
+    environment:
+      NOREA_ANONYMOUS_READ: "true"
+    restart: unless-stopped
+volumes:
+  norea-data:
