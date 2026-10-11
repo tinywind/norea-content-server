@@ -38,6 +38,8 @@ content that no participating device has acquired and uploaded.
 - Wait for the complete body and required assets before producing and uploading
   a ZIP package. Do not synchronize an acquisition that is still incomplete.
 - Use cross-device content identities instead of local database row IDs.
+- Preserve Norea's existing readable plugin/work/chapter folder structure.
+  Accept the existing plugin ID collision limitation across distribution sources.
 
 A public source repository does not determine the deployed server's network
 exposure. Anonymous catalog access and downloads are enabled by default; operators
@@ -111,17 +113,19 @@ content files.
 Use separate identities for the logical work, logical chapter, and content
 revision. Local numeric database IDs are only mappings within a device.
 
-For source content, the external identity is a stable source namespace
-plus the source's work ID, followed by its chapter ID. Where a plugin supplies no
-stable ID, use its existing work or chapter path as the fallback. A display name,
-chapter number, or sanitized storage directory is not a reliable identity.
+For source content, identify a work by its existing plugin ID and original work
+path, and a chapter by that work identity and original chapter path. Do not add
+repository UUIDs, distribution namespaces, or automatic cross-plugin merging.
+Local numeric row IDs remain device-specific. Matching plugin IDs and paths from
+different distributions can collide; this limitation is explicitly accepted for
+the intended personal and small-server use.
 
-Keep the source namespace separate from display names and current domains.
-Existing plugin IDs can seed the namespace; preserve that identity through domain
-changes and provide explicit aliases for plugin replacements or renames. Do not
-silently strip URL components or merge similarly named works. Document the exact
-identity fields and path fallback behavior with the Norea plugin contract during
-implementation planning.
+Preserve the current readable storage layout: plugin ID, work name/path, then
+chapter number/name. Users must remain able to find and open a work or chapter
+directly in the filesystem. Do not replace these directories with hash-only names
+or migrate existing folders for synchronization. Content hashes verify revisions
+and transfers; they do not replace the readable directory hierarchy. Packages
+carry original identity fields separately from sanitized filesystem paths.
 
 For local imports, the original file's SHA-256 digest detects identical imported
 files. A work and its extracted chapters also need identities that survive
@@ -307,6 +311,11 @@ continues. Publish the supported app/server combinations before release.
 App-side data changes must also follow Norea's active release-line compatibility
 policy.
 
+Publish an OpenAPI document from the same route schemas used for request and
+response validation. The selected stack is TypeScript, Fastify, REST/OpenAPI,
+and SQLite. Do not introduce GraphQL, Java, or Spring Boot. File uploads and
+downloads use ordinary streaming HTTP endpoints.
+
 The protocol needs operations for server capabilities, shared catalog changes,
 complete package publication and retrieval, explicit deletion and republication,
 and account-scoped reading-state changes. Define endpoint names and detailed
@@ -332,6 +341,12 @@ mechanism instead of copying a live database file directly. Coordinate package
 publication and cleanup with the snapshot so referenced files remain available
 until backup completion. Keep backups independently of the live data volume and
 verify restoration before release.
+
+Develop and test the server on the local Windows machine. Test the Norea Android
+integration on the ADB-connected Samsung S25, using the aarch64 APK only. Keep test
+data, logs, and generated artifacts under each project's `.tmp/` directory. Local
+device tests may use an ADB reverse connection to a loopback-only HTTP server;
+external deployments still require HTTPS.
 
 ## Initial delivery scope
 
@@ -396,8 +411,8 @@ validation has been performed for this document.
 The product decisions above are accepted. The implementation plan still needs
 concrete contracts and operational configuration:
 
-- Request and response schemas, source namespace aliases, path fallback
-  encoding, local chapter IDs, and the canonical manifest field set.
+- Request and response schemas, existing plugin/path identity encoding, local
+  chapter mappings, and the canonical manifest field set.
 - Device session storage and expiry, password storage, administrator bootstrap,
   account invitation/reset flow, and credential storage in the app.
 - Version preconditions, independent-item merge boundaries, conflict resolution
