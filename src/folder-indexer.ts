@@ -1,15 +1,15 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { Transform, type Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { canonicalize } from 'json-canonicalize';
 import { digest, publishPackage, safeArchivePath, validateManifest, type Limits, type PackageManifest } from './packages.ts';
-import { coverByteLimit, metadataByteLimit, metadataWorkId, readNovelMetadata, saveWork, saveWorkCover, type NovelMetadataV1 } from './works.ts';
+import { coverByteLimit, getWork, metadataByteLimit, metadataWorkId, readNovelMetadata, saveWork, saveWorkCover, validateNovelMetadata, type NovelMetadataV1 } from './works.ts';
 
 export interface FolderIndexItem {
   path: string;
@@ -311,7 +311,10 @@ async function rawPackage(directory: string, row: MetadataRow | undefined, stage
   validateManifest(manifest);
   const manifestBytes = Buffer.from(JSON.stringify(manifest));
   if (manifestBytes.length + expanded > options.limits.expandedBytes) fail('Expanded package limit exceeded');
-  const zip = new ZipFile(); for (const file of records) zip.addFile(join(portable, file.path), file.path); zip.addBuffer(manifestBytes, 'manifest.json'); zip.end();
+  const zip = new ZipFile();
+  // Media is already encoded; recompressing it makes large library scans CPU-bound.
+  for (const file of records) zip.addFile(join(portable, file.path), file.path, { compress: !file.path.startsWith('media/') });
+  zip.addBuffer(manifestBytes, 'manifest.json'); zip.end();
   const path = join(stage, 'package.zip'); let bytes = 0;
   await pipeline(zip.outputStream, new Transform({ transform(chunk, _encoding, done) { bytes += chunk.length; done(bytes > options.limits.zipBytes ? new Error('ZIP package limit exceeded') : null, chunk); } }), createWriteStream(path, { flags: 'wx' }), { signal: options.signal });
   return { path, manifest, snapshots, verifyInventory: async () => {
@@ -338,29 +341,111 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     catch (error) { aborted(options.signal); metadataError = `Metadata unavailable: ${(error as Error).message}`; }
     const directoryMetadata = new Map<string, DirectoryMetadata>();
     const contents = join(root, 'contents'); await noLinks(contents);
-    const registerLegacyWork = async (row: LegacyNovel, directory: string) => {
-      const id = digest(JSON.stringify([row.pluginId, row.novelPath]));
-      if (options.db.prepare('SELECT id FROM works WHERE id=?').get(id)) return;
-      const value: NovelMetadataV1 = { schemaVersion: 1, identity: { pluginId: row.pluginId, novelPath: row.novelPath },
-        novel: { name: row.novelName, cover: row.cover ?? null, author: row.author, artist: row.artist ?? null, summary: row.summary, status: row.status ?? null, genres: row.genres ?? null, isLocal: !!row.isLocal },
-        chapters: metadata.rows.filter(chapter => chapter.novelId === row.novelId).map(chapter => ({ path: chapter.chapterPath, name: chapter.chapterName, chapterNumber: chapter.chapterNumber, position: chapter.position, page: chapter.page, contentType: chapter.contentType, releaseTime: chapter.releaseTime ?? null,
-          directory: [...directoryMetadata.entries()].find(([, match]) => match.row?.chapterId === chapter.chapterId)?.[0].split('/').at(-1) ?? storagePath(chapter).split('/').at(-1)! })),
-        cover: null, updatedAt: 0 };
+    const registerLegacyWork = async (known: LegacyNovel | undefined, directory: string, sourceId: string) => {
+      let sidecar: { version?: number; sourceId?: string; novelPath?: string; fileName?: string; contentType?: string; sourceUrl?: string } | undefined;
       const coverPath = join(directory, 'cover.json');
-      let cover: Buffer | undefined;
       try {
         await noLinks(coverPath);
         if ((await lstat(coverPath)).size > 65536) fail('Cover sidecar exceeds limit');
-        const manifest = JSON.parse(await readFile(coverPath, 'utf8'));
-        if (manifest.version === 1 && (manifest.sourceId === undefined || manifest.sourceId === row.pluginId) && (manifest.novelPath === undefined || manifest.novelPath === row.novelPath) && /^cover\.(?:avif|bmp|gif|jpe?g|png|svg|webp|img)$/.test(manifest.fileName) && typeof manifest.sourceUrl === 'string') {
-          const snapshot = await snapshotFile(join(directory, manifest.fileName), join(stage, `${id}-cover`), coverByteLimit, options.signal);
-          await verifySnapshot([snapshot], options.signal); cover = await readFile(snapshot.destination);
-          value.cover = { fileName: manifest.fileName, contentType: typeof manifest.contentType === 'string' ? manifest.contentType : null, sourceUrl: manifest.sourceUrl };
+        const coverStage = await mkdtemp(join(stage, 'cover-'));
+        const file = await snapshotFile(coverPath, join(coverStage, 'cover.json'), 65536, options.signal);
+        await verifySnapshot([file], options.signal);
+        sidecar = JSON.parse(await readFile(file.destination, 'utf8'));
+        if (!sidecar || sidecar.version !== 1) throw new Error('Invalid cover sidecar version');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          aborted(options.signal); await report({ path: coverPath, sourceId, status: 'skipped', reason: `Cover metadata: ${(error as Error).message}` });
         }
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-      saveWork(options.db, dataDir, value);
-      if (cover) saveWorkCover(options.db, dataDir, id, cover);
-      options.onWorkChange?.();
+        sidecar = undefined;
+      }
+      if (sidecar) {
+        if (sidecar.sourceId !== undefined && (typeof sidecar.sourceId !== 'string' || segment(sidecar.sourceId, 'source') !== sourceId)) fail('Cover sidecar source does not match its folder');
+        if (sidecar.novelPath !== undefined && (typeof sidecar.novelPath !== 'string' || !sidecar.novelPath.trim())) fail('Invalid cover sidecar work identity');
+        if (known && sidecar.novelPath !== undefined && sidecar.novelPath !== known.novelPath) fail('Cover sidecar and database work identities disagree');
+      }
+      if (!known && !sidecar?.novelPath) {
+        const candidates = (options.db.prepare('SELECT entry FROM works').all() as { entry: string }[])
+          .map(record => JSON.parse(record.entry).metadata as NovelMetadataV1)
+          .filter(value => segment(value.identity.pluginId, 'source') === sourceId && basename(directory).endsWith(`-${segment(value.identity.novelPath, '')}`));
+        if (candidates.length > 1) fail('Multiple server works match the same folder');
+        if (candidates.length === 1) {
+          const value = candidates[0];
+          known = { novelId: 0, pluginId: value.identity.pluginId, novelPath: value.identity.novelPath, novelName: value.novel.name,
+            ...value.novel, isLocal: value.novel.isLocal ? 1 : 0 };
+        }
+      }
+      const novelPath = known?.novelPath ?? sidecar?.novelPath ?? `norea-folder:${basename(directory)}`;
+      const suffix = `-${segment(novelPath, '')}`;
+      const folderName = basename(directory);
+      const row: LegacyNovel = known ?? { novelId: 0, pluginId: sidecar?.sourceId ?? sourceId, novelPath,
+        novelName: sidecar?.novelPath && folderName.endsWith(suffix) ? folderName.slice(0, -suffix.length) : folderName,
+        author: null, summary: null, isLocal: sourceId === 'local' ? 1 : 0 };
+      const id = digest(JSON.stringify([row.pluginId, row.novelPath]));
+      const existing = options.db.prepare('SELECT id FROM works WHERE id=?').get(id) ? getWork(options.db, dataDir, id) : undefined;
+      const value: NovelMetadataV1 = existing ? structuredClone(existing.metadata) : { schemaVersion: 1, identity: { pluginId: row.pluginId, novelPath: row.novelPath },
+        novel: { name: row.novelName, cover: row.cover ?? null, author: row.author, artist: row.artist ?? null, summary: row.summary, status: row.status ?? null, genres: row.genres ?? null, isLocal: !!row.isLocal },
+        chapters: metadata.rows.filter(chapter => known && chapter.novelId === row.novelId).map(chapter => ({ path: chapter.chapterPath, name: chapter.chapterName, chapterNumber: chapter.chapterNumber, position: chapter.position, page: chapter.page, contentType: chapter.contentType, releaseTime: chapter.releaseTime ?? null,
+          directory: [...directoryMetadata.entries()].find(([, match]) => match.row?.chapterId === chapter.chapterId)?.[0].split('/').at(-1) ?? storagePath(chapter).split('/').at(-1)! })),
+        cover: null, updatedAt: 0 };
+      const folders = (await readdir(directory, { withFileTypes: true })).filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !unfinished(entry.name))
+        .sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+      const numbers = new Map<string, number>();
+      for (const folder of folders) {
+        const number = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/)?.[1];
+        if (number) numbers.set(number, (numbers.get(number) ?? 0) + 1);
+      }
+      for (const [index, folder] of folders.entries()) {
+        const path = join(directory, folder.name); const key = relative(contents, path).split(sep).join('/');
+        const mapped = directoryMetadata.get(key);
+        if (mapped) {
+          if (mapped.row) mapped.row = { ...mapped.row, novelName: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal ? 1 : 0 };
+          const stored = value.chapters.find(chapter => chapter.directory === folder.name);
+          if (mapped.row && stored && stored.contentType !== 'epub') {
+            mapped.row = { ...mapped.row, chapterPath: stored.path, chapterName: stored.name, chapterNumber: stored.chapterNumber,
+              position: stored.position, page: stored.page, contentType: stored.contentType };
+          } else if (mapped.row && !value.chapters.some(chapter => chapter.path === mapped.row!.chapterPath)) {
+            const chapter = mapped.row;
+            value.chapters.push({ path: chapter.chapterPath, name: chapter.chapterName, chapterNumber: chapter.chapterNumber, position: chapter.position,
+              page: chapter.page, contentType: chapter.contentType, releaseTime: chapter.releaseTime ?? null, directory: folder.name });
+          }
+          continue;
+        }
+        const parts = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/);
+        const stored = value.chapters.find(chapter => chapter.directory === folder.name);
+        const byNumber = parts ? value.chapters.filter(chapter => chapter.chapterNumber === parts[1]) : [];
+        if (!stored && (!parts || numbers.get(parts[1]) !== 1 || byNumber.length > 1)) {
+          directoryMetadata.set(key, { reason: 'Chapter folder must have a unique number followed by a hyphen and title' }); continue;
+        }
+        const previous = stored ?? byNumber[0];
+        const files = await readdir(path);
+        const chapter: NovelMetadataV1['chapters'][number] = previous ?? {
+          path: `norea-folder:${parts![1]}`, name: parts![2], chapterNumber: parts![1], position: index + 1, page: '1',
+          contentType: files.includes('content.pdf') ? 'pdf' : 'html', releaseTime: null, directory: folder.name };
+        if (chapter.contentType === 'epub') { directoryMetadata.set(key, { reason: 'EPUB chapter packages are unsupported' }); continue; }
+        directoryMetadata.set(key, { row: { ...row, novelName: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal ? 1 : 0, chapterId: 0, chapterPath: chapter.path, chapterName: chapter.name,
+          chapterNumber: chapter.chapterNumber, position: chapter.position, page: chapter.page, contentType: chapter.contentType, downloaded: 1, repair: 0 } });
+        if (!previous) value.chapters.push(chapter);
+      }
+      let cover: Buffer | undefined;
+      try {
+        const manifest = sidecar;
+        if (!existing?.hasCover && manifest && typeof manifest.fileName === 'string' && /^cover\.(?:avif|bmp|gif|jpe?g|png|svg|webp|img)$/.test(manifest.fileName) && typeof manifest.sourceUrl === 'string') {
+          const snapshot = await snapshotFile(join(directory, manifest.fileName), join(stage, `${id}-cover`), coverByteLimit, options.signal);
+          await verifySnapshot([snapshot], options.signal);
+          const bytes = await readFile(snapshot.destination);
+          if (!bytes.length) fail('Cover image is empty');
+          const descriptor = { fileName: manifest.fileName, contentType: typeof manifest.contentType === 'string' && /^image\/[a-zA-Z0-9.+-]+$/.test(manifest.contentType) ? manifest.contentType : null, sourceUrl: manifest.sourceUrl };
+          validateNovelMetadata({ ...value, cover: descriptor });
+          cover = bytes; value.cover = descriptor;
+        }
+      } catch (error) {
+        aborted(options.signal);
+        await report({ path: join(directory, sidecar!.fileName!), sourceId, status: 'skipped', reason: `Cover image: ${(error as Error).message}` });
+      }
+      let work = saveWork(options.db, dataDir, value);
+      if (cover) work = saveWorkCover(options.db, dataDir, id, cover);
+      await report({ path: directory, sourceId, workId: id, status: existing?.sequence === work.sequence ? 'unchanged' : 'registered' });
+      if (existing?.sequence !== work.sequence) options.onWorkChange?.();
     };
     const process = async (path: string, sourceFolder: string, row?: MetadataRow) => {
       let sourceId = row?.pluginId ?? sourceFolder;
@@ -386,7 +471,9 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         await verifySnapshot(prepared.snapshots, options.signal); await prepared.verifyInventory?.(); aborted(options.signal);
         const id = digest(JSON.stringify([prepared.manifest.identity.pluginId, prepared.manifest.identity.novelPath, prepared.manifest.identity.chapterPath]));
         const previous = options.db.prepare('SELECT revision FROM revisions WHERE chapter_id=? AND path IS NOT NULL').all(id) as { revision: string }[];
-        const entry = await publishPackage(options.db, dataDir, createReadStream(prepared.path, { signal: options.signal }), options.limits);
+        // Open the abortable file only after the publisher has attached stream error handling.
+        const input = Readable.from((async function* () { yield* createReadStream(prepared.path, { signal: options.signal }); })());
+        const entry = await publishPackage(options.db, dataDir, input, options.limits);
         await report({ path, sourceId, status: previous.some(row => row.revision === entry.revision) ? 'unchanged' : 'registered', chapterId: entry.id, revision: entry.revision });
       } catch (error) {
         aborted(options.signal);
@@ -444,20 +531,27 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       if (depth === 1) {
         const key = relative(contents, directory).split(sep).join('/');
         const mappedIds = new Set([...directoryMetadata.entries()].filter(([path, match]) => path.startsWith(`${key}/`) && match.row).map(([, match]) => match.row!.novelId));
-        const matches = metadata.novels.filter(novel => segment(novel.pluginId, 'source') === sourceId &&
-          (mappedIds.has(novel.novelId) || key === `${sourceId}/${label(novel.novelName, 'novel')}-${segment(novel.novelPath, String(novel.novelId))}`));
-        if (matches.length === 1) {
-          try { await registerLegacyWork(matches[0], directory); }
-          catch (error) { aborted(options.signal); await report({ path: directory, sourceId, status: 'skipped', reason: `Legacy work metadata: ${(error as Error).message}` }); }
-        }
+        const sourceNovels = metadata.novels.filter(novel => segment(novel.pluginId, 'source') === sourceId);
+        const exact = sourceNovels.filter(novel => mappedIds.has(novel.novelId) || key === `${sourceId}/${label(novel.novelName, 'novel')}-${segment(novel.novelPath, String(novel.novelId))}`);
+        const matches = exact.length ? exact : sourceNovels.filter(novel => basename(directory).endsWith(`-${segment(novel.novelPath, String(novel.novelId))}`));
+        try {
+          if (matches.length > 1) fail('Multiple database works match the same folder');
+          await registerLegacyWork(matches[0], directory, sourceId);
+        } catch (error) { aborted(options.signal); await report({ path: directory, sourceId, status: 'skipped', reason: `Legacy work metadata: ${(error as Error).message}` }); return; }
       }
-      for (const entry of entries) {
+      const visitEntry = async (entry: (typeof entries)[number]) => {
         aborted(options.signal); const path = join(directory, entry.name);
-        if (entry.isFile() && (entry.name === '.nomedia' || (depth === 1 && /^cover\.(?:json|avif|bmp|gif|jpg|jpeg|png|svg|webp|img)$/.test(entry.name)))) continue;
+        if (entry.isFile() && (entry.name === '.nomedia' || (depth === 1 && /^cover\.(?:json|avif|bmp|gif|jpg|jpeg|png|svg|webp|img)$/.test(entry.name)))) return;
         if (entry.isSymbolicLink() || unfinished(entry.name)) await report({ path, sourceId, status: 'skipped', reason: 'Symbolic or unfinished entry is unsupported' });
         else if (entry.isDirectory()) await walk(path, sourceId, depth + 1);
         else if (entry.isFile() && entry.name.endsWith('.zip') && entry.name !== 'media.zip') await process(path, sourceId);
         else await report({ path, sourceId, status: 'skipped', reason: 'Unsupported non-chapter file' });
+      };
+      const concurrency = depth === 1 ? 4 : 1;
+      for (let index = 0; index < entries.length; index += concurrency) {
+        const results = await Promise.allSettled(entries.slice(index, index + concurrency).map(visitEntry));
+        const rejected = results.find(result => result.status === 'rejected');
+        if (rejected?.status === 'rejected') throw rejected.reason;
       }
     };
     for (const source of await readdir(contents, { withFileTypes: true })) {
