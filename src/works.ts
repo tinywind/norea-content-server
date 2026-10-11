@@ -11,10 +11,8 @@ import { digest, safeArchivePath } from './packages.ts';
 export interface NovelMetadataV1 {
   schemaVersion: 1;
   identity: { pluginId: string; novelPath: string };
-  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; genres: string | null; isLocal: boolean };
-  chapters: { path: string; name: string; chapterNumber: string | null; position: number; page: string; contentType: 'html' | 'text' | 'markdown' | 'pdf' | 'epub'; releaseTime: string | null; directory: string }[];
+  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
   cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
-  updatedAt: number;
 }
 export interface WorkEntry { id: string; sequence: number; metadata: NovelMetadataV1; hasCover: boolean }
 interface WorkRow { id: string; directory: string; entry: string; fingerprint: string }
@@ -30,19 +28,14 @@ export function validateNovelMetadata(value: unknown): asserts value is NovelMet
   };
   const text = (input: unknown, required = false) => typeof input === 'string' && input.isWellFormed() && (!required || (input.trim().length > 0 && input.length <= 4096));
   const nullable = (input: unknown) => input === null || text(input);
-  const m = object(value, ['schemaVersion', 'identity', 'novel', 'chapters', 'cover', 'updatedAt']);
+  const m = object(value, ['schemaVersion', 'identity', 'novel', 'cover']);
   const identity = object(m.identity, ['pluginId', 'novelPath']);
-  const novel = object(m.novel, ['name', 'cover', 'author', 'artist', 'summary', 'status', 'genres', 'isLocal']);
-  if (m.schemaVersion !== 1 || !Number.isSafeInteger(m.updatedAt) || (m.updatedAt as number) < 0 || !text(identity.pluginId, true) || !text(identity.novelPath, true) || !text(novel.name, true) || typeof novel.isLocal !== 'boolean') throw problem(400, 'Invalid work identity or metadata');
+  const novel = object(m.novel, ['name', 'cover', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal']);
+  if (m.schemaVersion !== 1 || !text(identity.pluginId, true) || !text(identity.novelPath, true) || !text(novel.name, true) || typeof novel.isLocal !== 'boolean') throw problem(400, 'Invalid work identity or metadata');
   for (const key of ['cover', 'author', 'artist', 'summary', 'status', 'genres']) if (!nullable(novel[key])) throw problem(400, 'Invalid novel metadata');
-  if (!Array.isArray(m.chapters) || m.chapters.length > 100000) throw problem(400, 'Invalid chapter list');
-  const paths = new Set<string>(); const directories = new Set<string>();
-  for (const value of m.chapters) {
-    const chapter = object(value, ['path', 'name', 'chapterNumber', 'position', 'page', 'contentType', 'releaseTime', 'directory']);
-    if (!text(chapter.path, true) || !text(chapter.name, true) || !nullable(chapter.chapterNumber) || typeof chapter.position !== 'number' || !Number.isSafeInteger(chapter.position) || chapter.position < 0 || !text(chapter.page, true) || !nullable(chapter.releaseTime) || !['html', 'text', 'markdown', 'pdf', 'epub'].includes(chapter.contentType as string) || !validSegment(chapter.directory) || /^(novel\.json|cover(?:\.|$))/i.test(chapter.directory)) throw problem(400, 'Invalid chapter metadata or directory');
-    if (paths.has(chapter.path as string) || directories.has(chapter.directory.toLowerCase())) throw problem(400, 'Duplicate chapter path or directory');
-    paths.add(chapter.path as string); directories.add(chapter.directory.toLowerCase());
-  }
+  if (novel.rating !== null && (typeof novel.rating !== 'number' || !Number.isFinite(novel.rating) || novel.rating < 0 || novel.rating > 5)) throw problem(400, 'Invalid novel rating');
+  if (/^(?:https?:)?\/\//i.test(identity.novelPath as string)) throw problem(400, 'Work path must exclude the source base URL');
+  if ((identity.novelPath as string).startsWith('norea-folder:')) throw problem(400, 'Synthetic work identities are unsupported');
   if (m.cover !== null) {
     const cover = object(m.cover, ['fileName', 'contentType', 'sourceUrl']);
     if (!validSegment(cover.fileName) || !/^cover\.(avif|bmp|gif|img|jpe?g|png|svg|webp)$/.test(cover.fileName) || !nullable(cover.contentType) || !text(cover.sourceUrl, true) || (typeof cover.contentType === 'string' && !/^image\/[a-zA-Z0-9.+-]+$/.test(cover.contentType))) throw problem(400, 'Invalid work cover');
@@ -104,15 +97,31 @@ function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadat
 }
 
 export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
-  const root = join(dataDir, 'contents'); noLinks(root); if (!existsSync(root)) return;
+  const valid = new Set<string>();
+  const root = join(dataDir, 'contents'); noLinks(root); mkdirSync(root, { recursive: true });
   for (const source of readdirSync(root, { withFileTypes: true })) {
     if (!source.isDirectory() || source.isSymbolicLink()) continue;
     for (const work of readdirSync(join(root, source.name), { withFileTypes: true })) {
       if (!work.isDirectory() || work.isSymbolicLink()) continue;
       const directory = join('contents', source.name, work.name); const file = join(dataDir, directory, 'novel.json');
-      if (existsSync(file)) cacheWork(db, dataDir, directory, readNovelMetadata(file));
+      if (!existsSync(file)) continue;
+      let metadata: NovelMetadataV1;
+      try { metadata = readNovelMetadata(file); } catch { continue; }
+      valid.add(cacheWork(db, dataDir, directory, metadata).id);
     }
   }
+  transaction(db, () => {
+    for (const row of db.prepare('SELECT sequence,entry FROM work_changes').all() as { sequence: number; entry: string }[]) {
+      try { validateNovelMetadata(JSON.parse(row.entry).metadata); }
+      catch { db.prepare('DELETE FROM work_changes WHERE sequence=?').run(row.sequence); }
+    }
+    for (const row of db.prepare('SELECT id FROM works').all() as { id: string }[]) {
+      if (valid.has(row.id)) continue;
+      db.prepare('DELETE FROM work_changes WHERE work_id=?').run(row.id);
+      db.prepare('DELETE FROM works WHERE id=?').run(row.id);
+    }
+    db.exec('DELETE FROM catalog_changes WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works)); DELETE FROM revisions WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works)); DELETE FROM chapters WHERE work_id NOT IN (SELECT id FROM works)');
+  });
 }
 function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
   const id = metadataWorkId(metadata); const existing = rowFor(db, id); if (existing) return existing.directory;
@@ -130,7 +139,13 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
   const directory = workDirectory(db, value);
   const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, id);
   if (collision) throw problem(409, 'Work directory is already assigned');
-  atomicWrite(join(dataDir, directory, 'novel.json'), JSON.stringify(value, null, 2) + '\n');
+  const file = join(dataDir, directory, 'novel.json');
+  let current: unknown;
+  if (existsSync(file)) {
+    const bytes = readBytes(file, metadataByteLimit);
+    try { current = JSON.parse(bytes.toString('utf8')); } catch { current = undefined; }
+  }
+  if (current === undefined || canonicalize(current) !== canonicalize(value)) atomicWrite(file, JSON.stringify(value, null, 2) + '\n');
   return cacheWork(db, dataDir, directory, value);
 }
 export function getWork(db: DatabaseSync, dataDir: string, id: string): WorkEntry {
@@ -144,7 +159,6 @@ export function saveWorkCover(db: DatabaseSync, dataDir: string, id: string, byt
   if (!bytes.length || bytes.length > coverByteLimit) throw problem(413, 'Cover must contain at most 10 MiB');
   const directory = rowFor(db, id)!.directory;
   atomicWrite(join(dataDir, directory, entry.metadata.cover.fileName), bytes);
-  atomicWrite(join(dataDir, directory, 'cover.json'), JSON.stringify({ ...entry.metadata.cover, version: 1, sourceId: entry.metadata.identity.pluginId, novelPath: entry.metadata.identity.novelPath, updatedAt: entry.metadata.updatedAt }, null, 2) + '\n');
   return cacheWork(db, dataDir, directory, entry.metadata);
 }
 
@@ -181,6 +195,6 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     const where = "WHERE (?='' OR instr(lower(json_extract(w.entry,'$.metadata.novel.name') || ' ' || json_extract(w.entry,'$.metadata.identity.pluginId')),lower(?))>0)";
     const args = [request.query.search, request.query.search];
     const rows = db.prepare(`SELECT w.entry,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL) AS downloadedChapters FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string; downloadedChapters: number }[];
-    return { items: rows.map(row => { const entry = JSON.parse(row.entry) as WorkEntry; return { ...entry, chapterCount: entry.metadata.chapters.length, downloadedChapters: row.downloadedChapters }; }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n };
+    return { items: rows.map(row => { const entry = JSON.parse(row.entry) as WorkEntry; return { ...entry, chapterCount: row.downloadedChapters, downloadedChapters: row.downloadedChapters }; }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n };
   });
 }

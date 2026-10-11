@@ -17,8 +17,8 @@ const text = { type: 'string' };
 const nullableText = { type: ['string', 'null'] };
 const identityText = { type: 'string', minLength: 1, maxLength: 4096 };
 const count = { type: 'integer', minimum: 0 };
-const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name'], properties: {
-  id: text, chapterPath: text, position: { type: 'number' }, name: text,
+const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name', 'chapterNumber', 'page', 'contentType'], properties: {
+  id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf'] },
 } };
 const chapterChangeSchema = { type: 'object', required: ['identity', 'deleted', 'sequence'], properties: {
   identity: { type: 'object', required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelPath: text, chapterPath: text } },
@@ -27,7 +27,7 @@ const chapterChangeSchema = { type: 'object', required: ['identity', 'deleted', 
 const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identity', 'novel', 'hasCover', 'chapterCount'], properties: {
   id: text, sequence: count,
   identity: { type: 'object', required: ['pluginId', 'novelPath'], properties: { pluginId: text, novelPath: text } },
-  novel: { type: 'object', required: ['name', 'cover', 'author', 'artist', 'summary', 'status', 'genres', 'isLocal'], properties: { name: text, cover: nullableText, author: nullableText, artist: nullableText, summary: nullableText, status: nullableText, genres: nullableText, isLocal: { type: 'boolean' } } },
+  novel: { type: 'object', required: ['name', 'cover', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal'], properties: { name: text, cover: nullableText, author: nullableText, artist: nullableText, summary: nullableText, status: nullableText, rating: { type: ['number', 'null'], minimum: 0, maximum: 5 }, genres: nullableText, isLocal: { type: 'boolean' } } },
   hasCover: { type: 'boolean' }, chapterCount: count,
 } };
 const pagination = (limit: number) => ({ offset: { ...count, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: limit } });
@@ -90,21 +90,30 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     if (!db.prepare('SELECT 1 FROM works WHERE id=?').get(id) && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
     const total = (db.prepare('SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL').get(id) as { n: number }).n;
     const items = db.prepare(`SELECT id,json_extract(entry,'$.manifest.identity.chapterPath') AS chapterPath,
-      json_extract(entry,'$.manifest.chapter.position') AS position,json_extract(entry,'$.manifest.chapter.name') AS name
+      json_extract(entry,'$.manifest.chapter.position') AS position,json_extract(entry,'$.manifest.chapter.name') AS name,
+      json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType
       FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
     return { items, total, hasMore: offset + items.length < total };
   });
-  app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string } }>('/api/v1/catalog/chapter', { schema: {
+  app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string } }>('/api/v1/catalog/chapter', { schema: {
     security,
-    description: 'Resolve the current nondeleted package for an exact source, novel and chapter identity. Missing or deleted chapters return 404.',
-    querystring: { type: 'object', additionalProperties: false, required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: identityText, novelPath: identityText, chapterPath: identityText } },
+    description: 'Resolve a package by exact source identity, then optional chapter number within the same exact work. Missing or deleted chapters return 404; ambiguous folder matches return 409.',
+    querystring: { type: 'object', additionalProperties: false, required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: identityText, novelPath: identityText, chapterPath: identityText, chapterNumber: { type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' } } },
     response: { 200: catalogSchema },
   } }, async request => {
     requireRead(request);
-    const { pluginId, novelPath, chapterPath } = request.query;
+    const { pluginId, novelPath, chapterPath, chapterNumber } = request.query;
     const id = digest(JSON.stringify([pluginId, novelPath, chapterPath]));
-    const row = db.prepare('SELECT entry FROM chapters WHERE id=? AND deleted_at IS NULL').get(id) as { entry: string } | undefined;
-    if (!row) throw problem(404, 'Chapter not found');
-    return JSON.parse(row.entry) as CatalogEntry;
+    const row = db.prepare('SELECT entry,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; deleted_at: number | null } | undefined;
+    if (row) {
+      if (row.deleted_at !== null) throw problem(404, 'Chapter not found');
+      return JSON.parse(row.entry) as CatalogEntry;
+    }
+    if (!chapterNumber) throw problem(404, 'Chapter not found');
+    const work = digest(JSON.stringify([pluginId, novelPath]));
+    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL").all(work, chapterNumber) as { entry: string }[];
+    if (!matches.length) throw problem(404, 'Chapter not found');
+    if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
+    return JSON.parse(matches[0].entry) as CatalogEntry;
   });
 }

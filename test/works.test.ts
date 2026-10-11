@@ -10,9 +10,8 @@ import { consoleHeaders, deviceHeaders } from './access.ts';
 
 export function metadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/books/1?lang=ko' },
-    novel: { name: 'Book', cover: 'https://example.com/cover.png', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', genres: 'Fantasy', isLocal: false },
-    chapters: [{ path: '/chapter/1?lang=ko', name: 'First', chapterNumber: '1', position: 1, page: '1', contentType: 'html', releaseTime: null, directory: '1-First' }],
-    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example.com/cover.png' }, updatedAt: 100 };
+    novel: { name: 'Book', cover: 'https://example.com/cover.png', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
+    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example.com/cover.png' } };
 }
 const id = digest(JSON.stringify(['example', '/books/1?lang=ko']));
 async function fixture() {
@@ -40,7 +39,7 @@ test('stores a complete work without chapter packages and transfers authenticate
     assert.equal(catalog.items.length, 1); assert.equal(catalog.items[0].hasCover, true); assert.equal(catalog.hasMore, false);
     const admin = await consoleHeaders(f.app, f.dataDir);
     const listed = (await f.app.inject({ url: '/api/v1/admin/works?search=Book', headers: admin })).json();
-    assert.equal(listed.total, 1); assert.equal(listed.items[0].chapterCount, 1); assert.equal(listed.items[0].downloadedChapters, 0);
+    assert.equal(listed.total, 1); assert.equal(listed.items[0].chapterCount, 0); assert.equal(listed.items[0].downloadedChapters, 0);
     assert.equal((await f.app.inject({ url: '/api/v1/admin/overview', headers: admin })).json().works, 1);
     assert.deepEqual((await f.app.inject({ url: `/api/v1/admin/works/${id}/cover`, headers: admin })).rawPayload, image);
     assert.equal((await f.app.inject({ url: '/api/v1/admin/works', headers: f.headers })).statusCode, 403);
@@ -58,7 +57,7 @@ test('failed atomic replacement keeps the previous metadata and discards its tem
     await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
     const rename = t.mock.method(fs, 'renameSync', () => { throw new Error('Simulated interrupted replace'); }); syncBuiltinESMExports();
     try {
-      const response = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: { ...metadata(), updatedAt: 200 } });
+      const response = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: { ...metadata(), novel: { ...metadata().novel, name: 'Changed' } } });
       assert.equal(response.statusCode, 500);
     } finally { rename.mock.restore(); syncBuiltinESMExports(); }
     assert.deepEqual((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata, metadata());
@@ -98,16 +97,13 @@ test('rejects unsafe metadata and identity mismatches without replacing a valid 
   try {
     assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).statusCode, 200);
     const variants = [
+      { ...metadata(), chapters: [] },
+      { ...metadata(), updatedAt: 1 },
+      { ...metadata(), novel: { ...metadata().novel, rating: 6 } },
+      { ...metadata(), identity: { pluginId: 'example', novelPath: 'https://toki45.com/novel/123' } },
+      { ...metadata(), identity: { pluginId: 'example', novelPath: '//toki45.com/novel/123' } },
+      { ...metadata(), identity: { pluginId: "example", novelPath: "norea-folder:guessed" } },
       { ...metadata(), identity: { pluginId: 'other', novelPath: '/' } },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], directory: '../outside' }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], directory: 'novel.json' }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], directory: 'cover.png' }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], directory: 'cover' }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], directory: 'a'.repeat(241) }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], position: 0.5 }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], position: -1 }] },
-      { ...metadata(), chapters: [{ ...metadata().chapters[0], page: ' ' }] },
-      { ...metadata(), chapters: [...metadata().chapters, { ...metadata().chapters[0] }] },
       { ...metadata(), cover: { ...metadata().cover, fileName: '../cover.png' } },
       { ...metadata(), cover: { ...metadata().cover, fileName: 'cover.json' } },
       { ...metadata(), cover: { ...metadata().cover, fileName: 'cover.PNG' } },
@@ -125,7 +121,7 @@ test('catalog pages and change hints read the index without rescanning authorita
   try {
     const first = (await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).json();
     const source = join(f.dataDir, 'contents/example'); const [folder] = await readdir(source); const file = join(source, folder, 'novel.json');
-    const updated = { ...metadata(), novel: { ...metadata().novel, name: 'File edited now' }, updatedAt: 500 };
+    const updated = { ...metadata(), novel: { ...metadata().novel, name: 'File edited now' } };
     await writeFile(file, JSON.stringify(updated));
     const changes = (await f.app.inject({ url: `/api/v1/changes?workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json();
     assert.equal(changes.workCursor, first.sequence);
@@ -149,15 +145,34 @@ test('rebuilds the work cache from authoritative files and retains its folder on
   try {
     assert.equal((await app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).statusCode, 200);
     const source = join(f.dataDir, 'contents', 'example'); const folders = await readdir(source); assert.equal(folders.length, 1);
-    const file = join(source, folders[0], 'novel.json'); const updated = { ...metadata(), novel: { ...metadata().novel, name: 'Renamed' }, updatedAt: 200 };
+    const file = join(source, folders[0], 'novel.json'); const updated = { ...metadata(), novel: { ...metadata().novel, name: 'Renamed' } };
     await writeFile(file, JSON.stringify(updated));
     await app.close(); app = await buildApp({ dataDir: f.dataDir });
     assert.deepEqual((await app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata, updated);
-    const afterRebuild = { ...updated, novel: { ...updated.novel, name: 'Again' }, updatedAt: 300 };
+    const afterRebuild = { ...updated, novel: { ...updated.novel, name: 'Again' } };
     assert.equal((await app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: afterRebuild })).statusCode, 200);
     assert.deepEqual(await readdir(source), folders); assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), afterRebuild);
     await app.close(); await rm(join(f.dataDir, 'metadata.sqlite')); app = await buildApp({ dataDir: f.dataDir });
     const headers = await deviceHeaders(app);
     assert.deepEqual((await app.inject({ url: `/api/v1/works/${id}`, headers })).json().metadata, afterRebuild);
+  } finally { await app.close(); await rm(f.dataDir, { recursive: true, force: true }); }
+});
+
+
+test('unchanged metadata preserves file timestamps and startup excludes obsolete inferred works', async () => {
+  const f = await fixture(); let app = f.app;
+  try {
+    await app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
+    const [folder] = await readdir(join(f.dataDir, 'contents/example'));
+    const file = join(f.dataDir, 'contents/example', folder, 'novel.json');
+    const before = fs.statSync(file).mtimeMs;
+    await app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
+    assert.equal(fs.statSync(file).mtimeMs, before);
+    const obsolete = { ...metadata(), identity: { pluginId: 'example', novelPath: 'norea-folder:old' }, chapters: [], updatedAt: 1 };
+    await writeFile(file, JSON.stringify(obsolete));
+    await app.close(); app = await buildApp({ dataDir: f.dataDir });
+    assert.deepEqual((await app.inject('/api/v1/catalog/works')).json().items, []);
+    assert.deepEqual((await app.inject('/api/v1/works')).json().items, []);
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), obsolete);
   } finally { await app.close(); await rm(f.dataDir, { recursive: true, force: true }); }
 });

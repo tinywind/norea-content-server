@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { existsSync, statSync, utimesSync, watch } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { openDatabase } from '../src/db.ts';
@@ -27,272 +26,22 @@ async function fixture() {
   const dataDir = join(temp, 'server');
   const directory = join(rootPath, 'contents/example/Book-book/1-First');
   await mkdir(directory, { recursive: true });
-  const metadataDbPath = join(rootPath, 'norea.sqlite');
-  const metadata = new DatabaseSync(metadataDbPath);
-  metadata.exec(`CREATE TABLE novel(id INTEGER PRIMARY KEY,plugin_id TEXT,path TEXT,name TEXT,author TEXT,summary TEXT,is_local INTEGER);
-    CREATE TABLE chapter(id INTEGER PRIMARY KEY,novel_id INTEGER,path TEXT,name TEXT,chapter_number TEXT,position INTEGER,page TEXT,content_type TEXT,stored_content_type TEXT,is_downloaded INTEGER,media_repair_needed INTEGER);
-    CREATE TABLE installed_plugin(id TEXT PRIMARY KEY);
-    INSERT INTO novel VALUES(1,'example','/book','Book','Writer','Summary',0);
-    INSERT INTO chapter VALUES(1,1,'/first','First','1',1,'1','html','html',1,0);`);
-  metadata.close();
+  await writeFile(join(directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
   await writeFile(join(directory, 'content.html'), '<p>norea-media://reader-asset/prose</p><img src="norea-media://reader-asset/a.png">');
   await writeFile(join(directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, updatedAt: 12, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 5, status: 'stored', updatedAt: 12 }] } }));
   await writeFile(join(directory, 'media.zip'), await zip({ 'a.png': 'image' }));
   const db = openDatabase(dataDir);
   const items: FolderIndexItem[] = [];
-  const run = (overrides = {}) => scanFolder({ rootPath, dataDir, metadataDbPath, db, limits: defaultLimits, onItem: item => { items.push(item); }, ...overrides });
+  const run = (overrides = {}) => scanFolder({ rootPath, dataDir, db, limits: defaultLimits, onItem: item => { items.push(item); }, ...overrides });
   const close = async () => { db.close(); await rm(temp, { recursive: true, force: true }); };
-  return { temp, rootPath, dataDir, metadataDbPath, directory, db, items, run, close };
+  return { temp, rootPath, dataDir, directory, db, items, run, close };
 }
 
 function workMetadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/real/book?lang=ko' },
-    novel: { name: 'Portable Book', cover: 'https://example/cover.png', author: 'Writer', artist: null, summary: 'Summary', status: null, genres: null, isLocal: false },
-    chapters: [{ path: '/exact/chapter?number=1', name: 'Different name', chapterNumber: '1', position: 1, page: '1', contentType: 'html', releaseTime: null, directory: '1-First' },
-      { path: '/future', name: 'Undownloaded', chapterNumber: '2', position: 2, page: '1', contentType: 'html', releaseTime: null, directory: '2-Future' }],
-    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png' }, updatedAt: 123 };
+    novel: { name: 'Portable Book', cover: 'https://example/cover.png', author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false },
+    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png' } };
 }
-
-test('recovers numbered folders and their cover identity without database rows or source requests', async t => {
-  const network = t.mock.method(globalThis, 'fetch', () => { throw new Error('No source requests allowed'); });
-  const f = await fixture();
-  try {
-    const directory = join(f.directory, '..');
-    await writeFile(join(directory, 'cover.json'), JSON.stringify({ version: 1, sourceId: 'example', novelPath: '/book', fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://removed.example/cover.png' }));
-    await writeFile(join(directory, 'cover.png'), 'retained cover');
-    for (const name of ['10-Tenth-part-two', '2-Second']) {
-      await mkdir(join(directory, name)); await writeFile(join(directory, name, 'content.html'), '<p>Retained text</p>');
-    }
-    const before = await snapshot(f.rootPath);
-    assert.equal((await f.run({ metadataDbPath: undefined })).registered, 4);
-    const id = digest(JSON.stringify(['example', '/book']));
-    const work = getWork(f.db, f.dataDir, id);
-    assert.equal(work.hasCover, true); assert.equal(work.metadata.novel.name, 'Book');
-    assert.deepEqual(work.metadata.chapters.map(chapter => [chapter.chapterNumber, chapter.name]), [['1', 'First'], ['2', 'Second'], ['10', 'Tenth-part-two']]);
-    assert.equal(work.metadata.chapters[0].path, 'norea-folder:1');
-    assert.equal((await f.run({ metadataDbPath: undefined })).unchanged, 4);
-    assert.equal(getWork(f.db, f.dataDir, id).sequence, work.sequence);
-    assert.deepEqual(await snapshot(f.rootPath), before); assert.equal(network.mock.callCount(), 0);
-  } finally { await f.close(); }
-});
-
-test('retains existing chapter identity and merges newly discovered numbered chapters in the same work', async () => {
-  const f = await fixture();
-  try {
-    await f.run();
-    const directory = join(f.directory, '..', '2-Second'); await mkdir(directory); await writeFile(join(directory, 'content.html'), '<p>Second</p>');
-    const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.unchanged, 1);
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-    assert.deepEqual(work.metadata.chapters.map(chapter => chapter.path), ['/first', 'norea-folder:2']);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 1);
-  } finally { await f.close(); }
-});
-
-test('uses stable folder identity without a sidecar and rejects ambiguous numbered folders', async () => {
-  const f = await fixture();
-  try {
-    await cp(f.directory, join(f.directory, '..', '1-Another-title'), { recursive: true });
-    const result = await f.run({ metadataDbPath: undefined });
-    assert.equal(result.registered, 1); assert.equal(result.skipped, 2);
-    const id = digest(JSON.stringify(['example', 'norea-folder:Book-book']));
-    assert.equal(getWork(f.db, f.dataDir, id).metadata.chapters.length, 0);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-  } finally { await f.close(); }
-});
-
-test('imports legacy covers with a generic binary content type', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify({ version: 1, fileName: 'cover.img', contentType: 'application/octet-stream', sourceUrl: 'https://example/cover' }));
-    await writeFile(join(f.directory, '..', 'cover.img'), 'retained cover');
-    assert.equal((await f.run()).registered, 2);
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-    assert.equal(work.hasCover, true); assert.equal(work.metadata.cover?.contentType, null);
-  } finally { await f.close(); }
-});
-
-test('retains a multi-source plugin identity from server metadata on a database-free rescan', async () => {
-  const f = await fixture();
-  try {
-    const metadata = new DatabaseSync(f.metadataDbPath); metadata.exec("UPDATE novel SET plugin_id='example:site'"); metadata.close();
-    await rename(join(f.rootPath, 'contents/example'), join(f.rootPath, 'contents/example-site'));
-    assert.equal((await f.run()).registered, 2);
-    assert.equal((await f.run({ metadataDbPath: undefined })).unchanged, 2);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 1);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
-  } finally { await f.close(); }
-});
-
-test('prefers exact work mappings when two source paths have overlapping suffixes', async () => {
-  const f = await fixture();
-  try {
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec("INSERT INTO novel VALUES(2,'example','/other/book','Other',NULL,NULL,0); INSERT INTO chapter VALUES(2,2,'/first','First','1',1,'1','html','html',1,0)"); metadata.close();
-    await cp(f.directory, join(f.rootPath, 'contents/example/Other-other-book/1-First'), { recursive: true });
-    assert.equal((await f.run()).registered, 4);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 2);
-  } finally { await f.close(); }
-});
-
-test('reports malformed cover metadata separately and still registers complete chapters', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, '..', 'cover.json'), '{invalid');
-    const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.skipped, 1);
-    assert.ok(f.items.some(item => item.chapterId));
-    assert.match(f.items.find(item => item.status === 'skipped')!.reason!, /Cover metadata/);
-  } finally { await f.close(); }
-});
-
-test('adds newly mapped database chapters to existing portable work metadata', async () => {
-  const f = await fixture();
-  try {
-    await f.run();
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec("INSERT INTO chapter VALUES(2,1,'/second','Second','2',2,'1','html','html',1,0)"); metadata.close();
-    await cp(f.directory, join(f.directory, '..', '2-Second'), { recursive: true });
-    assert.equal((await f.run()).registered, 2);
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-    assert.deepEqual(work.metadata.chapters.map(chapter => chapter.path), ['/first', '/second']);
-  } finally { await f.close(); }
-});
-
-test('keeps a recovered directory identity when an app database is connected later', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify({ version: 1, sourceId: 'example', novelPath: '/book' }));
-    await f.run({ metadataDbPath: undefined });
-    assert.equal((await f.run()).unchanged, 2);
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-    assert.equal(work.metadata.chapters.length, 1); assert.equal(work.metadata.chapters[0].path, 'norea-folder:1');
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
-  } finally { await f.close(); }
-});
-
-test('invalid cover bytes or descriptors never block complete chapter registration', async () => {
-  for (const [sourceUrl, bytes] of [['https://example/cover', ''], ['', 'image']]) {
-    const f = await fixture();
-    try {
-      await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify({ version: 1, fileName: 'cover.png', contentType: 'image/png', sourceUrl }));
-      await writeFile(join(f.directory, '..', 'cover.png'), bytes);
-      const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.skipped, 1);
-      const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-      assert.equal(work.hasCover, false); assert.equal(work.metadata.cover, null);
-    } finally { await f.close(); }
-  }
-});
-
-test('processes bounded chapter batches and drains them before returning', { timeout: 10000 }, async () => {
-  const f = await fixture();
-  try {
-    for (let number = 2; number <= 8; number++) await cp(f.directory, join(f.directory, '..', `${number}-Chapter`), { recursive: true });
-    const before = await snapshot(f.rootPath); let active = 0; let maximum = 0; let finished = 0;
-    let waiting: (() => void)[] = [];
-    const result = await f.run({ onItem: async (item: FolderIndexItem) => {
-      if (!item.chapterId) return;
-      active++; maximum = Math.max(maximum, active);
-      await new Promise<void>(accept => { waiting.push(accept); if (waiting.length === 4) { const batch = waiting; waiting = []; batch.forEach(done => done()); } });
-      active--; finished++;
-    } });
-    assert.equal(result.registered, 9); assert.equal(maximum, 4); assert.equal(finished, 8); assert.equal(active, 0);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-    assert.deepEqual(await readdir(join(f.dataDir, 'staging')), []);
-  } finally { await f.close(); }
-});
-
-test('cancellation during a chapter batch drains source readers before removing staging', async () => {
-  const f = await fixture();
-  try {
-    for (let number = 2; number <= 8; number++) await cp(f.directory, join(f.directory, '..', `${number}-Chapter`), { recursive: true });
-    const before = await snapshot(f.rootPath); const controller = new AbortController();
-    const result = await f.run({ signal: controller.signal, onItem: (item: FolderIndexItem) => { if (item.chapterId) controller.abort(); } });
-    assert.equal(result.cancelled, true);
-    assert.deepEqual(await readdir(join(f.dataDir, 'staging')), []);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
-test('file-only scan registers full work and cover without chapters or an app database', async () => {
-  const f = await fixture();
-  try {
-    await rm(f.directory, { recursive: true }); await rm(f.metadataDbPath);
-    const directory = join(f.rootPath, 'contents/example/Book-book');
-    await writeFile(join(directory, 'novel.json'), JSON.stringify(workMetadata())); await writeFile(join(directory, 'cover.png'), 'cover bytes');
-    const before = await snapshot(f.rootPath);
-    const result = await f.run({ metadataDbPath: undefined }); assert.equal(result.registered, 1); assert.equal(result.failed, 0); assert.equal(result.skipped, 0);
-    const id = digest(JSON.stringify(['example', '/real/book?lang=ko']));
-    const work = getWork(f.db, f.dataDir, id); assert.deepEqual(work.metadata, workMetadata()); assert.equal(work.hasCover, true);
-    assert.equal((await f.run({ metadataDbPath: undefined })).unchanged, 1); assert.equal(getWork(f.db, f.dataDir, id).sequence, work.sequence);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
-test('novel.json identity and directories override stale DB guesses and preserve undownloaded metadata', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
-    const result = await f.run(); assert.equal(result.registered, 2);
-    const item = f.items.find(item => item.chapterId)!;
-    assert.equal(item.chapterId, digest(JSON.stringify(['example', '/real/book?lang=ko', '/exact/chapter?number=1'])));
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
-    const storedWork = f.db.prepare('SELECT directory FROM works').get() as { directory: string };
-    const storedChapter = f.db.prepare('SELECT directory FROM chapters').get() as { directory: string };
-    assert.equal(storedChapter.directory, join(storedWork.directory, '1-First'));
-    assert.equal(getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/real/book?lang=ko']))).metadata.chapters.length, 2);
-  } finally { await f.close(); }
-});
-
-test('invalid present novel.json never falls back to a matching app database chapter', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify({ ...workMetadata(), chapters: [{ ...workMetadata().chapters[0], directory: '../outside' }] }));
-    const result = await f.run(); assert.equal(result.registered, 0); assert.ok(result.skipped > 0);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 0);
-  } finally { await f.close(); }
-});
-
-test('file metadata remains available when remote chapter media prevents a complete package', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
-    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ status: 'remote' }] } }));
-    const result = await f.run({ metadataDbPath: undefined }); assert.equal(result.registered, 1); assert.equal(result.skipped, 1);
-    assert.match(f.items.find(item => item.status === 'skipped')!.reason!, /remote assets/);
-  } finally { await f.close(); }
-});
-
-test('legacy DB-assisted scan creates portable metadata and cover without overwriting a newer server work', async () => {
-  const f = await fixture();
-  try {
-    const cover = { version: 1, sourceId: 'example', novelPath: '/book', fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png', updatedAt: 12 };
-    await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify(cover)); await writeFile(join(f.directory, '..', 'cover.png'), 'legacy image');
-    const before = await snapshot(f.rootPath);
-    assert.equal((await f.run()).registered, 2);
-    const id = digest(JSON.stringify(['example', '/book']));
-    const work = getWork(f.db, f.dataDir, id); assert.equal(work.metadata.chapters[0].path, '/first'); assert.equal(work.hasCover, true);
-    const directory = (f.db.prepare('SELECT directory FROM works WHERE id=?').get(id) as { directory: string }).directory;
-    const newer = { ...work.metadata, novel: { ...work.metadata.novel, name: 'Newer remote title' }, updatedAt: 999 };
-    await writeFile(join(f.dataDir, directory, 'novel.json'), JSON.stringify(newer));
-    await f.run(); assert.deepEqual(getWork(f.db, f.dataDir, id).metadata, newer);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
-test('legacy work cover is registered even when no chapter directory exists', async () => {
-  const f = await fixture();
-  try {
-    await rm(f.directory, { recursive: true });
-    const directory = join(f.rootPath, 'contents/example/Book-book');
-    await writeFile(join(directory, 'cover.json'), JSON.stringify({ version: 1, fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png', updatedAt: 1 }));
-    await writeFile(join(directory, 'cover.png'), 'legacy cover');
-    const before = await snapshot(f.rootPath); let changes = 0;
-    await f.run({ onWorkChange: () => { changes++; } });
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-    assert.equal(work.hasCover, true); assert.equal(work.metadata.chapters.length, 1); assert.equal(changes, 1);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
 
 async function snapshot(root: string): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
@@ -335,128 +84,6 @@ test('indexes a complete chapter, verifies downloadable portable media, and resc
   } finally { await f.close(); }
 });
 
-test('indexes archived local chapters without installed or registered plugins and never checks the source site', async t => {
-  const f = await fixture();
-  const network = t.mock.method(globalThis, 'fetch', () => { throw new Error('Source site is unavailable'); });
-  try {
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec('DROP TABLE installed_plugin'); metadata.close();
-    const before = await snapshot(f.rootPath);
-    assert.equal((await f.run()).registered, 2);
-    const id = f.items.find(item => item.status === 'registered' && item.chapterId)!.chapterId!;
-    assert.equal((await f.run()).unchanged, 2);
-    await rename(join(f.rootPath, 'contents/example'), join(f.temp, 'disconnected-original'));
-    assert.equal((await f.run()).registered, 0);
-    assert.equal(packageStream(f.db, f.dataDir, id).catalog.deleted, false);
-    await rename(join(f.temp, 'disconnected-original'), join(f.rootPath, 'contents/example'));
-    assert.deepEqual(await snapshot(f.rootPath), before);
-    assert.equal(network.mock.callCount(), 0);
-  } finally { await f.close(); }
-});
-
-test('registers a complete archived ZIP using only its manifest and validates its source folder', async t => {
-  const f = await fixture();
-  const network = t.mock.method(globalThis, 'fetch', () => { throw new Error('Source site is unavailable'); });
-  try {
-    const source = join(f.rootPath, 'contents/retired-site'); await mkdir(source);
-    await rm(join(f.directory, '..'), { recursive: true });
-    const body = '<p>Archived chapter</p>';
-    const manifest = { packageVersion: 1, identity: { pluginId: 'retired:site', novelPath: '/removed', chapterPath: '/first' },
-      novel: { name: 'Removed work', isLocal: false }, chapter: { name: 'First', position: 1, chapterNumber: '1', contentType: 'html', page: '1' },
-      bodyPath: 'content.html', files: [{ path: 'content.html', size: Buffer.byteLength(body), sha256: digest(body) }] };
-    const archive = await zip({ 'manifest.json': JSON.stringify(manifest), 'content.html': body });
-    await writeFile(join(source, 'archived.zip'), archive);
-    assert.equal((await f.run({ metadataDbPath: undefined })).registered, 1);
-    const imported = f.items.find(item => item.status === 'registered' && item.chapterId)!;
-    assert.equal(imported.sourceId, 'retired:site');
-    assert.equal(packageStream(f.db, f.dataDir, imported.chapterId!).catalog.manifest.identity.novelPath, '/removed');
-    const wrong = join(f.rootPath, 'contents/unrelated'); await mkdir(wrong);
-    await writeFile(join(wrong, 'mismatched.zip'), archive);
-    await f.run({ metadataDbPath: undefined });
-    assert.ok(f.items.some(item => item.path.endsWith('mismatched.zip') && item.status === 'skipped' && /source.*folder/i.test(item.reason ?? '')));
-    assert.equal(network.mock.callCount(), 0);
-  } finally { await f.close(); }
-});
-
-test('accepts folder identity but skips incomplete media and unfinished directories', async () => {
-  const f = await fixture();
-  try {
-    assert.equal((await f.run()).registered, 2);
-    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: false, media: { files: [] } }));
-    assert.equal((await f.run()).registered, 0);
-    assert.match(f.items.at(-1)!.reason!, /incomplete/i);
-    await mkdir(join(f.rootPath, 'contents/example/.unfinished.tmp'), { recursive: true });
-    await f.run();
-    assert.ok(f.items.some(item => /unfinished/i.test(item.reason ?? '')));
-  } finally { await f.close(); }
-});
-
-test('excludes work covers and Android media markers from chapter scan results', async () => {
-  const f = await fixture();
-  try {
-    const work = join(f.rootPath, 'contents/example/Book-book');
-    for (const name of ['cover.json', 'cover.webp', 'cover.jpg', 'cover.img', '.nomedia']) {
-      await writeFile(join(work, name), name === 'cover.json' ? JSON.stringify({ version: 1, fileName: 'cover.webp', sourceId: 'example', novelPath: '/book' }) : 'cover');
-    }
-    await writeFile(join(f.rootPath, 'contents/example/.nomedia'), '');
-    const before = await snapshot(f.rootPath);
-    assert.deepEqual(await f.run(), { scanned: 2, registered: 2, unchanged: 0, skipped: 0, failed: 0, cancelled: false });
-    assert.deepEqual(f.items.map(item => item.path), [work, f.directory]);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
-test('reports remote-only media before missing database identity even when the media manifest says complete', async () => {
-  const f = await fixture();
-  try {
-    await rm(join(f.directory, 'media.zip'));
-    await writeFile(join(f.directory, 'content.html'), '<img src="https://example.com/page.jpg">');
-    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ fileName: 'page.jpg', path: 'media/page.jpg', bytes: 0, status: 'remote', sourceUrl: 'https://example.com/page.jpg' }] } }));
-    const result = await f.run({ metadataDbPath: undefined });
-    assert.equal(result.registered, 1);
-    assert.equal(result.skipped, 1);
-    assert.match(f.items.find(item => item.status === 'skipped')!.reason!, /media.*not downloaded.*remote/i);
-  } finally { await f.close(); }
-});
-
-test('imports text-only and PDF chapter bodies without a media manifest or archive', async () => {
-  for (const contentType of ['html', 'pdf']) {
-    const f = await fixture();
-    try {
-      await rm(join(f.directory, 'manifest.json'));
-      await rm(join(f.directory, 'media.zip'));
-      await rm(join(f.directory, 'content.html'));
-      const fileName = contentType === 'pdf' ? 'content.pdf' : 'content.html';
-      const body = contentType === 'pdf' ? '%PDF-1.4\n%%EOF' : '<p>Offline text chapter</p>';
-      await writeFile(join(f.directory, fileName), body);
-      const metadata = new DatabaseSync(f.metadataDbPath);
-      metadata.prepare('UPDATE chapter SET content_type=?,stored_content_type=?').run(contentType, contentType);
-      metadata.close();
-      assert.equal((await f.run()).registered, 2, JSON.stringify(f.items));
-      const chunks: Buffer[] = [];
-      for await (const chunk of packageStream(f.db, f.dataDir, f.items.find(item => item.chapterId)!.chapterId!).open()) chunks.push(chunk);
-      const files = await extractPackage(Buffer.concat(chunks));
-      assert.equal(files[fileName], body);
-      assert.equal(files['media-manifest.json'], undefined);
-    } finally { await f.close(); }
-  }
-});
-
-test('recovers a text chapter from folder rules when the database has no chapter row', async () => {
-  const f = await fixture();
-  try {
-    await rm(join(f.directory, 'manifest.json'));
-    await rm(join(f.directory, 'media.zip'));
-    await writeFile(join(f.directory, 'content.html'), '<p>Offline text chapter</p>');
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec('DELETE FROM chapter'); metadata.close();
-    assert.equal((await f.run()).registered, 2);
-    assert.equal((await f.run({ metadataDbPath: undefined })).unchanged, 2);
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', '/book'])));
-    assert.equal(work.metadata.chapters[0].path, 'norea-folder:1');
-  } finally { await f.close(); }
-});
-
 test('rejects extra media entries, preserves tombstones, and stops on cancellation', async () => {
   const f = await fixture();
   try {
@@ -481,47 +108,6 @@ test('rejects overlapping roots, symlink roots, and media traversal names', asyn
     await assert.rejects(f.run({ rootPath: alias }), /symbolic|symlink/i);
     await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ fileName: '../a.png', path: 'media/../a.png', bytes: 5, status: 'stored' }] } }));
     assert.equal((await f.run()).registered, 1);
-  } finally { await f.close(); }
-});
-
-test('accepts a multi-source identity from content metadata after its plugin is uninstalled', async () => {
-  const f = await fixture();
-  try {
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec("UPDATE novel SET plugin_id='example:site'; DROP TABLE installed_plugin;"); metadata.close();
-    const { rename } = await import('node:fs/promises');
-    await rename(join(f.rootPath, 'contents/example'), join(f.rootPath, 'contents/example-site'));
-    assert.equal((await f.run()).registered, 2);
-  } finally { await f.close(); }
-});
-
-test('reads a live WAL snapshot without creating or changing files in the original root', async () => {
-  const f = await fixture();
-  const live = new DatabaseSync(f.metadataDbPath);
-  try {
-    live.exec("PRAGMA journal_mode=WAL; UPDATE novel SET author='WAL author';");
-    const before = await snapshot(f.rootPath);
-    assert.equal((await f.run()).registered, 2);
-    const row = f.db.prepare('SELECT entry FROM chapters').get() as { entry: string };
-    assert.equal(JSON.parse(row.entry).manifest.novel.author, 'WAL author');
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { live.close(); await f.close(); }
-});
-
-test('imports a current package without metadata and rejects configured expansion limits', async () => {
-  const f = await fixture();
-  try {
-    await f.run();
-    const id = f.items.find(item => item.status === 'registered' && item.chapterId)!.chapterId!;
-    const chunks: Buffer[] = []; for await (const chunk of packageStream(f.db, f.dataDir, id).open()) chunks.push(chunk);
-    await writeFile(join(f.rootPath, 'contents/example/export.zip'), Buffer.concat(chunks));
-    const scan = await f.run({ metadataDbPath: undefined });
-    assert.equal(scan.unchanged, 3);
-    assert.ok(f.items.some(item => item.path.endsWith('export.zip') && item.status === 'unchanged'));
-    const bounded = await f.run({ limits: { zipBytes: 100, expandedBytes: 100, files: 2 } });
-    assert.equal(bounded.registered, 0);
-    assert.equal(bounded.unchanged, 1);
-    assert.equal((await readdir(join(f.dataDir, 'staging'))).length, 0);
   } finally { await f.close(); }
 });
 
@@ -564,65 +150,6 @@ test('rejects a staging symlink before any writes can reach the original root', 
   } finally { await f.close(); }
 });
 
-test('recovers renamed work and chapter folders only from unique database identities', async () => {
-  const f = await fixture();
-  try {
-    const before = await snapshot(f.rootPath);
-    const renamedWork = join(f.rootPath, 'contents/example/Previous-title-book');
-    await rename(join(f.rootPath, 'contents/example/Book-book'), renamedWork);
-    await rename(join(renamedWork, '1-First'), join(renamedWork, '1-Previous-chapter-title'));
-    const renamedSnapshot = await snapshot(f.rootPath);
-    const result = await f.run();
-    assert.equal(result.registered, 2, JSON.stringify(f.items));
-    const row = f.db.prepare('SELECT entry FROM chapters').get() as { entry: string };
-    assert.deepEqual(JSON.parse(row.entry).manifest.identity, { pluginId: 'example', novelPath: '/book', chapterPath: '/first' });
-    assert.equal(Object.keys(before).length, Object.keys(renamedSnapshot).length);
-    assert.deepEqual(await snapshot(f.rootPath), renamedSnapshot);
-  } finally { await f.close(); }
-});
-
-test('skips ambiguous renamed copies and prefers the exact current folder over an older copy', async () => {
-  const f = await fixture();
-  try {
-    const other = join(f.rootPath, 'contents/example/Older-title-book/1-Older-chapter');
-    await cp(f.directory, other, { recursive: true });
-    const exact = await f.run();
-    assert.equal(exact.registered, 2);
-    assert.equal(exact.skipped, 1);
-    assert.ok(f.items.some(item => item.path === other && item.status === 'skipped'));
-    await rename(f.directory, join(f.rootPath, 'contents/example/Book-book/1-Renamed'));
-    const ambiguous = await f.run();
-    assert.equal(ambiguous.registered, 0);
-    assert.equal(ambiguous.unchanged, 2);
-    assert.equal(ambiguous.skipped, 2);
-    assert.ok(f.items.filter(item => item.status === 'skipped').slice(-2).every(item => /ambiguous|multiple/i.test(item.reason ?? '')));
-  } finally { await f.close(); }
-});
-
-test('does not assign one renamed directory to two database chapter identities', async () => {
-  const f = await fixture();
-  try {
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec("INSERT INTO chapter VALUES(2,1,'/another','Another','1',2,'1','html','html',1,0);"); metadata.close();
-    await rename(f.directory, join(f.rootPath, 'contents/example/Book-book/1-Renamed'));
-    const result = await f.run();
-    assert.equal(result.registered, 1);
-    assert.equal(result.skipped, 1);
-    assert.match(f.items.at(-1)!.reason!, /multiple.*identit|ambiguous/i);
-  } finally { await f.close(); }
-});
-
-test('keeps distinct exact metadata paths when chapter-number prefixes happen to coincide', async () => {
-  const f = await fixture();
-  try {
-    const metadata = new DatabaseSync(f.metadataDbPath);
-    metadata.exec("INSERT INTO chapter VALUES(2,1,'/another','Another','1',2,'1','html','html',1,0);"); metadata.close();
-    await cp(f.directory, join(f.rootPath, 'contents/example/Book-book/1-Another'), { recursive: true });
-    const result = await f.run();
-    assert.equal(result.registered, 3, JSON.stringify(f.items));
-  } finally { await f.close(); }
-});
-
 test('retries one changed snapshot and still rejects a source that changes on both attempts', async () => {
   for (const keepChanging of [false, true]) {
     const f = await fixture();
@@ -658,4 +185,110 @@ test('media manifest key order does not create another revision for the same con
     const files = await extractPackage(Buffer.concat(chunks));
     assert.equal(files['media-manifest.json'], '{"complete":true,"media":{"files":[{"bytes":5,"fileName":"a.png","path":"media/a.png","status":"stored","updatedAt":0}]},"updatedAt":0,"version":1}');
   } finally { await f.close(); }
+});
+
+
+test('requires metadata-only novel.json and discovers chapters without guessed work identities', async () => {
+  const f = await fixture();
+  try {
+    await rm(join(f.directory, '..', 'novel.json'));
+    const noMetadata = await f.run();
+    assert.equal(noMetadata.registered, 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 0);
+    const value = workMetadata();
+    const portable = value;
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(portable));
+    const before = await snapshot(f.rootPath);
+    const result = await f.run();
+    assert.equal(result.registered, 2, JSON.stringify(f.items));
+    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', portable.identity.novelPath])));
+    assert.deepEqual(work.metadata, portable);
+    const chapter = JSON.parse((f.db.prepare('SELECT entry FROM chapters').get() as { entry: string }).entry);
+    assert.equal(chapter.manifest.identity.chapterPath, 'norea-folder:1');
+    assert.equal(chapter.manifest.identity.novelPath, portable.identity.novelPath);
+    assert.deepEqual(await snapshot(f.rootPath), before);
+  } finally { await f.close(); }
+});
+
+
+test('metadata-only works and covers import without source requests or chapter files', async t => {
+  const network = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected source request'); });
+  const f = await fixture();
+  try {
+    await rm(f.directory, { recursive: true });
+    await writeFile(join(f.directory, '..', 'cover.png'), 'cover bytes');
+    const before = await snapshot(f.rootPath);
+    assert.equal((await f.run()).registered, 1);
+    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', workMetadata().identity.novelPath])));
+    assert.equal(work.hasCover, true); assert.deepEqual(work.metadata, workMetadata());
+    assert.equal((await f.run()).unchanged, 1);
+    assert.equal(network.mock.callCount(), 0); assert.deepEqual(await snapshot(f.rootPath), before);
+  } finally { await f.close(); }
+});
+
+test('missing or invalid work metadata never falls back to covers, databases, or folder names', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify({ version: 1, sourceId: 'example', novelPath: '/book', fileName: 'cover.png' }));
+    await writeFile(join(f.rootPath, 'norea.sqlite'), 'Old database is not read');
+    for (const value of [null, '{broken', { ...workMetadata(), identity: { pluginId: 'example', novelPath: 'norea-folder:Book' } }, { ...workMetadata(), chapters: [] }]) {
+      const file = join(f.directory, '..', 'novel.json');
+      if (value === null) await rm(file); else await writeFile(file, typeof value === 'string' ? value : JSON.stringify(value));
+      const result = await f.run(); assert.equal(result.registered, 0);
+      assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 0);
+      assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
+    }
+  } finally { await f.close(); }
+});
+
+test('duplicate numbers and unfinished bodies remain unavailable within an exact work', async () => {
+  const f = await fixture();
+  try {
+    await cp(f.directory, join(f.directory, '..', '1-Duplicate'), { recursive: true });
+    const incomplete = join(f.directory, '..', '2-Incomplete'); await mkdir(incomplete);
+    await writeFile(join(incomplete, 'content.html'), 'partial'); await writeFile(join(incomplete, 'content.html.part'), 'partial');
+    const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.skipped, 3);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+test('remote media and ambiguous body formats are skipped without losing work metadata', async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ status: 'remote' }] } }));
+    assert.equal((await f.run()).skipped, 1); assert.match(f.items.at(-1)!.reason!, /not downloaded/);
+    await writeFile(join(f.directory, 'content.pdf'), '%PDF-1.4');
+    assert.equal((await f.run()).skipped, 1); assert.match(f.items.at(-1)!.reason!, /exactly one/);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 1);
+  } finally { await f.close(); }
+});
+
+test('text-only and PDF folders need no media manifest and preserve title hyphens', async () => {
+  const f = await fixture();
+  try {
+    await rm(f.directory, { recursive: true });
+    for (const [name, body] of [['2-Title-with-hyphens', 'content.html'], ['10-Tenth', 'content.pdf']]) {
+      const directory = join(f.directory, '..', name); await mkdir(directory); await writeFile(join(directory, body), body === 'content.pdf' ? '%PDF-1.4\n%%EOF' : '<p>Text</p>');
+    }
+    const result = await f.run(); assert.equal(result.registered, 3, JSON.stringify(f.items));
+    const chapters = (f.db.prepare("SELECT entry FROM chapters ORDER BY json_extract(entry,'$.manifest.chapter.position')").all() as { entry: string }[]).map(row => JSON.parse(row.entry).manifest);
+    assert.deepEqual(chapters.map(value => [value.chapter.name, value.chapter.chapterNumber, value.chapter.contentType]), [['Title-with-hyphens', '2', 'html'], ['Tenth', '10', 'pdf']]);
+  } finally { await f.close(); }
+});
+
+test('package manifests retain exact chapter paths only when their work matches novel.json', async () => {
+  for (const novelPath of [workMetadata().identity.novelPath, '/wrong']) {
+    const f = await fixture();
+    try {
+      await rm(f.directory, { recursive: true }); await mkdir(f.directory);
+      const body = '<p>Saved package</p>';
+      const manifest = { packageVersion: 1, identity: { pluginId: 'example', novelPath, chapterPath: '/original/chapter?number=1' }, novel: { name: 'Portable Book', isLocal: false }, chapter: { name: 'Original title', chapterNumber: '1', position: 1, page: '3', contentType: 'html' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: Buffer.byteLength(body), sha256: digest(body) }] };
+      await writeFile(join(f.directory, 'package.zip'), await zip({ 'manifest.json': JSON.stringify(manifest), 'content.html': body }));
+      const result = await f.run();
+      assert.equal(result.registered, novelPath === workMetadata().identity.novelPath ? 2 : 1);
+      const row = f.db.prepare('SELECT entry FROM chapters').get() as { entry: string } | undefined;
+      if (row) assert.deepEqual(JSON.parse(row.entry).manifest.identity, manifest.identity);
+      else assert.match(f.items.at(-1)!.reason!, /work identity differs/);
+    } finally { await f.close(); }
+  }
 });

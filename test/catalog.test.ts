@@ -12,7 +12,7 @@ import type { NovelMetadataV1 } from '../src/works.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 function metadata(pluginId: string, name: string): NovelMetadataV1 {
-  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, cover: null, author: 'Writer', artist: null, summary: 'Summary', status: null, genres: null, isLocal: false }, chapters: [], cover: null, updatedAt: 1 };
+  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, cover: null, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null };
 }
 async function fixture(anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });
@@ -25,8 +25,10 @@ async function fixture(anonymousRead = true) {
     assert.equal(response.statusCode, 200, response.body); return response.json();
   };
   const putChapter = async (work: NovelMetadataV1, path: string, position: number) => {
+    const id = digest(JSON.stringify([work.identity.pluginId, work.identity.novelPath]));
+    if ((await app.inject({ url: `/api/v1/works/${id}`, headers })).statusCode === 404) await putWork(work);
     const bytes = Buffer.from('Chapter content');
-    const manifest: PackageManifest = { packageVersion: 1, identity: { ...work.identity, chapterPath: path }, novel: { name: work.novel.name, isLocal: work.novel.isLocal }, chapter: { name: path, position, contentType: 'text', page: '1' }, bodyPath: 'content.txt', files: [{ path: 'content.txt', size: bytes.length, sha256: digest(bytes) }] };
+    const manifest: PackageManifest = { packageVersion: 1, identity: { ...work.identity, chapterPath: path }, novel: { name: work.novel.name, isLocal: work.novel.isLocal }, chapter: { name: path, position, chapterNumber: String(position), contentType: 'text', page: '1' }, bodyPath: 'content.txt', files: [{ path: 'content.txt', size: bytes.length, sha256: digest(bytes) }] };
     const zip = new ZipFile(); zip.addBuffer(Buffer.from(JSON.stringify(manifest)), 'manifest.json'); zip.addBuffer(bytes, 'content.txt'); zip.end();
     const chunks: Buffer[] = []; for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
     const response = await app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...headers, 'content-type': 'application/zip' }, payload: Buffer.concat(chunks) });
@@ -40,7 +42,7 @@ test('browses current work summaries with bounded pages, literal search and sour
   try {
     const a = metadata('source-a', 'Alpha'); const b = metadata('source-b', 'Beta'); const c = metadata('source-a', 'Gamma%');
     const first = await f.putWork(a); await f.putWork(b); await f.putWork(c);
-    await f.putWork({ ...a, novel: { ...a.novel, summary: 'Updated' }, updatedAt: 2 });
+    await f.putWork({ ...a, novel: { ...a.novel, summary: 'Updated' } });
     await f.putChapter(a, '/chapter/one', 1);
     const response = await f.app.inject('/api/v1/catalog/works?limit=2');
     assert.equal(response.statusCode, 200, response.body);
@@ -74,7 +76,7 @@ test('pages live chapters by position and id and resolves exact identities witho
     const last = await f.putChapter(work, '/chapter/last?x=1&y=2', 8);
     const first = await f.putChapter(work, '/chapter/first', 1); const tied = await f.putChapter(work, '/chapter/tied', 1);
     const ordered = [first, tied].sort((a, b) => a.id.localeCompare(b.id));
-    const summarize = (entry: typeof first) => ({ id: entry.id, chapterPath: entry.manifest.identity.chapterPath, position: entry.manifest.chapter.position, name: entry.manifest.chapter.name });
+    const summarize = (entry: typeof first) => ({ id: entry.id, chapterPath: entry.manifest.identity.chapterPath, position: entry.manifest.chapter.position, name: entry.manifest.chapter.name, chapterNumber: entry.manifest.chapter.chapterNumber, page: entry.manifest.chapter.page, contentType: entry.manifest.chapter.contentType });
     const page = (await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters?limit=1`)).json();
     assert.deepEqual(page, { items: [summarize(ordered[0])], total: 3, hasMore: true });
     assert.deepEqual((await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters?offset=1&limit=2`)).json(), { items: [summarize(ordered[1]), summarize(last)], total: 3, hasMore: false });
@@ -90,6 +92,29 @@ test('pages live chapters by position and id and resolves exact identities witho
     assert.equal((await f.app.inject(`/api/v1/catalog/works/${'f'.repeat(64)}/chapters`)).statusCode, 404);
     const empty = await f.putWork(metadata('source-a', 'Empty'));
     assert.deepEqual((await f.app.inject(`/api/v1/catalog/works/${empty.id}/chapters`)).json(), { items: [], total: 0, hasMore: false });
+  } finally { await f.close(); }
+});
+
+test('resolves folder chapters only within the exact canonical work', async () => {
+  const f = await fixture();
+  try {
+    const work = metadata('source-a', 'A work');
+    const stored = await f.putChapter(work, 'norea-folder:7', 7);
+    const query = new URLSearchParams({ ...work.identity, chapterPath: '/chapter/seven', chapterNumber: '7' });
+    const lookup = () => f.app.inject(`/api/v1/catalog/chapter?${query}`);
+    assert.deepEqual((await lookup()).json(), stored);
+    query.set('novelPath', '/different'); assert.equal((await lookup()).statusCode, 404);
+    query.set('novelPath', work.identity.novelPath);
+    await f.putChapter(work, '/chapter/other', 7);
+    assert.equal((await lookup()).statusCode, 409);
+    const exact = await f.putChapter(work, '/chapter/seven', 7);
+    assert.deepEqual((await lookup()).json(), exact);
+    await f.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${exact.id}`, headers: f.headers });
+    assert.equal((await lookup()).statusCode, 404);
+    const other = metadata('source-a', 'Another work');
+    const original = await f.putChapter(other, '/original/chapter', 3);
+    const reverse = new URLSearchParams({ ...other.identity, chapterPath: 'norea-folder:3', chapterNumber: '3' });
+    assert.deepEqual((await f.app.inject(`/api/v1/catalog/chapter?${reverse}`)).json(), original);
   } finally { await f.close(); }
 });
 

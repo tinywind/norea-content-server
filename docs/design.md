@@ -496,8 +496,8 @@ site to verify a work's existence. Local imports follow the same completeness an
 identity rules. Each connection has manual, periodic, or change-driven scanning;
 periodic reconciliation also covers missed filesystem events. A scan reports each registered, unchanged,
 skipped, or failed candidate. Unsupported old formats and incomplete assets are
-skipped without conversion or repair. Missing original site addresses do not
-prevent registration under the existing readable folder rules.
+skipped without conversion or repair. Every work requires valid original identity
+and title metadata in its source-folder `novel.json`.
 
 The walker excludes work-level cover images, `cover.json`, and `.nomedia` markers
 from chapter counts and skip reports. Cover synchronization is not part of the
@@ -507,34 +507,22 @@ It may exist without `media.zip`; even a complete manifest can contain remote
 assets. The importer reports these as undownloaded media and leaves the chapter
 unavailable until its required assets are stored locally.
 
-For legacy work folders, retain database identities or `cover.json` source/work
-identities when available. Recover chapter numbers and titles from
-`<number>-<title>`, splitting only at the first separator. A known chapter path
-from database or server metadata takes precedence; otherwise use
-`norea-folder:<number>` inside the same work. If no work identity survives, use
-`norea-folder:<work-folder-name>`. These identifiers describe stored content and
-do not claim to reconstruct source URLs. Sort new chapters numerically and retain
-title hyphens. Duplicate numbers without an exact metadata match are ambiguous
-and remain skipped. Existing richer server metadata stays intact; new folder
-chapters are appended to its catalog. Work metadata and cover registration have
-their own Jobs entries, including unchanged outcomes on repeated scans.
+Work identity and title come exclusively from `novel.json`. Missing or invalid
+metadata skips the whole work; folder names, cover sidecars, and old databases
+cannot establish a work identity. No plugin or source-site requests are made.
 
-When a site removes a work, its complete local chapters can still be registered
-from the saved metadata. Previously published server copies remain available
-when a site, plugin, repository, or local original disappears. Explicit server
-deletion and its tombstones remain authoritative; scanning does not undo them.
+Discover actual chapters from `<number>-<title>` folders, splitting at the first
+hyphen. Keep original chapter paths in valid package manifests whose work identity
+matches `novel.json`. Raw folders use `norea-folder:<number>` within that exact
+work. Synthetic work identities are rejected. Duplicate chapter numbers,
+conflicting bodies, incomplete media, and changing files are skipped.
 
-For existing folders, an optional Norea database path supplies exact source,
-work, and chapter identities. The importer copies a stable database/WAL snapshot
-to server staging before opening SQLite; it never opens the original database
-with SQLite. Only content fields are used, never account reading state or source
-credentials. Snapshot files are removed when the job ends. A chapter file that
-changes during its first copy is retried once, accommodating OneDrive hydration.
-Continued file changes are skipped until a later scan. An unavailable database
-snapshot leaves the importer using file metadata and folder rules.
-The importer accepts renamed work or chapter folders only when the existing
-database identity maps uniquely to their retained path suffix or chapter prefix.
-Media manifests use stable key ordering compatible with app package exports.
+Metadata-only works and covers can be registered independently. A removed source
+work or plugin does not prevent importing a complete local copy with valid work
+metadata. Explicit server deletions remain authoritative. Snapshot files are
+removed when the job ends. A chapter file that changes during its first copy is
+retried once; continued changes are skipped. Media manifests use stable key
+ordering compatible with app package exports.
 
 The original Norea folder and metadata files are read-only inputs: no manifests,
 locks, repairs, renames, deletions, or database side effects are written there.
@@ -554,22 +542,49 @@ Private filesystem paths and job results require administrator authentication.
 
 ## Filesystem Metadata v1
 
-Each readable work directory stores a `novel.json` document with `schemaVersion: 1`,
-exact source/work identities, work metadata, all known chapter identities and
-relative chapter directories, and an optional cover descriptor. The same directory
-contains `cover.json` and the cover image. Chapter catalogs include undownloaded
-chapters; reading positions, bookmarks, and library membership stay device-local.
+Each work directory stores this metadata-only document:
 
-Files are authoritative. The app retains searchable metadata in SQLite for
-undownloaded and library-added works, and the server rebuilds its work index from
-its owned files. Both use a single v1 database bootstrap; this development change
-does not provide migrations from earlier app schemas.
+```json
+{
+  "schemaVersion": 1,
+  "identity": { "pluginId": "example", "novelPath": "/novel/123456" },
+  "novel": {
+    "name": "Example work",
+    "cover": "https://example.com/cover.jpg",
+    "author": null,
+    "artist": null,
+    "summary": null,
+    "status": "Ongoing",
+    "rating": 4.5,
+    "genres": null,
+    "isLocal": false
+  },
+  "cover": {
+    "fileName": "cover.jpg",
+    "contentType": "image/jpeg",
+    "sourceUrl": "https://example.com/cover.jpg"
+  }
+}
+```
 
-Folder scans prefer `novel.json` and register work metadata and covers independently
-of complete chapter packages. Invalid present metadata is skipped rather than
-replaced with database guesses. Legacy folders can use the optional read-only app
-database snapshot. No source-site or plugin request is required, and neither path
-writes into the connected original folder.
+All fields are required. Text metadata and rating may be null; rating is finite
+and between 0 and 5. The entire cover descriptor may be null. Status preserves
+the source text. `identity.novelPath` excludes the source base URL and retains
+identity query parameters, such as `/webtoon/list?titleId=123`. Absolute HTTP(S),
+protocol-relative, and synthetic `norea-folder:` work paths are rejected.
+
+No chapter list or update timestamp is stored in `novel.json`. Chapter listings
+come from actual imported or uploaded packages; source pagination, reading state,
+and sync bookkeeping are excluded. The lightweight chapter catalog includes
+number, page, and content type without package file inventories. Number fallback
+lookup is limited to a unique chapter in the exact canonical work.
+
+Files are authoritative. The server indexes valid owned work files at startup
+and removes obsolete inferred entries from its metadata and chapter indexes.
+Their files remain on disk. Source imports require valid `novel.json` and never
+write to the connected root. Cover descriptors select local image files.
+Identical metadata preserves the file timestamp; sync sequence numbers stay in
+the server database. Upload clients register work metadata before chapter packages.
 
 `GET /api/v1/works?after=0&limit=100` provides incremental work changes.
 `GET` and device-authenticated `PUT /api/v1/works/:id` transfer metadata;

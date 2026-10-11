@@ -41,9 +41,9 @@ function chapterDirectory(manifest: PackageManifest): string {
   const plugin = safeSegment(manifest.identity.pluginId, 'source');
   const novel = `${safeLabel(manifest.novel.name, 'novel')}-${safeSegment(manifest.identity.novelPath, 'novel')}`;
   const chapter = `${safeSegment(manifest.chapter.chapterNumber, manifest.chapter.position > 0 ? String(manifest.chapter.position) : 'chapter')}-${safeLabel(manifest.chapter.name, 'chapter')}`;
-  const path = `contents/${plugin}/${novel}/${chapter}`;
-  if (!safeArchivePath(path)) throw problem(400, 'Content identity cannot be stored in a portable readable directory');
-  return join('contents', plugin, novel, chapter);
+  const path = join('contents', plugin, novel, chapter);
+  if (!safeArchivePath(path.split('\\').join('/'))) throw problem(400, 'Content identity cannot be stored in a portable readable directory');
+  return path;
 }
 
 export function safeArchivePath(path: string): boolean {
@@ -206,8 +206,8 @@ export async function publishPackage(db: DatabaseSync, dataDir: string, input: R
       if (previous?.deleted) throw problem(409, 'Revision was permanently deleted');
       if (previous?.path) return JSON.parse(previous.entry);
       const storedWork = db.prepare('SELECT directory,entry FROM works WHERE id=?').get(work) as { directory: string; entry: string } | undefined;
-      const storedChapter = storedWork ? (JSON.parse(storedWork.entry).metadata.chapters as { path: string; directory: string }[]).find(chapter => chapter.path === manifest.identity.chapterPath) : undefined;
-      const directory = existing?.directory ?? (storedWork ? join(storedWork.directory, storedChapter?.directory ?? basename(chapterDirectory(manifest))) : chapterDirectory(manifest));
+      if (!storedWork || manifest.identity.novelPath.startsWith('norea-folder:')) throw problem(409, 'Register exact work metadata before uploading chapter packages');
+      const directory = existing?.directory ?? join(storedWork.directory, basename(chapterDirectory(manifest)));
       if (!existing && db.prepare('SELECT id FROM chapters WHERE lower(directory)=lower(?) AND id<>?').get(directory, id)) throw problem(409, 'Readable chapter directory is already used by another identity');
       const file = join(directory, `${revision}.zip`);
       mkdirSync(join(dataDir, directory), { recursive: true });

@@ -70,20 +70,25 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   represented by current work metadata, ordered by source ID.
 - `GET /api/v1/catalog/works/:id/chapters?offset=0&limit=100` returns
   `{items,total,hasMore}` with current nondeleted chapter summaries containing
-  `{id,chapterPath,position,name}`, ordered by chapter position and ID. Package
+  `{id,chapterPath,position,name,chapterNumber,page,contentType}`, ordered by chapter position and ID. Package
   file manifests are excluded. Unknown works return 404; known works without packages return
   an empty page. Both paginated endpoints accept limits from 1 to 100. Concurrent
   writes can shift offset pages; these pages are for browsing, not change tracking.
 - `GET /api/v1/catalog/chapter?pluginId=...&novelPath=...&chapterPath=...` resolves
   one available chapter by its exact, URL-encoded identity. Missing or deleted
   entries return 404. Use its ID with the existing chapter package download route.
+  Optional numeric `chapterNumber` matches a unique chapter within the exact
+  same plugin ID and novel path. Exact identities take priority;
+  an exact deletion is not replaced by a folder match. Multiple matches return
+  409. The endpoint uses indexed chapter IDs and does not contact source sites.
   Catalog browsing follows the same anonymous-read and device-key policies as
   downloads. Queries read the current SQLite index without rescanning files.
   Import scans, API writes, and startup indexing populate that index. Use
   `GET /api/v1/works/:id` for full work metadata and
   `GET /api/v1/works/:id/cover` for the selected cover.
 - `POST /api/v1/packages` streams an authenticated raw `application/zip` upload.
-  Every declared file is checked for size and SHA-256, and undeclared files,
+  Register the exact work with `PUT /api/v1/works/:id` first; missing work
+  metadata returns 409. Every declared file is checked for size and SHA-256, and undeclared files,
   unsafe paths, duplicates, symlinks, encryption and invalid metadata are rejected.
   HTML resource URLs must be embedded data or declared package files. CSS imports
   and escaped CSS URLs are rejected; nested resource references inside separate
@@ -118,7 +123,7 @@ database tables are retained without being used; existing content remains availa
 ## Storage and limits
 
 Packages use the Norea readable directory rules:
-`contents/<plugin>/<work-name>-<work-path>/<chapter-number>-<chapter-name>/<revision>.zip`.
+`contents/<plugin>/<work-name>-<work-id-prefix>/<chapter-number>-<chapter-name>/<revision>.zip`.
 An identity that collides with another chapter's sanitized directory is rejected.
 Each ZIP contains portable body/assets and its manifest. ZIPs stream through a
 staging directory and are validated before becoming visible in SQLite.
@@ -181,51 +186,42 @@ and are visible in the authenticated management console.
 Connect a Norea root containing `contents/` under Folders. Scans traverse source
 directories regardless of plugin registration, installation, or enabled status.
 They never check the original site or whether it still publishes the work.
-For raw downloaded folders, an optional Norea SQLite database supplies retained
-source addresses and richer metadata. The server
-copies a stable database/WAL snapshot into its staging directory and reads only
-content metadata from that copy. Original files and databases are never opened
-for writing. Do not place server data inside a connected root or vice versa.
-Ambiguous folders, unsupported old formats, incomplete media, and files changing
-during inspection are skipped with reasons in Jobs. Valid complete package ZIPs
-can also be registered without a Norea metadata database.
+Each work folder must contain valid `novel.json` with its original plugin ID,
+base-URL-relative work path, title, and metadata. Missing or invalid metadata
+skips the whole work. The importer never recovers work identity from a folder
+name, `cover.json`, an old app database, or source-site requests. Synthetic
+`norea-folder:` work identities are rejected.
 
-Work-level `cover.json` and cover images are not chapter candidates and do not
-count as skipped chapters. They are registered with their work and synchronized
-separately from chapter packages. The console shows work covers in grid or list
-view and exposes full metadata through the Metadata action. Text-only
-chapters do not need `manifest.json` or `media.zip`. A chapter's `manifest.json`
-describes media assets, not its source/work/chapter identity; it can exist without
-an archive and can list remote assets even when marked complete. Those assets
-must be stored locally before the chapter can be imported.
+`novel.json` contains only `schemaVersion`, `identity`, `novel`, and `cover`.
+It has no chapter list or update timestamp. Work metadata includes the original
+status text and a nullable rating from 0 to 5. Cover files named by its descriptor
+are copied separately. Metadata-only works can be registered without chapters.
+See [Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1).
 
-Legacy chapter folders follow `<number>-<title>`. The first separator divides
-the chapter number from its title; further hyphens remain part of the title.
-The importer retains known chapter paths and recovers missing metadata from this
-rule. It uses the work identity in `cover.json` when available, so recovered
-chapters join that same work. A missing chapter address becomes `norea-folder:<number>`;
-this is a local identity, not a reconstructed site URL. Without any retained work
-identity, `norea-folder:<work-folder-name>` identifies the work. Duplicate numbers
-without exact metadata are skipped. Repeated scans preserve these identities.
-Jobs report work metadata and chapters separately, including unchanged entries.
+Chapter folders follow `<number>-<title>`. Additional hyphens belong to the title.
+The scanner discovers actual `content.html` or `content.pdf` files and complete
+chapter packages. Package manifests retain original chapter paths only when their
+work identity matches `novel.json`. Raw folders use `norea-folder:<number>` as a
+chapter identity within that exact work. Duplicate numbers, conflicting body
+formats, unfinished files, and incomplete media are skipped with reasons in Jobs.
 
-New Norea work folders contain authoritative `novel.json` metadata, including all
-known chapters and their exact storage directories. These folders can be indexed
-without an app database, including works with a cover but no complete chapter.
-SQLite retains a rebuildable metadata index. Metadata and cover changes use the
-incremental `/api/v1/works` API independently of chapter downloads. See
-[Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1) for the contract.
+Text-only chapters need no media manifest or archive. A chapter's `manifest.json`
+describes media assets and contains no source identities. Remote assets remain
+incomplete even when the manifest says `complete`; all referenced media must be
+stored locally. Work covers and `.nomedia` markers are not chapter candidates.
 
-A removed source work or plugin does not remove a server copy or prevent a
-complete local copy from being registered. Losing a local file also leaves the
-server copy intact. Only explicit server deletion changes its availability.
+The source folder is read-only. Source files are snapshotted into server staging,
+verified, and published as immutable packages. A file changed during its first
+copy is retried once. Cloud providers may hydrate files during reads; the server
+never writes to originals. Source and server storage must not overlap. Abandoned
+import snapshots are removed from server staging at startup.
 
-Renamed work/chapter folders can match the same known database identity when the
-mapping is unique; ambiguous duplicates are skipped. A file whose metadata changes
-during its first copy is retried once, then skipped if still changing. Reading
-cloud-backed files may cause the cloud provider to hydrate them or update provider
-metadata; the server itself never writes to the originals. Abandoned importer
-snapshots are removed from server staging on startup after a crash.
+SQLite indexes valid server-owned work files and available chapter packages.
+Startup excludes obsolete inferred work metadata and its chapter index entries,
+while retaining those files on disk. Metadata and cover changes use the work
+cursor independently of chapter packages. Unchanged metadata does not rewrite
+`novel.json`. Source disappearance does not delete a server copy; explicit server
+deletions and tombstones remain authoritative.
 
 Choose Manual, Periodic, or Changes scanning. Changes uses filesystem events
 with a two-second debounce plus periodic reconciliation. Unlike app sync, these

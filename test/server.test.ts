@@ -9,10 +9,14 @@ import { ZipFile } from 'yazl';
 import { buildApp } from '../src/app.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 import { DatabaseSync } from 'node:sqlite';
+import { saveWork } from '../src/works.ts';
+import { openDatabase } from '../src/db.ts';
 
 async function setup(anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(join('.tmp', 'test-'));
+  const db = openDatabase(dataDir);
+  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/book/one' }, novel: { name: 'Example book', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }); db.close();
   const app = await buildApp({ dataDir, anonymousRead });
   return { app, dataDir, device: () => deviceHeaders(app), admin: () => consoleHeaders(app, dataDir), close: async () => { await app.close(); await rm(dataDir, { recursive: true }); } };
 }
@@ -30,6 +34,17 @@ async function archive(body = '<p>Chapter one</p>', change: (manifest: any) => v
   for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
+
+test('rejects packages without exact registered work metadata', async () => {
+  const s = await setup();
+  try {
+    for (const novelPath of ['norea-folder:guessed', '/unregistered']) {
+      const payload = await archive(undefined, manifest => { manifest.identity.novelPath = novelPath; });
+      const response = await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...await s.device(), 'content-type': 'application/zip' }, payload });
+      assert.equal(response.statusCode, 409, response.body);
+    }
+  } finally { await s.close(); }
+});
 
 test('catalog changes reject old personal cursors, invalid cursors and unavailable future history', async () => {
   const s = await setup(false);
@@ -134,8 +149,8 @@ test('complete ZIP publication is idempotent, readable, resumable, and persisten
     const entry = upload.json();
     assert.equal((await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers, payload: zip })).json().sequence, entry.sequence);
     const folders = await readdir(join(s.dataDir, 'contents', 'example'));
-    assert.deepEqual(folders, ['Example-book-book-one']);
-    assert.deepEqual(await readdir(join(s.dataDir, 'contents', 'example', folders[0])), ['1-First-chapter']);
+    assert.equal(folders.length, 1); assert.match(folders[0], /^Example book-[a-f0-9]{16}$/);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', 'example', folders[0])), ['1-First-chapter', 'novel.json']);
     const download = await s.app.inject({ url: `/api/v1/chapters/${entry.id}/package`, headers: { range: 'bytes=10-29', 'if-range': `"${entry.zipSha256}"` } });
     assert.equal(download.statusCode, 206);
     assert.deepEqual(download.rawPayload, zip.subarray(10, 30));
@@ -277,6 +292,8 @@ test('a complete HTML chapter with a packaged image publishes and restores from 
     const body = Buffer.from('<p>Image</p><img src="media/pixel.png">');
     const asset = Buffer.from('owned-test-image-bytes');
     const manifest = { packageVersion: 1, identity: { pluginId: 'example', novelPath: '/images', chapterPath: '/one' }, novel: { name: 'Images', isLocal: true }, chapter: { name: 'One', position: 1, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: body.length, sha256: createHash('sha256').update(body).digest('hex') }, { path: 'media/pixel.png', size: asset.length, sha256: createHash('sha256').update(asset).digest('hex') }] };
+    const db = openDatabase(s.dataDir);
+    saveWork(db, s.dataDir, { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/images' }, novel: { name: 'Images', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: true }, cover: null }); db.close();
     const zip = new ZipFile(); zip.addBuffer(body, 'content.html'); zip.addBuffer(asset, 'media/pixel.png'); zip.addBuffer(Buffer.from(JSON.stringify(manifest)), 'manifest.json'); zip.end();
     const chunks: Buffer[] = []; for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
     const bytes = Buffer.concat(chunks);

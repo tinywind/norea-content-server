@@ -11,7 +11,7 @@ import { initializePluginRegistry, listPlugins, registerPlugin, removePlugin, se
 import { scanFolder, type FolderIndexItem, type FolderIndexSummary } from './folder-indexer.ts';
 
 interface FolderRoot {
-  id: string; name: string; path: string; metadataDbPath: string;
+  id: string; name: string; path: string;
   mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number;
   enabled: boolean; lastScanAt?: number;
 }
@@ -25,7 +25,7 @@ const identifier = { type: 'object', required: ['id'], properties: { id: text } 
 const pagination = { offset: { type: 'integer', minimum: 0, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 } };
 const rootProperties = {
   name: { type: 'string', minLength: 1, maxLength: 200 }, path: { type: 'string', minLength: 1, maxLength: 4096 },
-  metadataDbPath: { type: 'string', maxLength: 4096 }, mode: { type: 'string', enum: ['manual', 'periodic', 'changes'] },
+  mode: { type: 'string', enum: ['manual', 'periodic', 'changes'] },
   intervalMinutes: { type: 'integer', minimum: 1, maximum: 1440 }, enabled: { type: 'boolean' },
 };
 
@@ -36,6 +36,7 @@ export function initializeAdministration(db: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS admin_jobs (id TEXT PRIMARY KEY, entry TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS admin_job_items (sequence INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, entry TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS admin_job_items_job ON admin_job_items(job_id,sequence);
+    UPDATE admin_roots SET entry=json_remove(entry,'$.metadataDbPath') WHERE json_type(entry,'$.metadataDbPath') IS NOT NULL;
     CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   `);
 }
@@ -83,20 +84,16 @@ export async function registerAdministration(app: FastifyInstance, context: {
   }
 
   async function validateRoot(root: FolderRoot): Promise<void> {
-    if (!isAbsolute(root.path) || (root.metadataDbPath && !isAbsolute(root.metadataDbPath))) throw problem(400, 'Server filesystem paths must be absolute');
+    if (!isAbsolute(root.path)) throw problem(400, 'Server filesystem paths must be absolute');
     try {
       root.path = await realpath(root.path);
       if (!(await stat(root.path)).isDirectory()) throw new Error('Not a directory');
       const server = await realpath(dataDir);
       const contains = (parent: string, child: string) => { const path = relative(parent, child); return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path)); };
       if (contains(root.path, server) || contains(server, root.path)) throw problem(400, 'Source folder and server storage must not overlap');
-      if (root.metadataDbPath) {
-        root.metadataDbPath = await realpath(root.metadataDbPath);
-        if (!(await stat(root.metadataDbPath)).isFile() || contains(server, root.metadataDbPath)) throw problem(400, 'Metadata must be an existing Norea database outside server storage');
-      }
     } catch (error) {
       if ((error as { statusCode?: number }).statusCode) throw error;
-      throw problem(400, 'Source folder or metadata database is unavailable');
+      throw problem(400, 'Source folder is unavailable');
     }
     if (roots().some(other => other.id !== root.id && other.path.toLowerCase() === root.path.toLowerCase())) throw problem(409, 'This folder is already connected');
   }
@@ -111,7 +108,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     const controller = new AbortController();
     const promise = new Promise<void>(accept => setImmediate(accept)).then(async () => {
       try {
-        job.summary = await scanFolder({ rootPath: root.path, metadataDbPath: root.metadataDbPath || undefined, dataDir, db, limits, signal: controller.signal, onWorkChange: context.notify,
+        job.summary = await scanFolder({ rootPath: root.path, dataDir, db, limits, signal: controller.signal, onWorkChange: context.notify,
           onItem(item: FolderIndexItem) {
             db.prepare('INSERT INTO admin_job_items(job_id,entry) VALUES(?,?)').run(job.id, JSON.stringify(item));
             job.summary.scanned++;
@@ -208,7 +205,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     api.delete<{ Params: { id: string } }>('/plugins/:id', { schema: { params: identifier } }, async (request, reply) => { if (!removePlugin(db, request.params.id)) throw problem(404, 'Plugin registration not found'); return reply.code(204).send(); });
     api.get('/roots', async () => ({ items: roots() }));
     api.post<{ Body: Omit<FolderRoot, 'id'> }>('/roots', { schema: { body: { type: 'object', additionalProperties: false, required: ['name', 'path', 'mode', 'intervalMinutes'], properties: rootProperties } } }, async request => {
-      const root: FolderRoot = { ...request.body, id: randomUUID(), enabled: request.body.enabled ?? true, metadataDbPath: request.body.metadataDbPath ?? '' };
+      const root: FolderRoot = { ...request.body, id: randomUUID(), enabled: request.body.enabled ?? true };
       await validateRoot(root); saveRoot(root); scheduleRoot(root); return root;
     });
     api.patch<{ Params: { id: string }; Body: Partial<Omit<FolderRoot, 'id' | 'lastScanAt'>> }>('/roots/:id', { schema: { params: identifier, body: { type: 'object', additionalProperties: false, properties: rootProperties } } }, async request => {
