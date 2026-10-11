@@ -4,7 +4,7 @@
 > transfer adapter. The parent session owns app UI and integration.
 
 Goal: run a real local content server and synchronize complete Norea chapters and
-account state with the connected S25, preserving offline reading and folder names.
+content with the connected S25, preserving local reading state and folder names.
 
 Architecture: a Fastify REST server stores metadata in SQLite and immutable ZIP
 revisions in readable chapter folders. Norea maps its local IDs to plugin/path
@@ -14,7 +14,10 @@ the reader. The protocol below is the shared implementation contract.
 Tech stack: TypeScript, Fastify, REST/OpenAPI, SQLite, existing Tauri/Rust/Android.
 Spec: [design.md](design.md).
 
-Status: the first working implementation is complete for the scope below.
+Status: the original implementation has been followed by account-free device access.
+The current authentication contract and migration scope are recorded in
+[device-access-plan.md](device-access-plan.md).
+Its integration results are in [verification-2026-10-12.md](verification-2026-10-12.md).
 See [verification-2026-10-11.md](verification-2026-10-11.md) for executed checks
 and the design capabilities that remain unimplemented.
 
@@ -28,7 +31,7 @@ and the design capabilities that remain unimplemented.
 - Stream package files; do not move large binary arrays through the WebView.
 - Test only Android aarch64 on ADB serial R5CY509QC0D; never clear device app data.
 
-## Wire contract v1
+## Wire contract version 2
 
 All JSON uses camelCase. An Identity is `{pluginId, novelPath, chapterPath}`.
 The canonical identity string is `JSON.stringify([pluginId, novelPath, chapterPath])`.
@@ -56,42 +59,49 @@ by path. Reject unsafe, duplicate, missing, unlisted, and corrupt entries.
 
 Endpoints (all under `/api/v1`):
 
-- `GET /capabilities`: `{apiVersion:1,packageVersion:1,anonymousRead:boolean}`.
-- `GET /openapi.json`: generated OpenAPI from registered route schemas.
-- `POST /sessions` `{username,password,deviceName}` -> `{token,user:{id,username,role}}`.
-- `DELETE /sessions/current`: revoke current bearer token.
-- `GET /chapters?after=<integer>&limit=<1..100>` -> `{items: CatalogEntry[],cursor:number,hasMore:boolean}`.
-- `POST /packages` with raw `application/zip` body and bearer token -> CatalogEntry.
-- `GET /chapters/:id/package`: current complete ZIP, ETag, Content-Length, Range.
-- `DELETE /chapters/:id`: admin tombstone and trash; ordinary uploads cannot revive it.
-- `POST /chapters/:id/restore`: admin restore.
-- `POST /chapters/:id/revision` `{revision}`: admin select default.
-- `GET /state`: authenticated `{items: StateEntry[]}`.
-- `PUT /state`: authenticated StateMutation -> StateEntry, HTTP 409 with current
-  state and preserved candidates on a conflicting position/read-state update.
+- `GET /capabilities`: `{apiVersion:2,packageVersion:1,anonymousRead:boolean,authentication:"device-key",personalStateSync:false}`.
+- `GET /openapi.json`: generated OpenAPI from route schemas.
+- `POST /console-sessions` `{password}` -> `{token}`; 24-hour administrator session.
+- `DELETE /console-sessions/current`: revoke the current console session.
+- `POST /devices/register` `{deviceKey,deviceName}` -> `{id,deviceName}`.
+  New keys are accepted automatically, existing keys are reused, blocked keys fail.
+- `GET /admin/devices` -> `{items:[{id,deviceName,createdAt,lastSeenAt,blocked}]}`.
+- `PATCH /admin/devices/:id` `{blocked:boolean}`: console-only access control.
+- `GET /chapters?after=<integer>&limit=<1..100>` -> `{items:CatalogEntry[],cursor,hasMore}`.
+- `POST /packages`: raw ZIP with device bearer key -> CatalogEntry.
+- `GET /chapters/:id/package`: current ZIP, ETag, Content-Length, Range.
+- `DELETE /chapters/:id`: device or console tombstone and trash.
+- `POST /chapters/:id/restore`: explicit device or console restoration.
+- `POST /chapters/:id/revision` `{revision}`: console-only default selection.
+- `POST /chapters/:id/purge`: console-only permanent removal of deleted ZIPs.
+- `GET /changes?catalogAfter=0&waitSeconds=20` -> `{catalogCursor}`.
 
 CatalogEntry is `{id,revision,zipSha256,zipBytes,manifest,deleted,sequence}`.
-Catalog pages include tombstones so clients can suppress stale reuploads.
-Authentication never accepts a user ID from the client as account authority.
+Catalog pages include tombstones to suppress stale reuploads. Account, old session,
+and personal-state routes are removed. Device keys are random 32-byte hex values;
+servers persist only their hashes. Local reading records never enter the protocol.
 
-StateEntry is `{key,version,value,conflicts}`. StateMutation is
-`{key,baseVersion,operationId,deviceName,value}`. `key` is an identity string scoped
-with `position:`, `read:`, `bookmark:`, or `library:`. Value is a JSON object.
-Each conflict includes operationId, deviceName and value. Identical operation IDs
-are idempotent; membership/bookmark concurrent removals win, while later explicit
-adds are permitted. A resolution uses the returned current version.
+### Incremental catalog and change hints
+
+Catalog writes append durable sequence entries. A page cursor is the final returned
+sequence; an empty page retains the requested cursor. Drain all pages and persist
+each cursor only after successful application. Hints are targets, not applied-page
+cursors. `catalogAfter` is a nonnegative safe integer; ahead-of-log cursors return
+409. `waitSeconds` accepts 0 through 20. Bearer credentials are validated even
+when anonymous reading is enabled, and again after a waited response. Disconnect
+and shutdown release waiters. Personal-state changes never trigger server hints.
 
 ## Task 1: server
 
-Files: package.json, tsconfig.json, .gitignore, src/{app,main,db,auth,packages,state}.ts,
+Files: package.json, tsconfig.json, .gitignore, src/{app,main,db,auth,packages,changes}.ts,
 test/*.test.ts, README.md, Dockerfile and compose.yaml.
 
 - [x] Write failing Fastify injection/integration tests using real SQLite and ZIPs
   for anonymous catalog, unauthorized upload, login/revocation, package checks,
-  restart persistence, Range, deletion/reupload, and account-isolated conflicts.
+  restart persistence, Range, deletion/reupload, and device/console boundaries.
 - [x] Implement `buildApp({dataDir,anonymousRead?})` returning a Fastify instance;
-  expose an admin provisioning CLI without tracked credentials.
-- [x] Run tests and typecheck. Document local startup, provisioning, OpenAPI and
+  create an installation secret and automatically register device keys.
+- [x] Run tests and typecheck. Document local startup, device access, OpenAPI and
   backup; package files must remain under readable plugin/work/chapter directories.
 
 ## Task 2: native chapter transfer
@@ -120,13 +130,13 @@ Files: Norea src/lib/content-sync/{client,sync}.ts, src/store/content-sync.ts,
 src/components/ContentServerSettings.tsx, settings integration, locale keys.
 
 - [x] Test remote catalog import, local row-ID remapping, unchanged readable paths,
-  tombstone suppression, retry after failure, state conflicts and account isolation.
-- [x] Add optional server URL/session settings, anonymous catalog browsing,
-  explicit login merge choice, manual sync and per-chapter download actions.
-- [x] Persist pending upload/state changes and per-device download exclusions.
+  tombstone suppression, retry after failure, key persistence and blocked access.
+- [x] Add optional server URL/device settings, automatic registration, manual sync,
+  and per-chapter download actions.
+- [x] Persist pending content changes and per-device download exclusions.
   Trigger sync on configured lifecycle events without blocking local reading.
-- [x] Synchronize library, read state, bookmark and position; preserve conflicts
-  and offer explicit resolution without moving the active reader.
+- [x] Keep library, read state, bookmarks, and positions local. Reading mutations
+  must not queue transfers or contact personal-state endpoints.
 - [x] Run TypeScript checks, relevant tests and project verification skills.
 
 ## Task 4: integration and device evidence
@@ -134,7 +144,7 @@ src/components/ContentServerSettings.tsx, settings integration, locale keys.
 - [x] Start a loopback-only local server with data in server `.tmp/local-server`.
 - [x] Build targeted Android aarch64 APK, preserve installed data, connect the S25
   through `adb reverse`, and install/update the correct app channel.
-- [x] Exercise login, real package upload/download, account state and offline reading.
+- [x] Exercise automatic registration, real package transfers, and offline reading.
   Use temporary owned fixture content only; do not delete the user's chapters.
 - [x] Review the complete changes, resolve important findings, and record exact
   passing checks and any uncovered acceptance scenarios in a verification report.
@@ -146,6 +156,23 @@ src/components/ContentServerSettings.tsx, settings integration, locale keys.
   (Tasks 1 and 2 validation/rollback tests).
 - Same plugin/path content with different local numeric IDs must restore properly
   (Tasks 2 and 3 round-trip tests).
-- Account switches and retries must not leak or duplicate state (Tasks 1 and 3).
+- Server switches and retries must retain isolated device keys (Tasks 1 and 3).
 - Offline restart and server deletion must not remove local data or resurrect
   server content (Tasks 1, 3 and device smoke).
+
+## Administration and folder-ingestion implementation
+
+1. Implement `plugin-registry.ts` and real manifest tests: multiple repositories,
+   validation, update rollback, duplicate source IDs, enable/disable, and provider
+   expansion. No plugin code execution.
+2. Implement `folder-indexer.ts` with SQLite/ZIP fixtures: stable metadata
+   snapshot, plugin-independent local traversal, complete portable packages, legacy skips,
+   cancellation, tombstone preservation, and proof of unchanged source bytes.
+3. Implement `administration.ts` and API tests: authenticated routes, persistent
+   roots/jobs/results, scan cancellation/restart recovery, scheduling, catalog
+   queries, device access management, and persisted anonymous-read policy.
+4. Implement `web/` console and TypeScript asset build. Integrate static routes,
+   OpenAPI, server lifecycle, and production dependency/build packaging.
+5. Run server tests, TypeScript checks, and frontend build. Exercise the actual
+   console in desktop/mobile layouts and perform a read-only scan of the existing
+   local Norea folder. Keep runtime evidence under `.tmp/`; do not commit/push.

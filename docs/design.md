@@ -4,7 +4,12 @@ Date: 2026-10-11
 
 Status: approved design direction. This document records the accepted product,
 storage, synchronization, and deployment decisions. Detailed wire schemas belong
-in the implementation plan. The service has not been implemented.
+in the implementation plan. The service and Norea integration implement the
+initial scope; [verification notes](verification-2026-10-11.md) distinguish the
+implemented behavior from remaining work.
+
+The account-free access update is verified separately in
+[verification-2026-10-12.md](verification-2026-10-12.md).
 
 Repository: <https://github.com/tinywind/norea-content-server>
 
@@ -12,15 +17,14 @@ Repository: <https://github.com/tinywind/norea-content-server>
 
 Norea Content Server is an optional content storage and synchronization service
 for the Norea reader. It preserves content already acquired by an app and makes
-that content available to other devices. It also synchronizes personal reading
-state between devices belonging to the same account.
+that content available to other devices. Reading state remains local to each app.
 
 The motivating use cases are reading previously acquired content while its
 original source is temporarily unavailable, and moving between a PC and a tablet
-without manually transferring files or finding the previous reading position.
+without manually transferring files. Each device retains its own reading position.
 
 The server acts as a secondary copy. Norea remains usable without a server,
-without an account, and while a configured server is unavailable. Content must
+and while a configured server is unavailable. Content must
 reach a device before it can be read there offline. The service cannot recover
 content that no participating device has acquired and uploaded.
 
@@ -30,8 +34,8 @@ content that no participating device has acquired and uploaded.
   repository. Add the corresponding synchronization client to Norea separately.
 - Keep local reading independent of server availability.
 - Upload locally acquired content and download content held by the server.
-- Share content within a server while keeping each account's reading state
-  separate. Multiple devices using one account synchronize that account's state.
+- Share content within a server. Keep reading position, read status, bookmarks,
+  and library membership on each device; there are no accounts.
 - Separate catalog synchronization from downloading every content file. A device
   can discover server content without storing all of it locally.
 - Distinguish local removal from server deletion.
@@ -47,8 +51,8 @@ can disable anonymous reading to require authentication.
 
 ## Boundaries
 
-The server owns the shared catalog, completed content packages, account reading
-state, and synchronization changes. Implement it in TypeScript with Fastify,
+The server owns the shared catalog, completed content packages, registered
+devices, and catalog changes. Implement it in TypeScript with Fastify,
 SQLite for metadata, and a filesystem package store. The initial deployment is a
 single server instance distributed as a Linux Docker image with a persistent data
 volume. This server target does not change Norea's supported app platforms.
@@ -68,45 +72,52 @@ matching of works from different sites, and synchronization of the entire app
 database or all app settings. Independent backups remain necessary because
 synchronization can propagate unwanted changes and the server can lose data.
 
-## Accounts and access
+## Console and device access
 
 | Operation | Permission |
 | --- | --- |
-| Browse the catalog and download content | Anonymous by default; authenticated when anonymous reading is disabled |
-| Upload content | Authenticated member |
-| Read or change library membership, progress, read status, and bookmarks | The owning account |
-| Delete shared content or change its default revision | Administrator |
-| Provision accounts or reset passwords | Administrator |
+| Browse the catalog and download content | Anonymous by default; device or console credential when anonymous reading is disabled |
+| Upload complete content | Registered, unblocked device |
+| Soft-delete or restore shared content | Registered device or console session |
+| Purge content, select revisions, or manage the server | Console session |
+| Read or change personal reading state | Local app only |
 
-Provision accounts through an administrator or an administrator-controlled
-invitation. The first version excludes open registration, email delivery, and
-social login. Password recovery uses an administrator reset.
+First server initialization creates a random 256-bit secret in
+`admin-password.hash` inside its data directory. The file value is the console
+login credential, not a public password verifier. Create it exclusively with
+restrictive permissions, reuse it on restart, and never log or expose it through
+the API. A successful login issues a separate 24-hour console session.
 
-Issue a separate authenticated session to each device so a lost device's session
-can be revoked independently. Use HTTPS for external connections. Expired or
-revoked sessions stop authenticated synchronization, not access to content already
-stored on that device. Source-site credentials are never server credentials.
+Each app generates a random device key per server and persists it outside portable
+backups. Keys are independent of hardware identifiers. Registration is automatic,
+with no approval or username/password. The server stores only the key hash and
+records the device name, registration time, last access, and blocked status.
+Administrators can block or unblock a key. A blocked app retains its key and
+reports the rejection; it must not silently generate another key.
+
+Automatic admission is an explicit product decision: anyone who can reach the
+server can register a new key. Blocking identifies a credential, not a person,
+and does not prevent somebody from registering a different key. Device credentials
+do not grant console access. Use HTTPS outside local device testing.
+
+Removing server access does not prevent local reading. Source-site credentials
+are never server credentials. Old account sessions are invalid after this change;
+existing legacy database tables remain inert to preserve previously stored data.
 
 ## Data ownership
 
 | Data | Scope | Behavior |
 | --- | --- | --- |
-| Works, chapters, source identity, complete packages | Shared server catalog | Reused across accounts and devices |
-| Library membership, current reading position, read status, bookmarks | Account | Synchronized between that account's devices |
-| Downloaded files, local paths, storage usage, download selection | Device | Independently managed on each device |
-| Pending transfers, credentials, local database IDs | Device | Never treated as shared content |
+| Works, chapters, source identity, complete packages | Shared server catalog | Reused across devices |
+| Library membership, reading position, read status, bookmarks | Device | Never synchronized to this server |
+| Downloaded files, local paths, storage usage, download selection | Device | Independently managed |
+| Device keys, pending transfers, local database IDs | Device | Excluded from shared packages and portable credential backups |
 
-Library membership, reading position, read status, and bookmarks are all part of
-the first version. Reader appearance settings, including fonts, margins, and
-orientation, remain local, as do automatic download selections.
-
-Content access must not expose another account's reading records. A shared content
-package contains no account state, source credentials, or device-specific paths.
-At first sign-in, offer an explicit choice between merging existing local reading
-state and using server reading state. Do not upload existing local records before
-that choice. Switching accounts must not merge the previous account's state into
-the new account. These choices concern personal records, not deletion of local
-content files.
+Local reading records survive connecting, disconnecting, changing servers, and
+blocked access. Reader appearance settings remain local. The server publishes
+content metadata and package availability without changing a device's reading
+position or library selection. No first-login merge or conflict resolution is
+needed because personal state is not exchanged.
 
 ## Content identity and revisions
 
@@ -209,8 +220,7 @@ A server lookup has a bounded wait so an unavailable server does not stall sourc
 acquisition. Once a valid local copy exists, the reader must not stream its normal
 content from the server or require the server to renew access to that copy.
 
-The sync loop exchanges catalog changes and account state independently
-from large packages. It uses persistent pending operations, idempotent writes,
+The sync loop exchanges catalog changes independently from large packages. It uses persistent pending operations, idempotent writes,
 and a server change cursor so reconnecting does not require transferring every
 file. An empty response or connection failure is never interpreted as deletion.
 
@@ -232,8 +242,8 @@ failed. A cached server availability indicator must not imply a live guarantee.
 
 | Action | Effect |
 | --- | --- |
-| Remove download from this device | Remove this device's files; retain shared content and account reading state |
-| Remove from my library | Change account membership; do not delete shared content |
+| Remove download from this device | Remove this device's files; retain shared content and local reading state |
+| Remove from my library | Change local membership; do not delete shared content |
 | Delete server copy | Remove server availability; leave existing device copies intact |
 
 The UI offers `Remove download from this device` when content is local,
@@ -242,13 +252,13 @@ unchanged button must not silently escalate local removal into shared deletion.
 Server deletion should explain that other users will lose the ability to obtain
 that server copy. Deleting every device's copy is outside the initial scope.
 
-Only administrators can delete shared content. Support deleting an individual
-chapter or a whole work. Existing device copies and personal reading records
+Registered devices and administrators can soft-delete shared content. Support
+deleting an individual chapter or a whole work. Existing device copies and personal reading records
 remain intact. Download permission never implies shared deletion permission.
 
 Server deletion creates a persistent deletion record. Old queued uploads and
 devices returning after a long offline period must not resurrect the content.
-Republication requires an explicit administrator restoration or permission to
+Republication requires an explicit restoration by an authorized device or console, or permission to
 re-upload against the current deletion state. Deletion must also invalidate any
 pending publication for the affected item.
 
@@ -263,38 +273,17 @@ obsolete revisions. Deleted revisions must remain protected against stale
 re-uploads. Storage exhaustion rejects new uploads instead of silently evicting
 existing content. File cleanup must respect an active backup snapshot.
 
-## Account reading state and conflicts
+## Device-local reading state
 
-Synchronize the same account's current chapter and position, while preserving
-separate state for every other account. Record a device identity and operation
-identity so retries and reordered delivery do not produce duplicate changes.
+Reading position, current chapter, completion status, bookmarks, and library
+membership stay in the app's local database. Content synchronization neither
+uploads nor downloads these records. Reading on a PC and tablet can therefore
+progress independently, including rereading or moving backward.
 
-Do not resolve conflicts by always selecting the highest chapter or largest
-progress percentage. Rereading and moving backward are valid actions. Device
-clocks and server arrival order alone also cannot reliably establish reading order
-after independent offline sessions.
-
-Attach the last server state version observed by the device to each change.
-Apply one-sided changes automatically and merge changes to independent items.
-When devices concurrently change the reading position of the same work, retain
-both candidates and let the user choose when opening that work. Present the
-device associated with each candidate. Use a small versioned-state protocol;
-a general CRDT synchronization framework is outside the first version.
-
-Merge library membership and bookmarks per item. Concurrent addition and removal
-of the same item resolve to removal; a subsequent explicit addition is allowed.
-Preserve conflicting read/unread changes separately for resolution. In particular,
-an old automatic completion record must not erase an explicit unread action.
-Detailed operation schemas must distinguish concurrency from later intentional
-changes and handle repeated operations without creating new conflicts.
-
-Receiving a remote position must not move an actively displayed chapter without
-the user's action. Offer to continue from the other device when appropriate.
-For HTML and text, store paragraph identity information and an offset within the
-paragraph. For PDF, store the document page and a position within that page. These
-locators must not depend on viewport pagination. Include the content revision
-with the position. If a changed revision prevents exact restoration, fall back to
-chapter progress and disclose that the restored position is approximate.
+Existing local values and release-line database compatibility must be preserved.
+Old pending personal-state caches and server legacy state are no longer consumed.
+Content changes retain their durable journal and catalog cursors. Reading-only
+changes must not enqueue uploads or trigger content synchronization.
 
 ## Protocol and compatibility
 
@@ -304,7 +293,9 @@ but do not synchronize a live database or treat a full backup as the incremental
 sync protocol.
 
 Use a REST API under `/api/v1` with explicit request and response schemas and an
-independently versioned package format starting with `packageVersion: 1`. Query
+independently versioned package format starting with `packageVersion: 1`. The
+account-free protocol reports `apiVersion: 2` and `authentication: "device-key"`
+while retaining the existing `/api/v1` route prefix. Query
 supported protocol versions, package versions, and capabilities when connecting.
 Unsupported versions must produce a clear sync error while local reading
 continues. Publish the supported app/server combinations before release.
@@ -316,9 +307,37 @@ response validation. The selected stack is TypeScript, Fastify, REST/OpenAPI,
 and SQLite. Do not introduce GraphQL, Java, or Spring Boot. File uploads and
 downloads use ordinary streaming HTTP endpoints.
 
+Content synchronization consumes an append-only catalog change log. Reconnecting
+devices resume from a durable cursor. Complete immutable package publication is
+idempotent. Account and personal-state endpoints are removed.
+
+Connected clients can wait up to 20 seconds for catalog cursor changes. A hint
+contains only the catalog cursor and triggers ordinary paged feed
+reads. Anonymous clients receive catalog hints under the same reading policy as
+catalog requests. Stopping a request or shutting down the server releases the
+waiter's resources. The database remains authoritative across reconnects and
+server restarts.
+
+The app offers manual, periodic, and on-change synchronization. Manual is the
+default. Periodic mode runs when enabled, on foreground/network recovery, and
+then at the configured interval after each run finishes; its default is 15
+minutes, adjustable from 1 to 1,440 minutes. On-change mode uses those same
+startup/recovery triggers, debounces local changes for 1.5 seconds, and waits
+for server hints. The scheduler runs while the app is in the foreground; it does
+not promise continuous Android background execution. The manual sync button
+remains available in every mode.
+
+Ordinary synchronization processes incremental changes. An explicit rescan
+discovers file changes made outside the app. Reading progress never triggers
+network synchronization. Selecting
+manual mode cancels future automatic work and an outstanding hint request;
+an already-started transfer can finish. These modes preserve manual content
+download choices and do not download every catalog package. The first version
+retains its change logs without automatic pruning.
+
 The protocol needs operations for server capabilities, shared catalog changes,
 complete package publication and retrieval, explicit deletion and republication,
-and account-scoped reading-state changes. Define endpoint names and detailed
+and device registration/blocking. Define endpoint names and detailed
 schemas during implementation planning using the decisions in this document.
 
 ## Deployment and operations
@@ -330,7 +349,7 @@ dependency to the first version. Reconsider a client/server database such as
 PostgreSQL if deployment later requires multiple server instances or substantial
 concurrent writes.
 
-Enforce a server-wide storage limit and per-account limits on new upload data.
+A future storage quota can enforce a server-wide limit on new upload data.
 An exhausted limit leaves existing content available and holds or rejects new
 uploads with a clear reason. Specific quota values depend on the deployment;
 they are separate from the package validation limits.
@@ -350,16 +369,15 @@ external deployments still require HTTPS.
 
 ## Initial delivery scope
 
-The first usable version connects each app profile to one server, supports
-accounts with multiple devices, transfers complete chapter packages, discovers
-shared catalog content, and synchronizes personal reading position, read status,
-library membership, and bookmarks. It includes explicit local removal, controlled
-server deletion, and recovery from interrupted
-work. Reader appearance and download selection remain device-local.
+The first usable version connects each app profile to one server using a durable
+device key, transfers complete chapter packages, and discovers shared catalog
+content. The console uses its installation secret and manages sources, folders,
+packages, and devices. It includes explicit local removal, server deletion, and
+recovery from interrupted transfers. Personal reading state remains device-local.
 
-Implementation should first prove complete package transfer and offline reading,
-then account-state convergence and conflict handling. These are delivery steps
-within the design, not a commitment to ship incomplete behavior as complete.
+Verify automatic registration, separation of console/device permissions, complete
+package transfer, and offline reading. Existing packages and local reading data
+must remain usable when upgrading from the account-based prototype.
 
 ## Acceptance scenarios
 
@@ -375,16 +393,16 @@ within the design, not a commitment to ship incomplete behavior as complete.
    trigger an immediate automatic redownload.
 6. Deleting a server copy prevents new downloads and rejects stale queued uploads,
    while previously downloaded copies remain readable.
-7. Two accounts can read the same content without sharing progress. Two devices
-   on one account can continue from synchronized reading state.
-8. Concurrent offline reading and intentional backward movement do not silently
-   disappear under a highest-progress or last-arrival rule.
+7. Two devices can share packages while retaining independent reading progress.
+8. Local rereading, bookmarks, and completion changes make no personal-state
+   requests and do not enqueue content uploads.
 9. The same content restores correctly with different device database IDs and
    paths, including when the original source plugin is unavailable.
 10. Server downtime, storage exhaustion, authentication failure, corrupt packages,
     and unsupported versions leave local reading usable and report sync status.
 11. Anonymous readers can browse and download by default but cannot upload,
-    change account records, or delete shared content. Disabling anonymous reading
+    access console administration, or delete shared content without registering.
+    Disabling anonymous reading
     requires authentication for catalog access and downloads.
 12. An interrupted download resumes only against the same ZIP. An interrupted
     upload restarts safely. Package limits reject excess data without publishing
@@ -393,18 +411,16 @@ within the design, not a commitment to ship incomplete behavior as complete.
     device copies. Changed content uses an explicitly approximate position when
     its original locator cannot be restored.
 14. Server deletion enters the 30-day trash period. Permanent file removal retains
-    deletion records, and explicit administrator restoration permits republication.
-15. First sign-in respects the selected local/server merge behavior. Switching
-    accounts and revoking one device session do not leak personal records or
-    prevent local reading.
-16. Concurrent membership or bookmark addition/removal resolves to removal, while
-    a later explicit addition succeeds. An old automatic completion record does
-    not overwrite a deliberate unread action.
+    deletion records, and explicit device or administrator restoration permits republication.
+15. First connection registers a device without username/password. Restarting
+    reuses its key, and connecting to another server uses a separate key.
+16. A blocked key fails registration and mutation retries without silently
+    changing identity. Console login remains independent of device credentials.
 17. A restored backup contains every package and cover referenced by its database
     snapshot, including when publication or cleanup was active during backup.
 
-These are planned acceptance checks. No server implementation or runtime
-validation has been performed for this document.
+These are acceptance targets. Executed checks and remaining limitations are
+recorded in the verification documents.
 
 ## Implementation planning details
 
@@ -413,11 +429,10 @@ concrete contracts and operational configuration:
 
 - Request and response schemas, existing plugin/path identity encoding, local
   chapter mappings, and the canonical manifest field set.
-- Device session storage and expiry, password storage, administrator bootstrap,
-  account invitation/reset flow, and credential storage in the app.
-- Version preconditions, independent-item merge boundaries, conflict resolution
-  operations, and restart-safe transfer and synchronization cursors.
-- Locator encoding, cover transfer, archive validation, partial-download identity
+- Console session expiry, installation-secret creation, automatic device
+  registration, blocking, and local credential storage in the app.
+- Restart-safe transfers, idempotent publication, and catalog cursors.
+- Cover transfer, archive validation, partial-download identity
   checks, and recovery across filesystem/database publication boundaries.
 - Deployment-specific quota values, backup schedule and destination, and the
   initial tested client/server compatibility matrix.
@@ -427,8 +442,8 @@ model, stack, package unit, deletion scope, or first-release feature set.
 
 ## Current Norea integration references
 
-Static source inspection identified the following existing boundaries. These
-references are design inputs and do not imply that synchronization exists today.
+Static source inspection identified the following integration boundaries. See
+[verification notes](verification-2026-10-11.md) for the implemented and tested scope.
 
 | Norea path | Relevant responsibility |
 | --- | --- |
@@ -450,3 +465,62 @@ Technical references:
 - [Fastify streaming responses](https://github.com/fastify/fastify/blob/main/docs/Reference/Reply.md)
 - [SQLite deployment guidance](https://sqlite.org/whentouse.html)
 - [SQLite backup API](https://www.sqlite.org/backup.html)
+
+## Administration console and existing-folder ingestion
+
+The server serves an administrator-only operational console at `/admin/`.
+The console uses the existing REST API, in-memory bearer sessions, and locally
+built TypeScript/CSS assets. It has no separate frontend service or runtime.
+Its primary workflows are plugin repositories, connected folders, content and
+revision management, scan results, registered devices, and access policy.
+
+Multiple plugin repositories can be registered using a repository JSON URL or
+an absolute server-local JSON path. The supported manifest is the current Norea
+0.2 PluginItem array. Repository metadata supplies source IDs; the server never
+executes plugin JavaScript or visits source sites during indexing. Updates are
+explicit and atomic. Duplicate source IDs across registrations are rejected.
+Repository inventory is independent of folder scanning. Existing source IDs,
+including multi-source instances, come from local content metadata or package
+manifests. IDs and readable folder rules stay unchanged.
+
+A connected folder points to an existing Norea root containing `contents/`.
+Every source directory is eligible regardless of plugin registration, installation,
+or enabled status. The scan never queries plugin code, a repository, or an original
+site to verify a work's existence. Local imports follow the same completeness and
+identity rules. Each connection has manual, periodic, or change-driven scanning;
+periodic reconciliation also covers missed filesystem events. A scan reports each registered, unchanged,
+skipped, or failed candidate. Unsupported old formats and incomplete assets are
+skipped without conversion or repair. Missing metadata is a skip, not permission
+to infer a new logical identity from a lossy folder name.
+
+When a site removes a work, its complete local chapters can still be registered
+from the saved metadata. Previously published server copies remain available
+when a site, plugin, repository, or local original disappears. Explicit server
+deletion and its tombstones remain authoritative; scanning does not undo them.
+
+For existing folders, an optional Norea database path supplies exact source,
+work, and chapter identities. The importer copies a stable database/WAL snapshot
+to server staging before opening SQLite; it never opens the original database
+with SQLite. Only content fields are used, never account reading state or source
+credentials. Snapshot files are removed when the job ends. A chapter file that
+changes during its first copy is retried once, accommodating OneDrive hydration.
+Continued changes and unstable database snapshots are skipped until a later scan.
+The importer accepts renamed work or chapter folders only when the existing
+database identity maps uniquely to their retained path suffix or chapter prefix.
+Media manifests use stable key ordering compatible with app package exports.
+
+The original Norea folder and metadata files are read-only inputs: no manifests,
+locks, repairs, renames, deletions, or database side effects are written there.
+Symlink escapes and overlapping source/server storage are rejected. Complete
+chapter snapshots become portable ZIPs under server-owned storage and pass the
+same validation/publication path as app uploads. This uses additional disk space
+but preserves an immutable server copy independently of the source folder.
+Server deletions are not reversed by rescanning; loss of an original does not
+remove an already published package. Detaching a folder only stops scanning.
+
+Console data includes per-source metadata/version, folder scan configuration,
+content identities and revisions, package sizes, persistent job status and
+per-candidate reasons. Device administration shows registration and access metadata;
+personal reading history remains local. Server deletion, restoration, default
+revision selection, and permanent purge use the existing administrator actions.
+Private filesystem paths and job results require administrator authentication.
