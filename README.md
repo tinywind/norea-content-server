@@ -145,12 +145,12 @@ and are visible in the authenticated management console.
 Connect a Norea root containing `contents/` under Folders. Scans traverse source
 directories regardless of plugin registration, installation, or enabled status.
 They never check the original site or whether it still publishes the work.
-For raw downloaded folders, also provide the absolute path to the Norea SQLite
-database. The server
+For raw downloaded folders, an optional Norea SQLite database supplies retained
+source addresses and richer metadata. The server
 copies a stable database/WAL snapshot into its staging directory and reads only
 content metadata from that copy. Original files and databases are never opened
 for writing. Do not place server data inside a connected root or vice versa.
-Unknown identities, unsupported old formats, incomplete media, and files changing
+Ambiguous folders, unsupported old formats, incomplete media, and files changing
 during inspection are skipped with reasons in Jobs. Valid complete package ZIPs
 can also be registered without a Norea metadata database.
 
@@ -161,9 +161,17 @@ view and exposes full metadata through the Metadata action. Text-only
 chapters do not need `manifest.json` or `media.zip`. A chapter's `manifest.json`
 describes media assets, not its source/work/chapter identity; it can exist without
 an archive and can list remote assets even when marked complete. Those assets
-must be stored locally before the chapter can be imported. Media checks run
-before reporting missing database identities, and the two failures have distinct
-messages.
+must be stored locally before the chapter can be imported.
+
+Legacy chapter folders follow `<number>-<title>`. The first separator divides
+the chapter number from its title; further hyphens remain part of the title.
+The importer retains known chapter paths and recovers missing metadata from this
+rule. It uses the work identity in `cover.json` when available, so recovered
+chapters join that same work. A missing chapter address becomes `norea-folder:<number>`;
+this is a local identity, not a reconstructed site URL. Without any retained work
+identity, `norea-folder:<work-folder-name>` identifies the work. Duplicate numbers
+without exact metadata are skipped. Repeated scans preserve these identities.
+Jobs report work metadata and chapters separately, including unchanged entries.
 
 New Norea work folders contain authoritative `novel.json` metadata, including all
 known chapters and their exact storage directories. These folders can be indexed

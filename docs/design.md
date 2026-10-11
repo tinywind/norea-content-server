@@ -125,7 +125,9 @@ Use separate identities for the logical work, logical chapter, and content
 revision. Local numeric database IDs are only mappings within a device.
 
 For source content, identify a work by its existing plugin ID and original work
-path, and a chapter by that work identity and original chapter path. Do not add
+path, and a chapter by that work identity and original chapter path when retained.
+Legacy folder ingestion can preserve missing addresses as local folder identities,
+as specified under administration below. Do not add
 repository UUIDs, distribution namespaces, or automatic cross-plugin merging.
 Local numeric row IDs remain device-specific. Matching plugin IDs and paths from
 different distributions can collide; this limitation is explicitly accepted for
@@ -494,18 +496,28 @@ site to verify a work's existence. Local imports follow the same completeness an
 identity rules. Each connection has manual, periodic, or change-driven scanning;
 periodic reconciliation also covers missed filesystem events. A scan reports each registered, unchanged,
 skipped, or failed candidate. Unsupported old formats and incomplete assets are
-skipped without conversion or repair. Missing metadata is a skip, not permission
-to infer a new logical identity from a lossy folder name.
+skipped without conversion or repair. Missing original site addresses do not
+prevent registration under the existing readable folder rules.
 
 The walker excludes work-level cover images, `cover.json`, and `.nomedia` markers
 from chapter counts and skip reports. Cover synchronization is not part of the
 chapter package. Text-only bodies do not require a media manifest or archive.
 The app's `manifest.json` is a media inventory, not chapter identity metadata.
 It may exist without `media.zip`; even a complete manifest can contain remote
-assets. The importer reports these as undownloaded media before checking database
-identity availability. Legacy raw chapters without novel.json still need exact
-identities from the app database; the error distinguishes an unconfigured database
-from a missing row.
+assets. The importer reports these as undownloaded media and leaves the chapter
+unavailable until its required assets are stored locally.
+
+For legacy work folders, retain database identities or `cover.json` source/work
+identities when available. Recover chapter numbers and titles from
+`<number>-<title>`, splitting only at the first separator. A known chapter path
+from database or server metadata takes precedence; otherwise use
+`norea-folder:<number>` inside the same work. If no work identity survives, use
+`norea-folder:<work-folder-name>`. These identifiers describe stored content and
+do not claim to reconstruct source URLs. Sort new chapters numerically and retain
+title hyphens. Duplicate numbers without an exact metadata match are ambiguous
+and remain skipped. Existing richer server metadata stays intact; new folder
+chapters are appended to its catalog. Work metadata and cover registration have
+their own Jobs entries, including unchanged outcomes on repeated scans.
 
 When a site removes a work, its complete local chapters can still be registered
 from the saved metadata. Previously published server copies remain available
@@ -518,7 +530,8 @@ to server staging before opening SQLite; it never opens the original database
 with SQLite. Only content fields are used, never account reading state or source
 credentials. Snapshot files are removed when the job ends. A chapter file that
 changes during its first copy is retried once, accommodating OneDrive hydration.
-Continued changes and unstable database snapshots are skipped until a later scan.
+Continued file changes are skipped until a later scan. An unavailable database
+snapshot leaves the importer using file metadata and folder rules.
 The importer accepts renamed work or chapter folders only when the existing
 database identity maps uniquely to their retained path suffix or chapter prefix.
 Media manifests use stable key ordering compatible with app package exports.
