@@ -29,7 +29,7 @@ preserved. Content journals and manual, periodic, and change-driven sync remain.
 - Registered devices may upload, soft-delete, and restore content. Only console
   sessions may manage settings, sources, folders, devices, purge, or select the
   default revision. Existing anonymous download policy remains supported.
-- Capabilities advertise `apiVersion:2`, `packageVersion:1`,
+- Capabilities advertise `apiVersion:1`, `packageVersion:1`,
   `authentication:'device-key'`, and `personalStateSync:false`. Clients must reject
   incompatible authentication protocols before transferring data.
 - `/changes` accepts only `catalogAfter` and `waitSeconds`, and returns

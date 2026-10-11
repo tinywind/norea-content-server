@@ -137,8 +137,10 @@ are available for source inventory and do not determine which folders are indexe
 JavaScript plugin modules are never executed.
 Re-register a URL to refresh it; duplicate source IDs/namespaces are rejected.
 Existing multi-source identities are retained from local content metadata.
-Indexes must not contain credentials in URLs. For a private repository, provide
-a server-local metadata index with credential-free plugin URLs.
+Private repositories may use `https://username:token@host/path/plugins.json`.
+The server sends embedded credentials as HTTP Basic authentication when fetching
+the index. Repository and plugin URLs are stored as entered, including credentials,
+and are visible in the authenticated management console.
 
 Connect a Norea root containing `contents/` under Folders. Scans traverse source
 directories regardless of plugin registration, installation, or enabled status.
@@ -151,6 +153,24 @@ for writing. Do not place server data inside a connected root or vice versa.
 Unknown identities, unsupported old formats, incomplete media, and files changing
 during inspection are skipped with reasons in Jobs. Valid complete package ZIPs
 can also be registered without a Norea metadata database.
+
+Work-level `cover.json` and cover images are not chapter candidates and do not
+count as skipped chapters. They are registered with their work and synchronized
+separately from chapter packages. The console shows work covers in grid or list
+view and exposes full metadata through the Metadata action. Text-only
+chapters do not need `manifest.json` or `media.zip`. A chapter's `manifest.json`
+describes media assets, not its source/work/chapter identity; it can exist without
+an archive and can list remote assets even when marked complete. Those assets
+must be stored locally before the chapter can be imported. Media checks run
+before reporting missing database identities, and the two failures have distinct
+messages.
+
+New Norea work folders contain authoritative `novel.json` metadata, including all
+known chapters and their exact storage directories. These folders can be indexed
+without an app database, including works with a cover but no complete chapter.
+SQLite retains a rebuildable metadata index. Metadata and cover changes use the
+incremental `/api/v1/works` API independently of chapter downloads. See
+[Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1) for the contract.
 
 A removed source work or plugin does not remove a server copy or prevent a
 complete local copy from being registered. Losing a local file also leaves the

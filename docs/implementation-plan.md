@@ -59,7 +59,7 @@ by path. Reject unsafe, duplicate, missing, unlisted, and corrupt entries.
 
 Endpoints (all under `/api/v1`):
 
-- `GET /capabilities`: `{apiVersion:2,packageVersion:1,anonymousRead:boolean,authentication:"device-key",personalStateSync:false}`.
+- `GET /capabilities`: `{apiVersion:1,packageVersion:1,anonymousRead:boolean,authentication:"device-key",personalStateSync:false}`.
 - `GET /openapi.json`: generated OpenAPI from route schemas.
 - `POST /console-sessions` `{password}` -> `{token}`; 24-hour administrator session.
 - `DELETE /console-sessions/current`: revoke the current console session.

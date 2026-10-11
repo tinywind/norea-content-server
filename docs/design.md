@@ -294,7 +294,7 @@ sync protocol.
 
 Use a REST API under `/api/v1` with explicit request and response schemas and an
 independently versioned package format starting with `packageVersion: 1`. The
-account-free protocol reports `apiVersion: 2` and `authentication: "device-key"`
+account-free protocol reports `apiVersion: 1` and `authentication: "device-key"`
 while retaining the existing `/api/v1` route prefix. Query
 supported protocol versions, package versions, and capabilities when connecting.
 Unsupported versions must produce a clear sync error while local reading
@@ -479,6 +479,10 @@ an absolute server-local JSON path. The supported manifest is the current Norea
 0.2 PluginItem array. Repository metadata supplies source IDs; the server never
 executes plugin JavaScript or visits source sites during indexing. Updates are
 explicit and atomic. Duplicate source IDs across registrations are rejected.
+HTTP(S) repository URLs may contain a username and password or token. The server
+uses these as HTTP Basic authentication when fetching the index. Embedded
+credentials remain in stored repository and plugin URLs and are visible to
+authenticated console administrators.
 Repository inventory is independent of folder scanning. Existing source IDs,
 including multi-source instances, come from local content metadata or package
 manifests. IDs and readable folder rules stay unchanged.
@@ -492,6 +496,16 @@ periodic reconciliation also covers missed filesystem events. A scan reports eac
 skipped, or failed candidate. Unsupported old formats and incomplete assets are
 skipped without conversion or repair. Missing metadata is a skip, not permission
 to infer a new logical identity from a lossy folder name.
+
+The walker excludes work-level cover images, `cover.json`, and `.nomedia` markers
+from chapter counts and skip reports. Cover synchronization is not part of the
+chapter package. Text-only bodies do not require a media manifest or archive.
+The app's `manifest.json` is a media inventory, not chapter identity metadata.
+It may exist without `media.zip`; even a complete manifest can contain remote
+assets. The importer reports these as undownloaded media before checking database
+identity availability. Legacy raw chapters without novel.json still need exact
+identities from the app database; the error distinguishes an unconfigured database
+from a missing row.
 
 When a site removes a work, its complete local chapters can still be registered
 from the saved metadata. Previously published server copies remain available
@@ -524,3 +538,33 @@ per-candidate reasons. Device administration shows registration and access metad
 personal reading history remains local. Server deletion, restoration, default
 revision selection, and permanent purge use the existing administrator actions.
 Private filesystem paths and job results require administrator authentication.
+
+## Filesystem Metadata v1
+
+Each readable work directory stores a `novel.json` document with `schemaVersion: 1`,
+exact source/work identities, work metadata, all known chapter identities and
+relative chapter directories, and an optional cover descriptor. The same directory
+contains `cover.json` and the cover image. Chapter catalogs include undownloaded
+chapters; reading positions, bookmarks, and library membership stay device-local.
+
+Files are authoritative. The app retains searchable metadata in SQLite for
+undownloaded and library-added works, and the server rebuilds its work index from
+its owned files. Both use a single v1 database bootstrap; this development change
+does not provide migrations from earlier app schemas.
+
+Folder scans prefer `novel.json` and register work metadata and covers independently
+of complete chapter packages. Invalid present metadata is skipped rather than
+replaced with database guesses. Legacy folders can use the optional read-only app
+database snapshot. No source-site or plugin request is required, and neither path
+writes into the connected original folder.
+
+`GET /api/v1/works?after=0&limit=100` provides incremental work changes.
+`GET` and device-authenticated `PUT /api/v1/works/:id` transfer metadata;
+`GET` and `PUT /api/v1/works/:id/cover` transfer image bytes separately, up to 10 MiB.
+The work ID hashes the exact plugin ID and novel path. Metadata and cover changes
+advance the work cursor. Clients retain file fingerprints to preserve pending local
+edits and avoid unchanged uploads. Complete chapter ZIPs remain package version 1.
+
+The console offers work-cover grids and lists, search, chapter counts, a metadata
+dialog, and chapter/revision actions. Cover requests carry console authentication
+in headers rather than URLs.
