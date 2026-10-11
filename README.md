@@ -51,6 +51,37 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `GET /api/v1/chapters?after=0&limit=100` returns ordered catalog changes.
   Apply every entry in order, including repeated chapter IDs and tombstones, and
   save the returned cursor. Follow `hasMore` before considering the catalog current.
+- `GET /api/v1/catalog/changes?after=0&limit=100` returns lightweight availability
+  changes as `{items,cursor,hasMore}`. Each item contains only
+  `{identity:{pluginId,novelPath,chapterPath},deleted,sequence}`. Apply repeated
+  identities in sequence order, including deletions and restorations. The cursor
+  is the last returned sequence, or `after` when the page is empty. Limits range
+  from 1 to 100. Package file inventories are excluded; use the exact chapter
+  lookup when a download needs the full manifest. The existing `/chapters` change
+  endpoint retains its full-entry response for older clients.
+- `GET /api/v1/catalog/works?q=title&source=plugin-id&offset=0&limit=40` browses current work
+  summaries without downloading change history. Omit `source` to include all sources;
+  otherwise it matches an exact plugin ID. `q` matches a literal title substring,
+  ignoring ASCII letter case. Results contain `{items,total,hasMore}`, ordered by
+  title and ID. Each item has `id`, `sequence`, `identity`, `novel`, `hasCover`, and
+  `chapterCount`, the number of available nondeleted chapter packages. Summaries
+  exclude chapter metadata and package file lists. Metadata-only works remain visible.
+- `GET /api/v1/catalog/sources` returns `{items:[{id,workCount}]}` for sources
+  represented by current work metadata, ordered by source ID.
+- `GET /api/v1/catalog/works/:id/chapters?offset=0&limit=100` returns
+  `{items,total,hasMore}` with current nondeleted chapter summaries containing
+  `{id,chapterPath,position,name}`, ordered by chapter position and ID. Package
+  file manifests are excluded. Unknown works return 404; known works without packages return
+  an empty page. Both paginated endpoints accept limits from 1 to 100. Concurrent
+  writes can shift offset pages; these pages are for browsing, not change tracking.
+- `GET /api/v1/catalog/chapter?pluginId=...&novelPath=...&chapterPath=...` resolves
+  one available chapter by its exact, URL-encoded identity. Missing or deleted
+  entries return 404. Use its ID with the existing chapter package download route.
+  Catalog browsing follows the same anonymous-read and device-key policies as
+  downloads. Queries read the current SQLite index without rescanning files.
+  Import scans, API writes, and startup indexing populate that index. Use
+  `GET /api/v1/works/:id` for full work metadata and
+  `GET /api/v1/works/:id/cover` for the selected cover.
 - `POST /api/v1/packages` streams an authenticated raw `application/zip` upload.
   Every declared file is checked for size and SHA-256, and undeclared files,
   unsafe paths, duplicates, symlinks, encryption and invalid metadata are rejected.
@@ -74,6 +105,11 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   protects this endpoint. Fetch catalog pages to consume a hint; persist only
   successfully applied page cursors. Authorization is checked again after waiting.
   A cursor ahead of the visible log returns HTTP 409 and requires cursor recovery.
+  Include `workAfter` to wait for work metadata changes as well. Change polling,
+  work change pages, and catalog lists use the SQLite index without rescanning
+  the content tree. API writes and folder import scans update the index as they
+  publish. Direct edits to server files are indexed at startup; opening one work
+  refreshes only that work from its authoritative `novel.json` and cover.
 
 Capabilities include `authentication: "device-key"` and `personalStateSync: false`.
 Old account, session, and personal-state endpoints are removed. Existing legacy

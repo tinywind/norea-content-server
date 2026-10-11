@@ -120,7 +120,7 @@ test('rejects unsafe metadata and identity mismatches without replacing a valid 
   } finally { await f.close(); }
 });
 
-test('live file changes advance change hints and catalog reads without restarting the server', async () => {
+test('catalog pages and change hints read the index without rescanning authoritative files', async () => {
   const f = await fixture();
   try {
     const first = (await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).json();
@@ -128,14 +128,19 @@ test('live file changes advance change hints and catalog reads without restartin
     const updated = { ...metadata(), novel: { ...metadata().novel, name: 'File edited now' }, updatedAt: 500 };
     await writeFile(file, JSON.stringify(updated));
     const changes = (await f.app.inject({ url: `/api/v1/changes?workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json();
-    assert.ok(changes.workCursor > first.sequence);
+    assert.equal(changes.workCursor, first.sequence);
     const list = (await f.app.inject({ url: `/api/v1/works?after=${first.sequence}`, headers: f.headers })).json();
-    assert.deepEqual(list.items.at(-1).metadata, updated);
-    assert.deepEqual((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata, updated);
+    assert.deepEqual(list, { items: [], cursor: first.sequence, hasMore: false });
     await writeFile(file, '{broken');
-    assert.equal((await f.app.inject({ url: '/api/v1/works', headers: f.headers })).statusCode, 400);
+    assert.deepEqual((await f.app.inject({ url: '/api/v1/works', headers: f.headers })).json().items[0], first);
+    assert.equal((await f.app.inject({ url: `/api/v1/changes?workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json().workCursor, first.sequence);
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    assert.equal((await f.app.inject({ url: '/api/v1/admin/works', headers: admin })).statusCode, 200);
+    assert.equal((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).statusCode, 400);
     await writeFile(file, JSON.stringify(updated));
-    assert.deepEqual((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata, updated);
+    const refreshed = (await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json();
+    assert.deepEqual(refreshed.metadata, updated); assert.ok(refreshed.sequence > first.sequence);
+    assert.deepEqual((await f.app.inject({ url: `/api/v1/works?after=${first.sequence}`, headers: f.headers })).json().items, [refreshed]);
   } finally { await f.close(); }
 });
 

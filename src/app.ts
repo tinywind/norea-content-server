@@ -9,6 +9,7 @@ import type { CatalogEntry, Limits } from './packages.ts';
 import { createChangeNotifications, readChangeCursors } from './changes.ts';
 import { initializeAdministration, registerAdministration, savedAnonymousRead } from './administration.ts';
 import { rebuildWorkIndex, registerWorks } from './works.ts';
+import { registerCatalog } from './catalog.ts';
 
 const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
@@ -37,6 +38,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   app.addHook('onClose', async () => { db.close(); });
   const requireRead = (request: Parameters<typeof authenticate>[1]) => { if (!anonymousRead || request.headers.authorization !== undefined) authenticate(db, request); };
   registerWorks(app, { db, dataDir, requireRead, notify: () => changes.notify() });
+  registerCatalog(app, { db, requireRead, catalogSchema });
   app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: false, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
@@ -67,14 +69,12 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
     const authenticated = request.headers.authorization !== undefined || !anonymousRead;
     if (authenticated) authenticate(db, request);
     const after = { catalogCursor: request.query.catalogAfter ?? 0, workCursor: request.query.workAfter };
-    if (after.workCursor !== undefined) { rebuildWorkIndex(db, dataDir); changes.notify(); }
     const current = readChangeCursors(db);
     if (after.catalogCursor > current.catalogCursor) throw problem(409, 'Change cursor is ahead of the server log');
     if (after.workCursor !== undefined && after.workCursor > current.workCursor) throw problem(409, 'Work cursor is ahead of the server log');
     const waitSeconds = request.query.waitSeconds ?? 20;
     if (waitSeconds && current.catalogCursor === after.catalogCursor && (after.workCursor === undefined || current.workCursor === after.workCursor)) await changes.wait(after, waitSeconds, reply.raw);
     if (authenticated || !anonymousRead) authenticate(db, request);
-    if (after.workCursor !== undefined) { rebuildWorkIndex(db, dataDir); changes.notify(); }
     const result = readChangeCursors(db);
     return after.workCursor === undefined ? { catalogCursor: result.catalogCursor } : result;
   });

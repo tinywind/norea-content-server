@@ -157,7 +157,7 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     const entry = saveWork(db, dataDir, request.body, request.params.id); notify(); return entry;
   });
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/works', { schema: { querystring: { type: 'object', properties: { after: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 } } } } }, async request => {
-    requireRead(request); rebuildWorkIndex(db, dataDir);
+    requireRead(request);
     const { after, limit } = request.query;
     const rows = db.prepare('SELECT entry FROM work_changes WHERE sequence>? ORDER BY sequence LIMIT ?').all(after, limit + 1) as { entry: string }[];
     const items = rows.slice(0, limit).map(row => JSON.parse(row.entry) as WorkEntry);
@@ -177,7 +177,7 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     });
   }
   app.get<{ Querystring: { search: string; offset: number; limit: number } }>('/api/v1/admin/works', { schema: { querystring: { type: 'object', properties: { search: { type: 'string', maxLength: 500, default: '' }, offset: { type: 'integer', minimum: 0, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 } } } } }, async (request, reply) => {
-    authenticate(db, request, true); reply.header('Cache-Control', 'no-store'); rebuildWorkIndex(db, dataDir);
+    authenticate(db, request, true); reply.header('Cache-Control', 'no-store');
     const where = "WHERE (?='' OR instr(lower(json_extract(w.entry,'$.metadata.novel.name') || ' ' || json_extract(w.entry,'$.metadata.identity.pluginId')),lower(?))>0)";
     const args = [request.query.search, request.query.search];
     const rows = db.prepare(`SELECT w.entry,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL) AS downloadedChapters FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string; downloadedChapters: number }[];
