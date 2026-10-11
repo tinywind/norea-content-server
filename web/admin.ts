@@ -6,7 +6,7 @@ interface Device { id: string; deviceName: string; createdAt: number | string; l
 interface Plugin { id: string; name: string; url: string; enabled: boolean; updatedAt: number | string; sources: { id: string; name: string; version: string; installMode?: string }[] }
 interface Root { id: string; name: string; path: string; metadataDbPath?: string | null; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; scanned: number; cancelled: boolean } }
-interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; revision?: string }
+interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
 interface Entry { id: string; revision: string; zipSha256: string; zipBytes: number; deleted: boolean; sequence: number; manifest: { identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string } } }
 interface NovelMetadata {
   schemaVersion: 1;
@@ -425,7 +425,7 @@ async function jobs(current: number) {
       summary ? el('div', '', `${summary.scanned} scanned · ${summary.registered} registered · ${summary.unchanged} unchanged · ${summary.skipped} skipped · ${summary.failed} failed`) : '',
       data.job.error ? el('div', 'notice error', data.job.error) : '');
     detailResults.replaceChildren(table(['File', 'Outcome', 'Reason / identity'], data.items.map(item => [el('div', 'mono result-path', item.path), badge(item.status),
-      el('div', '', item.reason || '—', item.sourceId ? el('div', 'hint mono', `Source: ${item.sourceId}`) : null, item.chapterId ? el('div', 'hint mono', `Chapter: ${item.chapterId}`) : null, item.revision ? el('div', 'hint mono', `Revision: ${item.revision}`) : null)]), 'No file results recorded yet.'),
+      el('div', '', item.reason || '—', item.sourceId ? el('div', 'hint mono', `Source: ${item.sourceId}`) : null, item.workId ? el('div', 'hint mono', `Work: ${item.workId}`) : null, item.chapterId ? el('div', 'hint mono', `Chapter: ${item.chapterId}`) : null, item.revision ? el('div', 'hint mono', `Revision: ${item.revision}`) : null)]), 'No file results recorded yet.'),
       pagination(data.total, position, 100, async next => { offset = next; resultFingerprint = ''; await results(); }));
   }
   async function refresh() {
@@ -433,7 +433,7 @@ async function jobs(current: number) {
     const fingerprint = JSON.stringify(data); if (fingerprint !== listFingerprint) {
       listFingerprint = fingerprint;
       list.body.replaceChildren(table(['Folder', 'Status', 'Started', 'Results', 'Actions'], data.items.map(job => [el('div', 'cell-title', job.rootName), badge(job.status), date(job.startedAt),
-        job.summary ? `${job.summary.registered} registered / ${job.summary.skipped} skipped / ${job.summary.failed} failed` : 'In progress',
+        job.summary ? `${job.summary.registered} registered / ${job.summary.unchanged} unchanged / ${job.summary.skipped} skipped / ${job.summary.failed} failed` : 'In progress',
         el('div', 'actions', action('Inspect', async () => { selected = job.id; offset = 0; resultFingerprint = ''; await results(); }, 'small'),
           job.status === 'running' ? action('Cancel', async () => { if (!confirm(`Cancel the scan for “${job.rootName}”? Content already registered will remain.`)) return; await api(`/admin/jobs/${encodeURIComponent(job.id)}/cancel`, 'POST'); await refresh(); }, 'small danger') : null),
       ]), 'No scans yet. Start a scan from Folders.'));
