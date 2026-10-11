@@ -8,6 +8,16 @@ interface Root { id: string; name: string; path: string; metadataDbPath?: string
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; revision?: string }
 interface Entry { id: string; revision: string; zipSha256: string; zipBytes: number; deleted: boolean; sequence: number; manifest: { identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string } } }
+interface NovelMetadata {
+  schemaVersion: 1;
+  identity: { pluginId: string; novelPath: string };
+  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; genres: string | null; isLocal: boolean };
+  chapters: { path: string; name: string; chapterNumber: string | null; position: number; page: string; contentType: 'html' | 'text' | 'markdown' | 'pdf' | 'epub'; releaseTime: string | null; directory: string }[];
+  cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
+  updatedAt: number;
+}
+interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount: number; downloadedChapters: number }
+interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
 interface Settings { anonymousRead: boolean; limits: { zipBytes: number; expandedBytes: number; files: number }; dataDir: string }
 interface Overview { works: number; chapters: number; revisions: number; zipBytes: number; deletedChapters: number; plugins: number; roots: number; runningJobs: number }
 
@@ -21,12 +31,14 @@ let flash: HTMLElement;
 let heading: HTMLElement;
 let subtitle: HTMLElement;
 let nav: HTMLElement;
+const coverUrls = new Set<string>();
+const coverRequests = new Set<AbortController>();
 const apiRoot = '/api/v1';
 const descriptions: Record<View, string> = {
   Overview: 'Content, storage, and ingestion at a glance.',
   Plugins: 'Register repositories and inspect the source identities they provide.',
   Folders: 'Connect server folders and control when their content is scanned.',
-  Content: 'Inspect chapters, manage revisions, and recover content from trash.',
+  Content: 'Browse works and metadata, inspect chapters, and manage stored revisions.',
   Jobs: 'Follow scans and inspect the outcome of every discovered file.',
   Devices: 'Inspect registered devices and block or restore their access.',
   Settings: 'Control anonymous reading and inspect server configuration.',
@@ -138,9 +150,15 @@ function pagination(total: number, offset: number, limit: number, change: (offse
   return el('div', 'pagination', el('span', '', total ? `${offset + 1}–${Math.min(offset + limit, total)} of ${total.toLocaleString()}` : '0 results'), el('div', 'actions', previous, next));
 }
 function stopPolling() { if (pollTimer) clearTimeout(pollTimer); pollTimer = undefined; }
+function clearCovers() {
+  for (const controller of coverRequests) controller.abort();
+  coverRequests.clear();
+  for (const url of coverUrls) URL.revokeObjectURL(url);
+  coverUrls.clear();
+}
 
 function login(error?: string) {
-  stopPolling(); generation++; document.querySelectorAll('dialog').forEach(node => node.remove());
+  stopPolling(); clearCovers(); generation++; document.querySelectorAll('dialog').forEach(node => node.remove());
   document.title = 'Sign in · Norea';
   const password = input('password', 'password'); password.autocomplete = 'current-password';
   const errors = el('div'); errors.setAttribute('role', 'alert');
@@ -172,7 +190,7 @@ function shell() {
     el('div', 'sidebar-footer', el('strong', '', 'Console session'), action('Sign out', async () => { await api('/console-sessions/current', 'DELETE'); token = ''; login(); }))), main));
 }
 async function navigate(next: View) {
-  stopPolling(); const current = ++generation; view = next;
+  stopPolling(); clearCovers(); const current = ++generation; view = next;
   document.querySelectorAll('dialog').forEach(node => node.remove());
   heading.textContent = next; subtitle.textContent = descriptions[next]; flash.replaceChildren();
   for (const button of nav.querySelectorAll('button')) {
@@ -251,24 +269,123 @@ async function folders(current: number) {
   page.replaceChildren(el('div', 'notice', el('strong', '', 'Read-only access to your source library'), 'Scans use local files and metadata without checking plugins or source sites. Raw chapter folders need a Norea metadata database for exact identities; complete ZIPs carry their own manifest. Incomplete files and unknown identities are skipped. Originals stay untouched.'), list.node, add.node);
 }
 
-async function content(current: number) {
-  const section = panel('Chapter catalog'); section.body.className = '';
+async function loadCover(work: Work, target: HTMLElement, current: number) {
+  const controller = new AbortController(); coverRequests.add(controller);
+  const requestToken = token;
+  try {
+    const response = await fetch(`${apiRoot}/admin/works/${encodeURIComponent(work.id)}/cover`, {
+      headers: { Authorization: `Bearer ${requestToken}` }, cache: 'no-store', signal: controller.signal,
+    });
+    if (requestToken !== token || current !== generation || !target.isConnected) return;
+    if (response.status === 401) { token = ''; login('Your session expired. Sign in again.'); return; }
+    if (!response.ok) throw new Error('Cover unavailable');
+    const blob = await response.blob();
+    if (controller.signal.aborted || current !== generation || !target.isConnected) return;
+    const url = URL.createObjectURL(blob); coverUrls.add(url);
+    const image = el('img'); image.alt = ''; image.src = url;
+    image.addEventListener('error', () => {
+      URL.revokeObjectURL(url); coverUrls.delete(url);
+      target.replaceChildren(el('span', 'cover-placeholder', 'Cover unavailable'));
+    }, { once: true });
+    target.replaceChildren(image);
+  } catch {
+    if (!controller.signal.aborted && current === generation && target.isConnected) target.replaceChildren(el('span', 'cover-placeholder', 'Cover unavailable'));
+  } finally { coverRequests.delete(controller); }
+}
+function inspectWork(work: Work) {
+  const { metadata } = work; const { novel, identity, cover } = metadata;
+  const modal = dialog(`Metadata · ${novel.name}`); modal.node.classList.add('metadata-dialog');
+  const values: [string, Child][] = [
+    ['Title', novel.name], ['Author', novel.author ?? '—'], ['Artist', novel.artist ?? '—'],
+    ['Status', novel.status ?? '—'], ['Genres', novel.genres ?? '—'], ['Summary', el('span', 'preserve-lines', novel.summary ?? '—')],
+    ['Local work', novel.isLocal ? 'Yes' : 'No'], ['Source cover URL', novel.cover ?? '—'],
+    ['Plugin ID', el('span', 'mono', identity.pluginId)], ['Novel path', el('span', 'mono', identity.novelPath)],
+    ['Cover file', cover?.fileName ?? '—'], ['Cover content type', cover?.contentType ?? '—'], ['Cover source URL', cover?.sourceUrl ?? '—'],
+    ['Stored cover', work.hasCover ? 'Available' : 'Not available'], ['Known chapters', work.chapterCount], ['Downloaded chapters', work.downloadedChapters],
+    ['Updated', date(metadata.updatedAt)], ['Schema version', metadata.schemaVersion], ['Work ID', el('span', 'mono', work.id)], ['Sequence', work.sequence],
+  ];
+  const json = el('details', 'metadata-json', el('summary', '', 'Full JSON'), el('pre', 'mono', JSON.stringify(metadata, null, 2)));
+  modal.body.append(details(values), el('h3', '', `Chapter list (${metadata.chapters.length.toLocaleString()})`),
+    table(['Chapter', 'Path / directory', 'Position / page', 'Format / release'], metadata.chapters.map(chapter => [
+      el('div', '', el('div', 'cell-title', chapter.name), el('div', 'hint', `Number: ${chapter.chapterNumber ?? '—'}`)),
+      el('div', '', el('div', 'mono', chapter.path), el('div', 'hint mono', chapter.directory)),
+      el('div', '', String(chapter.position), el('div', 'hint', `Page: ${chapter.page}`)),
+      el('div', '', chapter.contentType, el('div', 'hint', chapter.releaseTime ?? '—')),
+    ]), 'This work has no known chapters.'), json);
+}
+async function content(current: number, state: WorkView = { search: '', offset: 0, layout: 'grid' }) {
+  clearCovers();
+  const section = panel('Works', 'Known chapters include chapters that have not been downloaded.'); section.body.className = '';
+  const search = input('search', 'search', state.search, false); search.className = 'search-input'; search.placeholder = 'Search works'; search.setAttribute('aria-label', 'Search works');
+  const errors = el('div'); errors.setAttribute('role', 'alert');
+  const results = el('div'); let requestId = 0; let data: { items: Work[]; total: number } | undefined;
+  const back = () => content(++generation, state);
+  const openChapters = (work?: Work) => chapters(++generation, work, back);
+  const grid = action('Grid', () => changeLayout('grid'), 'small');
+  const list = action('List', () => changeLayout('list'), 'small');
+  const toggle = el('div', 'actions layout-toggle', grid, list); toggle.setAttribute('role', 'group'); toggle.setAttribute('aria-label', 'Work layout');
+  function changeLayout(layout: WorkView['layout']) { state.layout = layout; render(); }
+  function render() {
+    if (!data || current !== generation) return;
+    clearCovers();
+    grid.setAttribute('aria-pressed', String(state.layout === 'grid')); list.setAttribute('aria-pressed', String(state.layout === 'list'));
+    const covers: { work: Work; node: HTMLElement }[] = [];
+    const works = el('div', `works works-${state.layout}`);
+    for (const work of data.items) {
+      const cover = el('div', 'work-cover', el('span', 'cover-placeholder', work.hasCover ? 'Loading cover…' : 'No cover'));
+      const title = action(work.metadata.novel.name, () => openChapters(work), 'work-title');
+      const controls = el('div', 'actions', action('Chapters', () => openChapters(work), 'small'), action('Metadata', () => inspectWork(work), 'small'));
+      const info = el('div', 'work-info', el('h3', '', title), el('p', 'hint work-author', work.metadata.novel.author || 'Unknown author'),
+        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${work.downloadedChapters.toLocaleString()} / ${work.chapterCount.toLocaleString()} chapters downloaded`), controls);
+      works.append(el('article', 'work', cover, info));
+      if (work.hasCover) covers.push({ work, node: cover });
+    }
+    results.replaceChildren(data.items.length ? works : el('div', 'empty', state.search ? 'No matching works.' : 'No work metadata yet. Scan a folder containing novel.json to add works.'), pagination(data.total, state.offset, 50, load));
+    for (const cover of covers) void loadCover(cover.work, cover.node, current);
+  }
+  async function load(offset = 0) {
+    const request = ++requestId; errors.replaceChildren(); results.setAttribute('aria-busy', 'true');
+    const query = search.value.trim();
+    try {
+      const next = await api<{ items: Work[]; total: number }>(`/admin/works?search=${encodeURIComponent(query)}&offset=${offset}&limit=50`);
+      if (current !== generation || request !== requestId) return;
+      state.search = query; state.offset = offset; data = next; render();
+    } catch (error) {
+      if (current !== generation || request !== requestId) return;
+      clearCovers(); data = undefined;
+      showError(errors, error); results.replaceChildren(el('div', 'empty', action('Try again', () => load(offset))));
+    } finally { if (request === requestId) results.removeAttribute('aria-busy'); }
+  }
+  const form = el('form', 'toolbar', search); form.append(submit(form, 'Search', () => load(), errors), toggle, action('All chapters', () => openChapters(), 'small'));
+  results.append(el('div', 'loading', 'Loading works…')); section.body.append(form, errors, results);
+  if (current !== generation) return; page.replaceChildren(section.node); await load(state.offset);
+}
+async function chapters(current: number, work?: Work, back: () => Promise<void> = () => content(++generation)) {
+  clearCovers();
+  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'Downloaded chapter packages and stored revisions for this work.' : 'All chapter packages, including content without work metadata.'); section.body.className = '';
   const search = input('search', 'search', '', false); search.className = 'search-input'; search.placeholder = 'Search novel or chapter'; search.setAttribute('aria-label', 'Search content');
   const deleted = select('deleted', ['Active content', 'Trash']); deleted.setAttribute('aria-label', 'Content state'); deleted.className = 'button';
   const results = el('div'); let requestId = 0;
   const load = async (offset = 0) => {
-    const request = ++requestId;
-    const data = await api<{ items: Entry[]; total: number }>(`/admin/chapters?search=${encodeURIComponent(search.value.trim())}&deleted=${deleted.value === 'Trash'}&offset=${offset}&limit=50`);
-    if (current !== generation || request !== requestId) return;
-    results.replaceChildren(table(['Chapter', 'Source', 'Package', 'Actions'], data.items.map(entry => [
-      el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
-      el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.zipBytes), el('div', 'hint mono', entry.revision.slice(0, 12))),
-      action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'),
-    ]), deleted.value === 'Trash' ? 'Trash is empty.' : 'No matching chapters. Scan a connected folder to add content.'), pagination(data.total, offset, 50, load));
+    const request = ++requestId; errors.replaceChildren(); results.setAttribute('aria-busy', 'true');
+    try {
+      const data = await api<{ items: Entry[]; total: number }>(`/admin/chapters?search=${encodeURIComponent(search.value.trim())}&deleted=${deleted.value === 'Trash'}&offset=${offset}&limit=50${work ? `&workId=${encodeURIComponent(work.id)}` : ''}`);
+      if (current !== generation || request !== requestId) return;
+      results.replaceChildren(table(['Chapter', 'Source', 'Package', 'Actions'], data.items.map(entry => [
+        el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
+        el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.zipBytes), el('div', 'hint mono', entry.revision.slice(0, 12))),
+        action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'),
+      ]), deleted.value === 'Trash' ? 'Trash is empty.' : 'No matching chapters. Scan a connected folder to add content.'), pagination(data.total, offset, 50, load));
+    } catch (error) {
+      if (current !== generation || request !== requestId) return;
+      showError(errors, error); results.replaceChildren(el('div', 'empty', action('Try again', () => load(offset))));
+    } finally { if (request === requestId) results.removeAttribute('aria-busy'); }
   };
-  const form = el('form', 'toolbar', search, deleted); const errors = el('div');
+  const form = el('form', 'toolbar', search, deleted); const errors = el('div'); errors.setAttribute('role', 'alert');
   form.append(submit(form, 'Search', () => load(), errors)); deleted.addEventListener('change', () => { void load().catch(error => showError(errors, error)); });
-  section.body.append(form, errors, results); if (current !== generation) return; page.replaceChildren(section.node); await load();
+  results.append(el('div', 'loading', 'Loading chapters…'));
+  section.body.append(form, errors, results); if (current !== generation) return;
+  page.replaceChildren(el('div', 'actions', action('Back to works', back), work ? action('Metadata', () => inspectWork(work)) : null), section.node); await load();
 }
 async function inspectEntry(id: string, changed: () => Promise<void>) {
   const modal = dialog('Chapter details'); modal.body.append(el('div', 'loading', 'Loading chapter…'));
