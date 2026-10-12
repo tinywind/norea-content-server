@@ -80,7 +80,7 @@ function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer | unde
   try { return readBytes(path, coverByteLimit); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
 }
-function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1): WorkEntry {
+export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1): WorkEntry {
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
   if (existing && existing.directory !== directory) throw problem(409, 'Duplicate work identity in different folders');
   const cover = coverBytes(join(dataDir, directory), metadata);

@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { test } from 'node:test';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
@@ -11,7 +13,7 @@ async function setup() {
   await mkdir('.tmp', { recursive: true });
   const root = await mkdtemp(resolve('.tmp', 'administration-'));
   const dataDir = join(root, 'server');
-  const original = join(root, 'original');
+  const original = dataDir;
   await mkdir(join(original, 'contents'), { recursive: true });
   await writeFile(join(original, 'untouched.txt'), 'Original stays unchanged');
   const app = await buildApp({ dataDir });
@@ -31,7 +33,7 @@ test('administration requires a console session and does not expose filesystem p
   } finally { await s.close(); }
 });
 
-test('folder scan registers an archived ZIP without plugins and detaching preserves originals and server content', async () => {
+test('single-root scan registers an archived ZIP without plugins and preserves originals', async () => {
   const s = await setup();
   try {
     const headers = await s.admin();
@@ -46,10 +48,7 @@ test('folder scan registers an archived ZIP without plugins and detaching preser
     const source = join(s.original, 'contents/removed-source/Removed/1-First'); await mkdir(source, { recursive: true });
     await writeFile(join(source, '..', 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'removed-source', novelPath: '/gone' }, novel: { ...manifest.novel, author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null }, cover: null }));
     const archive = join(source, 'archived.zip'); await writeFile(archive, bytes);
-    const registered = await s.app.inject({ method: 'POST', url: '/api/v1/admin/roots', headers, payload: { name: 'Existing library', path: s.original, mode: 'manual', intervalMinutes: 15 } });
-    assert.equal(registered.statusCode, 200, registered.body);
-    const root = registered.json();
-    const started = await s.app.inject({ method: 'POST', url: `/api/v1/admin/roots/${root.id}/scan`, headers });
+    const started = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers });
     assert.equal(started.statusCode, 202, started.body);
     let detail;
     for (let i = 0; i < 100; i++) {
@@ -60,7 +59,7 @@ test('folder scan registers an archived ZIP without plugins and detaching preser
     assert.equal(detail.job.status, 'completed');
     assert.equal(detail.job.summary.registered, 2);
     const chapterId = detail.items.find((item: { chapterId?: string }) => item.chapterId).chapterId;
-    assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/admin/roots/${root.id}`, headers })).statusCode, 204);
+    assert.equal((await s.app.inject({ method: 'DELETE', url: '/api/v1/admin/roots/contents', headers })).statusCode, 404);
     assert.equal(await readFile(join(s.original, 'untouched.txt'), 'utf8'), 'Original stays unchanged');
     assert.deepEqual(await readFile(archive), bytes);
     assert.equal((await s.app.inject(`/api/v1/chapters/${chapterId}/package`)).statusCode, 200);
@@ -68,15 +67,24 @@ test('folder scan registers an archived ZIP without plugins and detaching preser
   } finally { await s.close(); }
 });
 
-test('server and source paths cannot overlap; root mutation inputs are strict', async () => {
+test('storage root is fixed at startup and scan mutation inputs are strict', async () => {
   const s = await setup();
   try {
     const headers = await s.admin();
-    for (const path of [s.dataDir, s.root]) {
-      const response = await s.app.inject({ method: 'POST', url: '/api/v1/admin/roots', headers, payload: { name: 'Unsafe', path, mode: 'manual', intervalMinutes: 15 } });
-      assert.equal(response.statusCode, 400, response.body);
+    const storage = (await s.app.inject({ url: '/api/v1/admin/storage', headers })).json();
+    assert.equal(storage.path, join(s.dataDir, 'contents'));
+    assert.equal((await s.app.inject({ method: 'POST', url: '/api/v1/admin/roots', headers, payload: {} })).statusCode, 404);
+    for (const payload of [{ path: s.root }, { name: 'Other root' }, { intervalMinutes: 0 }]) {
+      assert.equal((await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload })).statusCode, 400);
     }
-    assert.equal((await s.app.inject({ method: 'POST', url: '/api/v1/admin/roots', headers, payload: { name: 'Bad', path: s.original, mode: 'periodic', intervalMinutes: 0 } })).statusCode, 400);
+    assert.equal((await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload: { mode: 'manual', intervalMinutes: 30, enabled: false } })).statusCode, 200);
+    assert.equal((await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers })).statusCode, 202);
+    await s.app.close();
+    const restarted = await buildApp({ dataDir: s.dataDir });
+    try {
+      const saved = (await restarted.inject({ url: '/api/v1/admin/storage', headers: await consoleHeaders(restarted, s.dataDir) })).json();
+      assert.equal(saved.intervalMinutes, 30); assert.equal(saved.enabled, false);
+    } finally { await restarted.close(); }
   } finally { await s.close(); }
 });
 
@@ -97,6 +105,13 @@ test('access policy survives restart and protects anonymous reads immediately', 
 test('console HTML has a strict local-only content policy and catalog supports empty search', async () => {
   const s = await setup();
   try {
+    for (const page of ['overview', 'plugins', 'storage', 'content', 'jobs', 'devices', 'settings']) {
+      for (const suffix of ['', '/']) {
+        const route = await s.app.inject(`/admin/${page}${suffix}`);
+        assert.equal(route.statusCode, 200); assert.match(route.headers['content-type'] as string, /text\/html/);
+      }
+    }
+    assert.equal((await s.app.inject('/admin/not-a-route')).statusCode, 404);
     const response = await s.app.inject('/admin/');
     assert.equal(response.statusCode, 200);
     assert.match(response.headers['content-security-policy'] as string, /default-src 'self'/);
@@ -104,27 +119,6 @@ test('console HTML has a strict local-only content policy and catalog supports e
     assert.deepEqual(result.json(), { items: [], total: 0 });
   } finally { await s.close(); }
 });
-test('automatic roots queue behind each other instead of dropping simultaneous scans', async () => {
-  const s = await setup();
-  try {
-    const headers = await s.admin();
-    for (let i = 0; i < 3; i++) {
-      const path = join(s.root, `source-${i}`);
-      await mkdir(join(path, 'contents'), { recursive: true });
-      const response = await s.app.inject({ method: 'POST', url: '/api/v1/admin/roots', headers, payload: { name: `Source ${i}`, path, mode: 'periodic', intervalMinutes: 15 } });
-      assert.equal(response.statusCode, 200, response.body);
-    }
-    let jobs: { status: string; rootId: string }[] = [];
-    for (let i = 0; i < 100; i++) {
-      jobs = (await s.app.inject({ url: '/api/v1/admin/jobs', headers })).json().items;
-      if (jobs.length === 3 && jobs.every(job => job.status === 'completed')) break;
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    assert.equal(new Set(jobs.map(job => job.rootId)).size, 3);
-    assert.ok(jobs.every(job => job.status === 'completed'));
-  } finally { await s.close(); }
-});
-
 test('startup removes abandoned importer snapshots but preserves unrelated staging files', async () => {
   const s = await setup();
   try {
@@ -146,7 +140,7 @@ test('change-driven folder watching schedules a new durable scan after a filesys
   const s = await setup();
   try {
     const headers = await s.admin();
-    const response = await s.app.inject({ method: 'POST', url: '/api/v1/admin/roots', headers, payload: { name: 'Watched source', path: s.original, mode: 'changes', intervalMinutes: 15 } });
+    const response = await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload: { mode: 'changes', intervalMinutes: 15 } });
     assert.equal(response.statusCode, 200, response.body);
     const waitForJobs = async (count: number) => {
       for (let i = 0; i < 120; i++) {
@@ -163,5 +157,99 @@ test('change-driven folder watching schedules a new durable scan after a filesys
     assert.equal(results.items.length, 1);
     assert.equal(results.items[0].status, 'skipped');
     assert.equal(await readFile(join(s.original, 'contents', 'new-file.txt'), 'utf8'), 'Source changed');
+  } finally { await s.close(); }
+});
+
+
+test('generated packages do not cause repeated change-driven scans', async () => {
+  const s = await setup();
+  try {
+    const headers = await s.admin();
+    const work = join(s.dataDir, 'contents/example/Work'); const chapter = join(work, '1-First');
+    await mkdir(chapter, { recursive: true });
+    await writeFile(join(work, 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/work' }, novel: { name: 'Work', author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }));
+    await writeFile(join(chapter, 'content.html'), '<p>Saved chapter</p>');
+    const response = await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload: { mode: 'changes', intervalMinutes: 15 } });
+    assert.equal(response.statusCode, 200);
+    let jobs: { status: string; summary: { registered: number } }[] = [];
+    for (let i = 0; i < 120; i++) {
+      jobs = (await s.app.inject({ url: '/api/v1/admin/jobs', headers })).json().items;
+      if (jobs.length && jobs.every(job => job.status === 'completed')) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'completed'); assert.equal(jobs[0].summary.registered, 2);
+    await new Promise(resolve => setTimeout(resolve, 2300));
+    assert.equal((await s.app.inject({ url: '/api/v1/admin/jobs', headers })).json().items.length, 1);
+  } finally { await s.close(); }
+});
+
+
+test('batched scan progress remains consistent and flushes final and cancelled items', async () => {
+  const s = await setup();
+  try {
+    const headers = await s.admin();
+    const candidates = 250;
+    for (let i = 0; i < candidates; i++) await mkdir(join(s.dataDir, 'contents', 'example', `Work-${i}`), { recursive: true });
+    const start = async () => {
+      const response = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers });
+      assert.equal(response.statusCode, 202); return response.json().id as string;
+    };
+    const detail = async (id: string) => (await s.app.inject({ url: `/api/v1/admin/jobs/${id}?limit=100`, headers })).json();
+    const id = await start(); let sawProgress = false;
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const current = await detail(id);
+      assert.equal(current.job.summary.scanned, current.total);
+      assert.equal(current.job.summary.skipped, current.total);
+      if (current.job.status === 'completed') { assert.equal(current.total, candidates); break; }
+      if (current.total > 0) sawProgress = true;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal((await detail(id)).job.status, 'completed'); assert.ok(sawProgress);
+    const cancelledId = await start();
+    for (let attempt = 0; attempt < 1000; attempt++) {
+      const current = await detail(cancelledId);
+      if (current.total > 0) break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const cancelled = await s.app.inject({ method: 'POST', url: `/api/v1/admin/jobs/${cancelledId}/cancel`, headers });
+    assert.equal(cancelled.json().status, 'cancelled');
+    const current = await detail(cancelledId);
+    assert.equal(current.job.summary.scanned, current.total); assert.equal(current.job.summary.skipped, current.total);
+    assert.ok(current.total > 0 && current.total < candidates);
+    const allItems = [];
+    for (let offset = 0; offset < current.total; offset += 100) {
+      allItems.push(...(await s.app.inject({ url: `/api/v1/admin/jobs/${cancelledId}?offset=${offset}&limit=100`, headers })).json().items);
+    }
+    assert.equal(allItems.length, current.total);
+    assert.equal(new Set(allItems.map(item => item.path)).size, current.total);
+  } finally { await s.close(); }
+});
+
+
+test('failed scans flush pending result items before persisting their final status', async t => {
+  const s = await setup();
+  try {
+    const headers = await s.admin();
+    await mkdir(join(s.dataDir, 'contents', 'a', 'Missing metadata'), { recursive: true });
+    const unreadable = join(s.dataDir, 'contents', 'b'); await mkdir(unreadable);
+    const original = fs.promises.readdir;
+    t.mock.method(fs.promises, 'readdir', async (...args: Parameters<typeof fs.promises.readdir>) => {
+      if (String(args[0]) === unreadable) throw new Error('Injected directory listing failure');
+      return original(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      const started = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers });
+      assert.equal(started.statusCode, 202);
+      let detail;
+      for (let i = 0; i < 100; i++) {
+        detail = (await s.app.inject({ url: `/api/v1/admin/jobs/${started.json().id}`, headers })).json();
+        if (detail.job.status !== 'running') break;
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.equal(detail.job.status, 'failed'); assert.match(detail.job.error, /Injected directory listing failure/);
+      assert.equal(detail.total, 1); assert.equal(detail.items.length, 1);
+      assert.equal(detail.job.summary.scanned, 1); assert.equal(detail.job.summary.skipped, 1);
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
   } finally { await s.close(); }
 });

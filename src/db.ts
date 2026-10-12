@@ -17,8 +17,10 @@ export function openDatabase(dataDir: string): DatabaseSync {
     CREATE TABLE IF NOT EXISTS revisions (chapter_id TEXT NOT NULL REFERENCES chapters(id), revision TEXT NOT NULL, entry TEXT NOT NULL, path TEXT, deleted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(chapter_id,revision));
     CREATE TABLE IF NOT EXISTS work_tombstones (work_id TEXT PRIMARY KEY, deleted INTEGER NOT NULL, sequence INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS chapter_tombstones (chapter_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS scan_checkpoints (path TEXT PRIMARY KEY, signature TEXT NOT NULL, entry TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS works (id TEXT PRIMARY KEY, directory TEXT UNIQUE NOT NULL, entry TEXT NOT NULL, fingerprint TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS work_changes (sequence INTEGER PRIMARY KEY AUTOINCREMENT, work_id TEXT NOT NULL, entry TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS revisions_path ON revisions(path);
     CREATE INDEX IF NOT EXISTS works_catalog_name ON works(json_extract(entry,'$.metadata.novel.name'),id);
     CREATE INDEX IF NOT EXISTS works_catalog_source ON works(json_extract(entry,'$.metadata.identity.pluginId'),json_extract(entry,'$.metadata.novel.name'),id);
     CREATE INDEX IF NOT EXISTS chapters_catalog_work ON chapters(work_id,deleted_at,json_extract(entry,'$.manifest.chapter.position'),id);

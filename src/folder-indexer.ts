@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, relative, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -9,7 +9,7 @@ import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { canonicalize } from 'json-canonicalize';
 import { digest, publishPackage, safeArchivePath, validateManifest, type Limits, type PackageManifest } from './packages.ts';
-import { coverByteLimit, metadataByteLimit, metadataWorkId, readNovelMetadata, saveWork, saveWorkCover, type NovelMetadataV1 } from './works.ts';
+import { cacheWork, coverByteLimit, metadataByteLimit, metadataWorkId, readNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
 export interface FolderIndexItem {
   path: string;
@@ -22,7 +22,6 @@ export interface FolderIndexItem {
 }
 export interface FolderIndexSummary { scanned: number; registered: number; unchanged: number; skipped: number; failed: number; cancelled: boolean }
 export interface FolderIndexOptions {
-  rootPath: string;
   dataDir: string;
   db: DatabaseSync;
   limits: Limits;
@@ -40,7 +39,6 @@ interface Snapshot { source: string; destination: string; size: number; sha256: 
 interface PreparedPackage { path: string; manifest: PackageManifest; snapshots: Snapshot[]; verifyInventory?: () => Promise<void> }
 const unfinished = (name: string) => name.startsWith('.') || /(?:\.tmp|\.bak|\.part|\.partial|\.norea-sync-backup)$/i.test(name);
 const fail = (message: string): never => { throw new Error(message); };
-const inside = (parent: string, child: string) => { const path = relative(parent, child); return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path)); };
 const segment = (value: string | null, fallback: string) => { const result = (value?.trim() || fallback).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96); return !result || result === '.' || result === '..' ? fallback : result; };
 function aborted(signal?: AbortSignal): void { signal?.throwIfAborted(); }
 async function noLinks(path: string): Promise<void> {
@@ -235,22 +233,51 @@ async function rawPackage(directory: string, row: MetadataRow, stage: string, op
 export async function scanFolder(options: FolderIndexOptions): Promise<FolderIndexSummary> {
   const summary: FolderIndexSummary = { scanned: 0, registered: 0, unchanged: 0, skipped: 0, failed: 0, cancelled: false };
   if (options.signal?.aborted) return { ...summary, cancelled: true };
-  const root = resolve(options.rootPath); const dataDir = resolve(options.dataDir);
-  if (inside(root, dataDir) || inside(dataDir, root)) fail('Source and server storage overlap');
-  await noLinks(root); await noLinks(dataDir);
-  if (!(await lstat(root)).isDirectory()) fail('Source root must be a directory');
-  const actual = await realpath(root);
-  if (inside(actual, dataDir) || inside(dataDir, actual)) fail('Source and server storage overlap');
+  const dataDir = resolve(options.dataDir);
+  await noLinks(dataDir);
+  if (!(await lstat(dataDir)).isDirectory()) fail('Server storage must be a directory');
   await noLinks(join(dataDir, 'staging'));
   await mkdir(join(dataDir, 'staging'), { recursive: true });
   const stage = await mkdtemp(join(dataDir, 'staging', 'folder-'));
   const report = async (item: FolderIndexItem) => { summary.scanned++; summary[item.status]++; await options.onItem?.(item); };
   try {
-    const contents = join(root, 'contents'); await noLinks(contents);
+    const contents = join(dataDir, 'contents'); await noLinks(contents); await mkdir(contents, { recursive: true });
+    const publishedPath = options.db.prepare('SELECT chapter_id,revision FROM revisions WHERE path=?');
+    const checkpoint = (path: string) => options.db.prepare('SELECT signature,entry FROM scan_checkpoints WHERE path=?').get(path) as { signature: string; entry: string } | undefined;
+    const remember = (path: string, key: string, item: FolderIndexItem) => options.db.prepare('INSERT INTO scan_checkpoints(path,signature,entry) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,entry=excluded.entry').run(path, key, JSON.stringify(item));
+    const inventorySignature = async (path: string): Promise<string> => {
+      await noLinks(path);
+      const info = await lstat(path, { bigint: true });
+      if (info.isFile()) return signature(path);
+      if (!info.isDirectory()) fail('Expected a regular source file or directory');
+      const entries = (await readdir(path, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
+      const parts: string[] = [];
+      for (const entry of entries) {
+        aborted(options.signal);
+        const child = join(path, entry.name);
+        if (publishedPath.get(relative(dataDir, child))) continue;
+        if (entry.isSymbolicLink()) fail('Symbolic chapter files are unsupported');
+        parts.push(entry.name, await inventorySignature(child));
+      }
+      return JSON.stringify(parts);
+    };
     const process = async (path: string, sourceFolder: string, row: MetadataRow) => {
       let sourceId = row.pluginId;
       aborted(options.signal); const itemStage = await mkdtemp(join(stage, 'chapter-'));
       try {
+        const chapterMetadata = { pluginId: row.pluginId, novelPath: row.novelPath, chapterPath: row.chapterPath, chapterName: row.chapterName, chapterNumber: row.chapterNumber, position: row.position, page: row.page, contentType: row.contentType };
+        const before = canonicalize([chapterMetadata, await inventorySignature(path)]);
+        const saved = checkpoint(path);
+        if (saved?.signature === before) {
+          const item = JSON.parse(saved.entry) as FolderIndexItem;
+          const revision = options.db.prepare('SELECT r.path,c.deleted_at,r.deleted FROM revisions r JOIN chapters c ON c.id=r.chapter_id WHERE r.chapter_id=? AND r.revision=?').get(item.chapterId!, item.revision!) as { path: string | null; deleted_at: number | null; deleted: number } | undefined;
+          if (revision?.deleted_at != null || revision?.deleted) fail('Content was deleted; an administrator must restore it');
+          if (revision?.path) {
+            try {
+              if ((await lstat(join(dataDir, revision.path))).isFile()) { await report({ ...item, status: 'unchanged' }); return; }
+            } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          }
+        }
         let prepared: PreparedPackage;
         if (path.endsWith('.zip')) {
           const snapshot = await snapshotFile(path, join(itemStage, 'package.zip'), options.limits.zipBytes, options.signal);
@@ -270,11 +297,13 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         }
         await verifySnapshot(prepared.snapshots, options.signal); await prepared.verifyInventory?.(); aborted(options.signal);
         const id = digest(JSON.stringify([prepared.manifest.identity.pluginId, prepared.manifest.identity.novelPath, prepared.manifest.identity.chapterPath]));
-        const previous = options.db.prepare('SELECT revision FROM revisions WHERE chapter_id=? AND path IS NOT NULL').all(id) as { revision: string }[];
+        const previous = options.db.prepare("SELECT json_extract(entry,'$.revision') AS revision FROM chapters WHERE id=?").get(id) as { revision: string } | undefined;
         // Open the abortable file only after the publisher has attached stream error handling.
         const input = Readable.from((async function* () { yield* createReadStream(prepared.path, { signal: options.signal }); })());
-        const entry = await publishPackage(options.db, dataDir, input, options.limits);
-        await report({ path, sourceId, status: previous.some(row => row.revision === entry.revision) ? 'unchanged' : 'registered', chapterId: entry.id, revision: entry.revision });
+        const entry = await publishPackage(options.db, dataDir, input, options.limits, true);
+        const item: FolderIndexItem = { path, sourceId, status: previous?.revision === entry.revision ? 'unchanged' : 'registered', chapterId: entry.id, revision: entry.revision };
+        if (before === canonicalize([chapterMetadata, await inventorySignature(path)])) remember(path, before, item);
+        await report(item);
       } catch (error) {
         aborted(options.signal);
         const code = (error as NodeJS.ErrnoException).code;
@@ -288,35 +317,66 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         const workStage = await mkdtemp(join(stage, 'work-'));
         let value: NovelMetadataV1;
         try {
-          const file = await snapshotFile(join(directory, 'novel.json'), join(workStage, 'novel.json'), metadataByteLimit, options.signal);
-          value = readNovelMetadata(file.destination);
-          if (segment(value.identity.pluginId, 'source') !== sourceId) fail('Work metadata source does not match its folder');
-          const snapshots = [file];
-          if (value.cover && entries.some(entry => entry.name === value.cover!.fileName)) snapshots.push(await snapshotFile(join(directory, value.cover.fileName), join(workStage, value.cover.fileName), coverByteLimit, options.signal));
-          await verifySnapshot(snapshots, options.signal); aborted(options.signal);
-          const id = metadataWorkId(value);
-          const previous = options.db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;
-          let work = saveWork(options.db, dataDir, value);
-          if (snapshots.length > 1) work = saveWorkCover(options.db, dataDir, id, await readFile(snapshots[1].destination));
-          if (!previous || JSON.parse(previous.entry).sequence !== work.sequence) options.onWorkChange?.();
-          await report({ path: join(directory, 'novel.json'), sourceId: value.identity.pluginId, workId: id, status: previous && JSON.parse(previous.entry).sequence === work.sequence ? 'unchanged' : 'registered' });
+          const metadataPath = join(directory, 'novel.json');
+          const workSignature = async (metadata: NovelMetadataV1) => {
+            let cover: string | null = null;
+            if (metadata.cover) {
+              try { cover = await signature(join(directory, metadata.cover.fileName)); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+            }
+            return canonicalize([await signature(metadataPath), metadata.cover?.fileName ?? null, cover]);
+          };
+          const saved = checkpoint(metadataPath);
+          const cached = options.db.prepare('SELECT entry FROM works WHERE directory=?').get(relative(dataDir, directory)) as { entry: string } | undefined;
+          const stored = cached ? JSON.parse(cached.entry) as WorkEntry : undefined;
+          if (saved && stored && saved.signature === await workSignature(stored.metadata)) {
+            value = stored.metadata;
+            await report({ ...JSON.parse(saved.entry) as FolderIndexItem, status: 'unchanged' });
+          } else {
+            const file = await snapshotFile(metadataPath, join(workStage, 'novel.json'), metadataByteLimit, options.signal);
+            value = readNovelMetadata(file.destination);
+            if (segment(value.identity.pluginId, 'source') !== sourceId) fail('Work metadata source does not match its folder');
+            const before = await workSignature(value);
+            const snapshots = [file];
+            if (value.cover && entries.some(entry => entry.name === value.cover!.fileName)) snapshots.push(await snapshotFile(join(directory, value.cover.fileName), join(workStage, value.cover.fileName), coverByteLimit, options.signal));
+            await verifySnapshot(snapshots, options.signal); aborted(options.signal);
+            const id = metadataWorkId(value);
+            const previous = options.db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;
+            const work = cacheWork(options.db, dataDir, relative(dataDir, directory), value);
+            if (!previous || JSON.parse(previous.entry).sequence !== work.sequence) options.onWorkChange?.();
+            const item: FolderIndexItem = { path: metadataPath, sourceId: value.identity.pluginId, workId: id, status: previous && JSON.parse(previous.entry).sequence === work.sequence ? 'unchanged' : 'registered' };
+            if (before === await workSignature(value)) remember(metadataPath, before, item);
+            await report(item);
+          }
         } catch (error) {
           aborted(options.signal);
           await report({ path: join(directory, 'novel.json'), sourceId, status: 'skipped', reason: (error as Error).message });
           return;
         } finally { await rm(workStage, { recursive: true, force: true }); }
-        const folders = entries.filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !unfinished(entry.name))
-          .sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+        const folders = [];
+        for (const entry of entries) {
+          if (!entry.isDirectory() || entry.isSymbolicLink() || unfinished(entry.name)) continue;
+          const path = join(directory, entry.name);
+          const files = await readdir(path, { withFileTypes: true });
+          const onlyPublished = files.length > 0 && files.every(file => file.isFile() && publishedPath.get(relative(dataDir, join(path, file.name))));
+          if (onlyPublished) {
+            for (const file of files) {
+              const row = publishedPath.get(relative(dataDir, join(path, file.name))) as { chapter_id: string; revision: string };
+              await report({ path: join(path, file.name), sourceId, status: 'unchanged', chapterId: row.chapter_id, revision: row.revision });
+            }
+          } else folders.push(entry);
+        }
+        folders.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
         const numbers = new Map<string, number>();
         for (const folder of folders) {
           const number = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/)?.[1];
           if (number) numbers.set(number, (numbers.get(number) ?? 0) + 1);
         }
-        for (const [index, folder] of folders.entries()) {
+        for (const folder of folders) {
           const path = join(directory, folder.name); const parts = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/);
           if (!parts || numbers.get(parts[1]) !== 1) { await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must have a unique number followed by a hyphen and title' }); continue; }
           const files = await readdir(path, { withFileTypes: true });
-          const row: MetadataRow = { ...value.identity, chapterPath: `norea-folder:${parts[1]}`, novelName: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal ? 1 : 0, chapterName: parts[2], chapterNumber: parts[1], position: index + 1, page: '1', contentType: files.some(file => file.name === 'content.pdf') ? 'pdf' : 'html' };
+          const row: MetadataRow = { ...value.identity, chapterPath: `norea-folder:${parts[1]}`, novelName: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal ? 1 : 0, chapterName: parts[2], chapterNumber: parts[1], position: Number(parts[1]), page: '1', contentType: files.some(file => file.name === 'content.pdf') ? 'pdf' : 'html' };
           const packages = files.filter(file => file.isFile() && file.name.endsWith('.zip') && file.name !== 'media.zip' && !unfinished(file.name));
           if (files.some(file => /^content\./.test(file.name)) || packages.length === 0) await process(path, sourceId, row);
           else if (packages.length === 1) await process(join(path, packages[0].name), sourceId, row);
