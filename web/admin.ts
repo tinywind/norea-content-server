@@ -1,10 +1,10 @@
 export {};
 
-type View = 'Overview' | 'Plugins' | 'Folders' | 'Content' | 'Jobs' | 'Devices' | 'Settings';
+type View = 'Overview' | 'Plugins' | 'Storage' | 'Content' | 'Jobs' | 'Devices' | 'Settings';
 type Child = Node | string | number | null | undefined;
 interface Device { id: string; deviceName: string; createdAt: number | string; lastSeenAt: number | string | null; blocked: boolean }
 interface Plugin { id: string; name: string; url: string; enabled: boolean; updatedAt: number | string; sources: { id: string; name: string; version: string; installMode?: string }[] }
-interface Root { id: string; name: string; path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
+interface StorageSettings { path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
 interface Entry { id: string; revision: string; zipSha256: string; zipBytes: number; deleted: boolean; sequence: number; manifest: { identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string } } }
@@ -14,13 +14,14 @@ interface NovelMetadata {
   novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
   cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
 }
-interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount: number; downloadedChapters: number }
+interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount?: number; downloadedChapters?: number }
 interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
 interface Settings { anonymousRead: boolean; limits: { zipBytes: number; expandedBytes: number; files: number }; dataDir: string }
-interface Overview { works: number; chapters: number; revisions: number; zipBytes: number; deletedChapters: number; plugins: number; roots: number; runningJobs: number }
+interface Overview { works: number; chapters: number; revisions: number; zipBytes: number; deletedChapters: number; plugins: number; contentsPath: string; runningJobs: number }
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
-let token = '';
+const sessionKey = 'norea-console-session';
+let token = sessionStorage.getItem(sessionKey) ?? '';
 let view: View = 'Overview';
 let generation = 0;
 let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -35,7 +36,7 @@ const apiRoot = '/api/v1';
 const descriptions: Record<View, string> = {
   Overview: 'Content, storage, and ingestion at a glance.',
   Plugins: 'Register repositories and inspect the source identities they provide.',
-  Folders: 'Connect server folders and control when their content is scanned.',
+  Storage: 'Inspect the content directory and scan for new or changed files.',
   Content: 'Browse works and metadata, inspect chapters, and manage stored revisions.',
   Jobs: 'Follow scans and inspect the outcome of every discovered file.',
   Devices: 'Inspect registered devices and block or restore their access.',
@@ -44,12 +45,33 @@ const descriptions: Record<View, string> = {
 const iconPaths: Record<View, string> = {
   Overview: 'M3 3h6v6H3zM13 3h6v6h-6zM3 13h6v6H3zM13 13h6v6h-6z',
   Plugins: 'M8 3v4M14 3v4M5 7h12v4a6 6 0 0 1-12 0zM11 17v4',
-  Folders: 'M2 6h7l2 2h9v11H2zM2 6V4h7l2 2',
+  Storage: 'M2 6h7l2 2h9v11H2zM2 6V4h7l2 2',
   Content: 'M4 3h6a2 2 0 0 1 2 2v15a3 3 0 0 0-3-2H4zM12 5a2 2 0 0 1 2-2h6v15h-5a3 3 0 0 0-3 2',
   Jobs: 'M4 5h10M4 11h8M4 17h6M15 13l5 3-5 3z',
   Devices: 'M6 2h10v18H6zM9 17h4',
   Settings: 'M3 6h16M3 16h16M7 3v6M15 13v6',
 };
+
+function setToken(value: string) {
+  token = value;
+  if (value) sessionStorage.setItem(sessionKey, value); else sessionStorage.removeItem(sessionKey);
+}
+function routeView(): View {
+  const name = location.pathname.replace(/\/$/, '').split('/').at(-1);
+  return (Object.keys(descriptions) as View[]).find(item => item.toLowerCase() === name) ?? 'Overview';
+}
+function queryOffset(key = 'offset') {
+  const value = Number(new URLSearchParams(location.search).get(key));
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+function updateQuery(values: Record<string, string | number | null>, push = false) {
+  const url = new URL(location.href);
+  for (const [key, value] of Object.entries(values)) {
+    if (value === null || value === '' || value === 0) url.searchParams.delete(key);
+    else url.searchParams.set(key, String(value));
+  }
+  if (url.href !== location.href) history[push ? 'pushState' : 'replaceState'](null, '', url);
+}
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', ...children: Child[]): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
@@ -85,7 +107,7 @@ async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> 
   const data = response.status === 204 ? undefined : await response.json().catch(() => undefined);
   if (requestToken !== token) throw new Error('The session changed while this request was in progress.');
   if (!response.ok) {
-    if (response.status === 401 && token) { token = ''; login('Your session expired. Sign in again.'); }
+    if (response.status === 401 && token) { setToken(''); login('Your session expired. Sign in again.'); }
     throw new Error(data?.message || data?.error || `Request failed (${response.status}).`);
   }
   return data as T;
@@ -164,41 +186,49 @@ function login(error?: string) {
   const form = el('form');
   const button = submit(form, 'Sign in', async () => {
     const session = await api<{ token: string }>('/console-sessions', 'POST', { password: password.value });
-    password.value = ''; token = session.token;
-    shell(); await navigate('Overview');
+    password.value = ''; setToken(session.token);
+    shell(); await navigate(routeView(), false);
   }, errors);
   form.append(field('Installation secret', password, 'Use the value stored in admin-password.hash in the server data directory.'), button);
   app.replaceChildren(el('div', 'login',
     el('aside', 'login-aside', el('div', 'brand', el('span', 'brand-mark', '◈'), 'norea'),
-      el('div', '', el('div', 'eyebrow', 'Content server'), el('h1', '', 'Content server administration'), el('p', '', 'Connect content folders, inspect ingestion, and manage access to your shared library.')),
-      el('div', 'login-footer', 'Administration console', el('br'), 'Source folders and original metadata databases stay untouched.')),
+      el('div', '', el('div', 'eyebrow', 'Content server'), el('h1', '', 'Content server administration'), el('p', '', 'Browse stored content, inspect scans, and manage device access.')),
+      el('div', 'login-footer', 'Administration console')),
     el('main', 'login-main', el('div', 'login-card', el('div', 'eyebrow', 'Administration'), el('h2', '', 'Welcome back'), el('p', 'hint', 'Sign in with this server’s installation secret.'), form, errors,
-      el('p', 'hint', 'The session stays in this tab’s memory. Reloading requires signing in again.')))));
+      el('p', 'hint', 'Your session stays signed in in this tab until it expires or you sign out.')))));
   password.focus();
 }
 function shell() {
   nav = el('nav', 'nav'); nav.setAttribute('aria-label', 'Administration');
   for (const name of Object.keys(descriptions) as View[]) {
-    const button = action(name, () => navigate(name)); button.className = ''; button.prepend(icon(name)); button.dataset.view = name; nav.append(button);
+    const link = el('a', '', icon(name), name); link.href = `/admin/${name.toLowerCase()}`; link.dataset.view = name;
+    link.addEventListener('click', event => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      event.preventDefault(); void navigate(name);
+    });
+    nav.append(link);
   }
   heading = el('h1'); subtitle = el('p'); page = el('div', 'page'); flash = el('div', 'flash'); flash.setAttribute('role', 'status');
   const main = el('main', 'main', el('div', 'topline', el('span', '', 'NOREA', ' / ', el('strong', '', 'CONTENT SERVER')), el('span', 'environment', el('span', 'dot'), 'ADMINISTRATION')),
     flash, el('header', 'page-heading', el('div', '', el('div', 'eyebrow', 'Library administration'), heading, subtitle)), page);
   app.replaceChildren(el('div', 'shell', el('aside', 'sidebar', el('div', 'brand', el('span', 'brand-mark', '◈'), 'norea'), el('div', 'brand-caption', 'Content server'), nav,
-    el('div', 'sidebar-footer', el('strong', '', 'Console session'), action('Sign out', async () => { await api('/console-sessions/current', 'DELETE'); token = ''; login(); }))), main));
+    el('div', 'sidebar-footer', el('strong', '', 'Console session'), action('Sign out', async () => { await api('/console-sessions/current', 'DELETE'); setToken(''); login(); }))), main));
 }
-async function navigate(next: View) {
+async function navigate(next: View, push = true) {
+  const path = `/admin/${next.toLowerCase()}`;
+  if (push && location.pathname + location.search !== path) history.pushState(null, '', path);
+  else if (location.pathname.replace(/\/$/, '') !== path) history.replaceState(null, '', path + location.search);
   stopPolling(); clearCovers(); const current = ++generation; view = next;
   document.querySelectorAll('dialog').forEach(node => node.remove());
   heading.textContent = next; subtitle.textContent = descriptions[next]; flash.replaceChildren();
-  for (const button of nav.querySelectorAll('button')) {
+  for (const button of nav.querySelectorAll('a')) {
     if (button.dataset.view === next) button.setAttribute('aria-current', 'page'); else button.removeAttribute('aria-current');
   }
   page.replaceChildren(el('div', 'loading', 'Loading…')); document.title = `${next} · Norea`;
   try {
-    const render = { Overview: overview, Plugins: plugins, Folders: folders, Content: content, Jobs: jobs, Devices: devices, Settings: settings }[next];
+    const render = { Overview: overview, Plugins: plugins, Storage: storage, Content: contentRoute, Jobs: jobs, Devices: devices, Settings: settings }[next];
     await render(current);
-  } catch (error) { if (current === generation) page.replaceChildren(el('div', 'notice error', message(error)), action('Try again', () => navigate(next))); }
+  } catch (error) { if (current === generation) page.replaceChildren(el('div', 'notice error', message(error)), action('Try again', () => navigate(next, false))); }
 }
 
 async function overview(current: number) {
@@ -206,17 +236,14 @@ async function overview(current: number) {
   const stats = el('div', 'stats');
   for (const [label, value, detail] of [
     ['Works', data.works.toLocaleString(), 'Distinct novels in the catalog'], ['Chapters', data.chapters.toLocaleString(), 'Available to connected readers'],
-    ['Package storage', bytes(data.zipBytes), `${data.revisions.toLocaleString()} stored revisions`], ['Running scans', data.runningJobs.toLocaleString(), `${data.roots} connected folders`],
+    ['Package storage', bytes(data.zipBytes), `${data.revisions.toLocaleString()} stored revisions`], ['Running scans', data.runningJobs.toLocaleString(), 'Content directory'],
   ]) stats.append(el('div', 'stat', el('div', 'stat-label', label), el('div', 'stat-value', value), el('div', 'stat-detail', detail)));
   const inventory = panel('Server inventory');
-  for (const [label, value] of [['Registered repositories', data.plugins], ['Connected source folders', data.roots], ['Chapters in trash', data.deletedChapters]]) inventory.body.append(el('div', 'health-line', el('span', '', label), el('strong', '', value)));
+  for (const [label, value] of [['Registered repositories', data.plugins], ['Chapters in trash', data.deletedChapters]]) inventory.body.append(el('div', 'health-line', el('span', '', label), el('strong', '', value)));
   inventory.body.append(el('div', 'form-actions', action('Browse content', () => navigate('Content'), 'primary'), action('View jobs', () => navigate('Jobs'))));
-  const start = panel('Connect your library', 'From source files to a shared catalog.');
-  start.body.append(el('ol', 'step-list',
-    el('li', '', el('div', '', el('strong', '', 'Connect a content folder'), 'Use a path on this server and a Norea metadata database when needed.')),
-    el('li', '', el('div', '', el('strong', '', 'Keep archived content available'), 'Local files and metadata are enough; source sites and installed plugins are not required.')),
-    el('li', '', el('div', '', el('strong', '', 'Scan and inspect the results'), 'Review registered, unchanged, and skipped files in Jobs.'))));
-  page.replaceChildren(stats, el('div', 'two-col', inventory.node, start.node), el('div', 'notice', el('strong', '', 'Source files stay untouched'), 'Scans read the connected folders and temporary metadata copies. Deleting or purging content only affects the server’s catalog and package storage.'));
+  const storage = panel('Content directory', 'Uploads and scans use this directory.');
+  storage.body.append(el('p', 'mono', data.contentsPath), action('Scan settings', () => navigate('Storage')));
+  page.replaceChildren(stats, el('div', 'two-col', inventory.node, storage.node));
 }
 
 async function plugins(current: number) {
@@ -236,33 +263,26 @@ async function plugins(current: number) {
   add.body.append(form); page.replaceChildren(list.node, add.node);
 }
 
-function rootForm(existing: Root | undefined, saved: () => Promise<void>) {
-  const form = el('form'); const errors = el('div');
-  const name = input('name', 'text', existing?.name ?? ''); const path = input('path', 'text', existing?.path ?? '');
-  const mode = select('mode', ['manual', 'periodic', 'changes'], existing?.mode);
-  const interval = input('intervalMinutes', 'number', String(existing?.intervalMinutes ?? 15)); interval.min = '1'; interval.max = '1440'; interval.step = '1';
-  const syncMode = () => { interval.disabled = mode.value === 'manual'; }; mode.addEventListener('change', syncMode); syncMode();
-  form.append(el('div', 'form-grid', field('Folder name', name), field('Scan mode', mode, 'Changes mode watches files and also reconciles on the configured interval.'),
-    field('Content folder on the server', path, 'Absolute server filesystem path. This is not a path on your browser’s device.', true),
-    field('Interval (minutes)', interval, 'Used by periodic and changes modes.')));
-  form.append(el('div', 'form-actions', submit(form, existing ? 'Save folder' : 'Connect folder', async () => {
-    await api(`/admin/roots${existing ? `/${encodeURIComponent(existing.id)}` : ''}`, existing ? 'PATCH' : 'POST', { name: name.value.trim(), path: path.value.trim(), mode: mode.value, intervalMinutes: Number(interval.value) });
-    await saved();
-  }, errors)), errors); return form;
-}
-async function folders(current: number) {
-  const data = await api<{ items: Root[] }>('/admin/roots'); if (current !== generation) return;
-  const list = panel('Connected folders', `${data.items.length} folders · Source folders are read-only`); list.body.className = '';
-  list.body.append(table(['Folder', 'Schedule', 'Last scan', 'Actions'], data.items.map(root => [
-    el('div', '', el('div', 'cell-title', root.name), el('div', 'hint mono', root.path)),
-    el('div', '', badge(root.enabled ? 'enabled' : 'disabled'), el('div', 'hint', `${root.mode}${root.mode === 'manual' ? '' : ` · ${root.intervalMinutes} min`}`)), date(root.lastScanAt),
-    el('div', 'actions', action('Scan now', async () => { const job = await api<Job>(`/admin/roots/${encodeURIComponent(root.id)}/scan`, 'POST'); await navigate('Jobs'); notify(`Scan started for ${root.name}. Job ${job.id}.`); }, 'small primary'),
-      action('Edit', () => { const modal = dialog('Edit connected folder'); modal.body.append(rootForm(root, async () => { modal.node.close(); await navigate('Folders'); })); }, 'small'),
-      action(root.enabled ? 'Disable' : 'Enable', async () => { await api(`/admin/roots/${encodeURIComponent(root.id)}`, 'PATCH', { enabled: !root.enabled }); await navigate('Folders'); }, 'small'),
-      action('Detach', async () => { if (!confirm(`Detach “${root.name}”? This stops future scans. Its source files and existing server content remain untouched.`)) return; await api(`/admin/roots/${encodeURIComponent(root.id)}`, 'DELETE'); await navigate('Folders'); }, 'small danger')),
-  ]), 'No folders connected. Add a server path below.'));
-  const add = panel('Connect a folder'); add.body.append(rootForm(undefined, async () => { await navigate('Folders'); notify('Folder connected. Start a scan when ready.'); }));
-  page.replaceChildren(el('div', 'notice', el('strong', '', 'Read-only access to your source library'), 'Scans use local files and metadata without checking plugins or source sites. Every work needs a valid novel.json with its original identity and title. Chapters are discovered from numbered folders. Incomplete files and unknown identities are skipped. Originals stay untouched.'), list.node, add.node);
+async function storage(current: number) {
+  const data = await api<StorageSettings>('/admin/storage'); if (current !== generation) return;
+  const directory = panel('Content directory', 'Configured when the server starts. Uploads and scans use the same directory.');
+  directory.body.append(details([['Path', el('span', 'mono', data.path)], ['Last scan', date(data.lastScanAt)]]),
+    action('Scan now', async () => {
+      const job = await api<Job>('/admin/storage/scan', 'POST');
+      await navigate('Jobs'); updateQuery({ job: job.id }, true); await navigate('Jobs', false);
+    }, 'primary'));
+  const schedule = panel('Scan schedule'); const form = el('form'); const errors = el('div');
+  const enabled = input('enabled', 'checkbox', '', false); enabled.checked = data.enabled;
+  const mode = select('mode', ['manual', 'periodic', 'changes'], data.mode);
+  const interval = input('intervalMinutes', 'number', String(data.intervalMinutes)); interval.min = '1'; interval.max = '1440'; interval.step = '1';
+  const updateMode = () => { interval.disabled = mode.value === 'manual'; }; mode.addEventListener('change', updateMode); updateMode();
+  form.append(el('label', 'check-field', enabled, 'Enable scheduled scans'),
+    el('div', 'form-grid', field('Scan mode', mode, 'Changes mode watches files and also checks on the configured interval.'), field('Interval (minutes)', interval)),
+    el('div', 'form-actions', submit(form, 'Save schedule', async () => {
+      await api('/admin/storage', 'PATCH', { mode: mode.value, intervalMinutes: Number(interval.value), enabled: enabled.checked }); notify('Scan schedule saved.');
+    }, errors)), errors);
+  schedule.body.append(form);
+  page.replaceChildren(directory.node, schedule.node, el('div', 'notice', 'The first scan indexes existing content. Later scans process new or changed files and reuse unchanged results. Each work needs valid novel.json metadata. Scans do not contact source sites or alter original chapter files.'));
 }
 
 async function loadCover(work: Work, target: HTMLElement, current: number) {
@@ -273,7 +293,7 @@ async function loadCover(work: Work, target: HTMLElement, current: number) {
       headers: { Authorization: `Bearer ${requestToken}` }, cache: 'no-store', signal: controller.signal,
     });
     if (requestToken !== token || current !== generation || !target.isConnected) return;
-    if (response.status === 401) { token = ''; login('Your session expired. Sign in again.'); return; }
+    if (response.status === 401) { setToken(''); login('Your session expired. Sign in again.'); return; }
     if (!response.ok) throw new Error('Cover unavailable');
     const blob = await response.blob();
     if (controller.signal.aborted || current !== generation || !target.isConnected) return;
@@ -297,24 +317,38 @@ function inspectWork(work: Work) {
     ['Local work', novel.isLocal ? 'Yes' : 'No'], ['Source cover URL', novel.cover ?? '—'],
     ['Plugin ID', el('span', 'mono', identity.pluginId)], ['Novel path', el('span', 'mono', identity.novelPath)],
     ['Cover file', cover?.fileName ?? '—'], ['Cover content type', cover?.contentType ?? '—'], ['Cover source URL', cover?.sourceUrl ?? '—'],
-    ['Stored cover', work.hasCover ? 'Available' : 'Not available'], ['Downloaded chapters', work.downloadedChapters],
+    ['Stored cover', work.hasCover ? 'Available' : 'Not available'],
     ['Schema version', metadata.schemaVersion], ['Work ID', el('span', 'mono', work.id)], ['Sequence', work.sequence],
   ];
+  if (work.downloadedChapters !== undefined) values.push(['Downloaded chapters', work.downloadedChapters]);
   const json = el('details', 'metadata-json', el('summary', '', 'Full JSON'), el('pre', 'mono', JSON.stringify(metadata, null, 2)));
   modal.body.append(details(values), json);
 }
-async function content(current: number, state: WorkView = { search: '', offset: 0, layout: 'grid' }) {
+async function contentRoute(current: number) {
+  const query = new URLSearchParams(location.search);
+  if (query.has('work') || query.has('chapters')) {
+    const work = query.has('work') ? await api<Work>(`/works/${encodeURIComponent(query.get('work')!)}`) : undefined;
+    if (current !== generation) return;
+    await chapters(current, work, async () => {
+      updateQuery({ work: null, chapters: null, chapterSearch: null, chapterOffset: null, deleted: null }, true);
+      await navigate('Content', false);
+    });
+  } else await content(current, { search: query.get('search') ?? '', offset: queryOffset(), layout: query.get('layout') === 'list' ? 'list' : 'grid' });
+}
+async function content(current: number, state: WorkView) {
   clearCovers();
   const section = panel('Works', 'Chapter counts include available imported or uploaded packages.'); section.body.className = '';
   const search = input('search', 'search', state.search, false); search.className = 'search-input'; search.placeholder = 'Search works'; search.setAttribute('aria-label', 'Search works');
   const errors = el('div'); errors.setAttribute('role', 'alert');
   const results = el('div'); let requestId = 0; let data: { items: Work[]; total: number } | undefined;
-  const back = () => content(++generation, state);
-  const openChapters = (work?: Work) => chapters(++generation, work, back);
+  const openChapters = async (work?: Work) => {
+    updateQuery({ work: work?.id ?? null, chapters: work ? null : 'all' }, true);
+    await navigate('Content', false);
+  };
   const grid = action('Grid', () => changeLayout('grid'), 'small');
   const list = action('List', () => changeLayout('list'), 'small');
   const toggle = el('div', 'actions layout-toggle', grid, list); toggle.setAttribute('role', 'group'); toggle.setAttribute('aria-label', 'Work layout');
-  function changeLayout(layout: WorkView['layout']) { state.layout = layout; render(); }
+  function changeLayout(layout: WorkView['layout']) { state.layout = layout; updateQuery({ layout }); render(); }
   function render() {
     if (!data || current !== generation) return;
     clearCovers();
@@ -326,7 +360,7 @@ async function content(current: number, state: WorkView = { search: '', offset: 
       const title = action(work.metadata.novel.name, () => openChapters(work), 'work-title');
       const controls = el('div', 'actions', action('Chapters', () => openChapters(work), 'small'), action('Metadata', () => inspectWork(work), 'small'));
       const info = el('div', 'work-info', el('h3', '', title), el('p', 'hint work-author', work.metadata.novel.author || 'Unknown author'),
-        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${work.downloadedChapters.toLocaleString()} chapters available`), controls);
+        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${(work.downloadedChapters ?? 0).toLocaleString()} chapters available`), controls);
       works.append(el('article', 'work', cover, info));
       if (work.hasCover) covers.push({ work, node: cover });
     }
@@ -339,7 +373,7 @@ async function content(current: number, state: WorkView = { search: '', offset: 
     try {
       const next = await api<{ items: Work[]; total: number }>(`/admin/works?search=${encodeURIComponent(query)}&offset=${offset}&limit=50`);
       if (current !== generation || request !== requestId) return;
-      state.search = query; state.offset = offset; data = next; render();
+      state.search = query; state.offset = offset; updateQuery({ search: query, offset }); data = next; render();
     } catch (error) {
       if (current !== generation || request !== requestId) return;
       clearCovers(); data = undefined;
@@ -350,22 +384,26 @@ async function content(current: number, state: WorkView = { search: '', offset: 
   results.append(el('div', 'loading', 'Loading works…')); section.body.append(form, errors, results);
   if (current !== generation) return; page.replaceChildren(section.node); await load(state.offset);
 }
-async function chapters(current: number, work?: Work, back: () => Promise<void> = () => content(++generation)) {
+async function chapters(current: number, work: Work | undefined, back: () => Promise<void>) {
   clearCovers();
   const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'Downloaded chapter packages and stored revisions for this work.' : 'All chapter packages associated with registered work metadata.'); section.body.className = '';
-  const search = input('search', 'search', '', false); search.className = 'search-input'; search.placeholder = 'Search novel or chapter'; search.setAttribute('aria-label', 'Search content');
+  const query = new URLSearchParams(location.search);
+  const search = input('search', 'search', query.get('chapterSearch') ?? '', false); search.className = 'search-input'; search.placeholder = 'Search novel or chapter'; search.setAttribute('aria-label', 'Search content');
   const deleted = select('deleted', ['Active content', 'Trash']); deleted.setAttribute('aria-label', 'Content state'); deleted.className = 'button';
+  if (query.get('deleted') === 'true') deleted.value = 'Trash';
   const results = el('div'); let requestId = 0;
   const load = async (offset = 0) => {
     const request = ++requestId; errors.replaceChildren(); results.setAttribute('aria-busy', 'true');
     try {
       const data = await api<{ items: Entry[]; total: number }>(`/admin/chapters?search=${encodeURIComponent(search.value.trim())}&deleted=${deleted.value === 'Trash'}&offset=${offset}&limit=50${work ? `&workId=${encodeURIComponent(work.id)}` : ''}`);
       if (current !== generation || request !== requestId) return;
+      updateQuery({ chapterSearch: search.value.trim(), chapterOffset: offset, deleted: deleted.value === 'Trash' ? 'true' : null });
+      if (work && deleted.value !== 'Trash') work.downloadedChapters = data.total;
       results.replaceChildren(table(['Chapter', 'Source', 'Package', 'Actions'], data.items.map(entry => [
         el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
         el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.zipBytes), el('div', 'hint mono', entry.revision.slice(0, 12))),
         action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'),
-      ]), deleted.value === 'Trash' ? 'Trash is empty.' : 'No matching chapters. Scan a connected folder to add content.'), pagination(data.total, offset, 50, load));
+      ]), deleted.value === 'Trash' ? 'Trash is empty.' : 'No matching chapters. Scan the content directory to add content.'), pagination(data.total, offset, 50, load));
     } catch (error) {
       if (current !== generation || request !== requestId) return;
       showError(errors, error); results.replaceChildren(el('div', 'empty', action('Try again', () => load(offset))));
@@ -375,7 +413,7 @@ async function chapters(current: number, work?: Work, back: () => Promise<void> 
   form.append(submit(form, 'Search', () => load(), errors)); deleted.addEventListener('change', () => { void load().catch(error => showError(errors, error)); });
   results.append(el('div', 'loading', 'Loading chapters…'));
   section.body.append(form, errors, results); if (current !== generation) return;
-  page.replaceChildren(el('div', 'actions', action('Back to works', back), work ? action('Metadata', () => inspectWork(work)) : null), section.node); await load();
+  page.replaceChildren(el('div', 'actions', action('Back to works', back), work ? action('Metadata', () => inspectWork(work)) : null), section.node); await load(queryOffset('chapterOffset'));
 }
 async function inspectEntry(id: string, changed: () => Promise<void>) {
   const modal = dialog('Chapter details'); modal.body.append(el('div', 'loading', 'Loading chapter…'));
@@ -403,7 +441,7 @@ async function jobs(current: number) {
   const list = panel('Scan history', 'Refreshes every 2 seconds while this view is open.'); list.body.className = '';
   const detail = panel('Scan results', 'Select a job to inspect file outcomes and skip reasons.');
   const detailMeta = el('div', 'job-meta'); const detailResults = el('div'); const errors = el('div');
-  detail.body.append(detailMeta, detailResults); let selected: string | undefined; let offset = 0; let listFingerprint = ''; let resultFingerprint = ''; let pollBusy = false; let resultRequest = 0;
+  detail.body.append(detailMeta, detailResults); let selected = new URLSearchParams(location.search).get('job') ?? undefined; let offset = queryOffset(); let listFingerprint = ''; let resultFingerprint = ''; let pollBusy = false; let resultRequest = 0;
   async function results() {
     if (!selected) return; const id = selected; const position = offset; const request = ++resultRequest;
     const data = await api<{ job: Job; items: JobItem[]; total: number }>(`/admin/jobs/${encodeURIComponent(id)}?offset=${position}&limit=100`);
@@ -416,7 +454,7 @@ async function jobs(current: number) {
       data.job.error ? el('div', 'notice error', data.job.error) : '');
     detailResults.replaceChildren(table(['File', 'Outcome', 'Reason / identity'], data.items.map(item => [el('div', 'mono result-path', item.path), badge(item.status),
       el('div', '', item.reason || '—', item.sourceId ? el('div', 'hint mono', `Source: ${item.sourceId}`) : null, item.workId ? el('div', 'hint mono', `Work: ${item.workId}`) : null, item.chapterId ? el('div', 'hint mono', `Chapter: ${item.chapterId}`) : null, item.revision ? el('div', 'hint mono', `Revision: ${item.revision}`) : null)]), 'No file results recorded yet.'),
-      pagination(data.total, position, 100, async next => { offset = next; resultFingerprint = ''; await results(); }));
+      pagination(data.total, position, 100, async next => { offset = next; updateQuery({ offset }); resultFingerprint = ''; await results(); }));
   }
   async function refresh() {
     const data = await api<{ items: Job[] }>('/admin/jobs'); if (current !== generation) return;
@@ -424,9 +462,9 @@ async function jobs(current: number) {
       listFingerprint = fingerprint;
       list.body.replaceChildren(table(['Folder', 'Status', 'Started', 'Results', 'Actions'], data.items.map(job => [el('div', 'cell-title', job.rootName), badge(job.status), date(job.startedAt),
         job.summary ? `${job.summary.registered} registered / ${job.summary.unchanged} unchanged / ${job.summary.skipped} skipped / ${job.summary.failed} failed` : 'In progress',
-        el('div', 'actions', action('Inspect', async () => { selected = job.id; offset = 0; resultFingerprint = ''; await results(); }, 'small'),
+        el('div', 'actions', action('Inspect', async () => { selected = job.id; offset = 0; updateQuery({ job: selected, offset }, true); resultFingerprint = ''; await results(); }, 'small'),
           job.status === 'running' ? action('Cancel', async () => { if (!confirm(`Cancel the scan for “${job.rootName}”? Content already registered will remain.`)) return; await api(`/admin/jobs/${encodeURIComponent(job.id)}/cancel`, 'POST'); await refresh(); }, 'small danger') : null),
-      ]), 'No scans yet. Start a scan from Folders.'));
+      ]), 'No scans yet. Start a scan from Storage.'));
     }
     await results();
   }
@@ -474,4 +512,5 @@ async function settings(current: number) {
   page.replaceChildren(access.node, config.node);
 }
 
-login();
+window.addEventListener('popstate', () => { if (token) void navigate(routeView(), false); });
+if (token) { shell(); void navigate(routeView(), false); } else login();
