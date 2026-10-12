@@ -101,7 +101,9 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - Registered devices and console administrators use `DELETE /api/v1/chapters/:id`
   and `POST /api/v1/chapters/:id/restore` to manage shared availability.
   Only console administrators use `POST /api/v1/chapters/:id/revision` to set defaults.
-  A newer upload does not automatically replace the first default revision.
+  A newer app upload does not automatically replace the first default revision.
+  A changed source file found by a storage scan becomes the served default;
+  previous immutable revisions remain available.
 - `POST /api/v1/chapters/:id/purge` permanently removes a deleted chapter's ZIPs.
   Tombstones survive purge and restart. Restoration after purge permits a fresh
   upload but keeps the catalog entry deleted until a complete package is published.
@@ -168,8 +170,10 @@ shutdown/disconnect cleanup, and a disconnected HTTP upload.
 
 Run `pnpm build` after installation, then open `http://127.0.0.1:8787/admin/`
 (or the configured port). Sign in with the value from `admin-password.hash`.
-The console has Overview, Plugins, Folders, Content, Jobs, Devices,
-and Settings views. Sessions stay in tab memory; a reload requires sign-in.
+The console has Overview, Plugins, Storage, Content, Jobs, Devices,
+and Settings views. The session token stays in tab session storage across reloads
+until expiry or logout. Each view has its own `/admin/<view>` route; reloading
+restores that view, and browser Back/Forward follows navigation history.
 
 Register multiple current Norea `apiVersion: "0.2"` repository JSON indexes in
 Plugins. Both HTTP(S) URLs and absolute server-local JSON paths are supported.
@@ -183,8 +187,11 @@ The server sends embedded credentials as HTTP Basic authentication when fetching
 the index. Repository and plugin URLs are stored as entered, including credentials,
 and are visible in the authenticated management console.
 
-Connect a Norea root containing `contents/` under Folders. Scans traverse source
-directories regardless of plugin registration, installation, or enabled status.
+The server scans only `<NOREA_DATA_DIR>/contents/`. Configure `NOREA_DATA_DIR`
+at startup; the console cannot add, select, or detach roots. Storage displays
+this path and controls its scan schedule. Legacy connected-root records are no
+longer used. Scans traverse source directories regardless of plugin registration,
+installation, or enabled status.
 They never check the original site or whether it still publishes the work.
 Each work folder must contain valid `novel.json` with its original plugin ID,
 base-URL-relative work path, title, and metadata. Missing or invalid metadata
@@ -195,7 +202,7 @@ name, `cover.json`, an old app database, or source-site requests. Synthetic
 `novel.json` contains only `schemaVersion`, `identity`, `novel`, and `cover`.
 It has no chapter list or update timestamp. Work metadata includes the original
 status text and a nullable rating from 0 to 5. Cover files named by its descriptor
-are copied separately. Metadata-only works can be registered without chapters.
+are indexed separately. Metadata-only works can be registered without chapters.
 See [Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1).
 
 Chapter folders follow `<number>-<title>`. Additional hyphens belong to the title.
@@ -210,31 +217,43 @@ describes media assets and contains no source identities. Remote assets remain
 incomplete even when the manifest says `complete`; all referenced media must be
 stored locally. Work covers and `.nomedia` markers are not chapter candidates.
 
-The source folder is read-only. Source files are snapshotted into server staging,
-verified, and published as immutable packages. A file changed during its first
-copy is retried once. Cloud providers may hydrate files during reads; the server
-never writes to originals. Source and server storage must not overlap. Abandoned
-import snapshots are removed from server staging at startup.
+The scanner reads existing work metadata, covers, and chapter files in place.
+It snapshots new or changed chapters into staging, verifies them, and publishes
+immutable packages under `<work>/.packages/<chapter>/<revision>.zip`. Originals
+are not rewritten. Server-created packages are excluded from source discovery
+and change notifications. Symbolic source and package paths are rejected.
+Abandoned importer snapshots are removed from staging at startup.
 
 SQLite indexes valid server-owned work files and available chapter packages.
 Startup excludes obsolete inferred work metadata and its chapter index entries,
 while retaining those files on disk. Metadata and cover changes use the work
 cursor independently of chapter packages. Unchanged metadata does not rewrite
-`novel.json`. Source disappearance does not delete a server copy; explicit server
+`novel.json`. Source chapter disappearance does not delete a generated package; explicit server
 deletions and tombstones remain authoritative.
 
 Choose Manual, Periodic, or Changes scanning. Changes uses filesystem events
-with a two-second debounce plus periodic reconciliation. Unlike app sync, these
-scans run while the server process is running, without an open console. Jobs are
-serialized, persist progress/results, can be cancelled, and are marked interrupted
-after an unclean restart. A rescan safely retries existing packages. Scans verify
-source bytes again; they are not a constant-time filesystem change feed and can
-be expensive for large libraries. Detaching a folder stops its scans and keeps
-both original files and already published server packages.
+with a two-second debounce plus periodic reconciliation. Automatic scanning runs
+while the server process is running, without an open console. Disabling the
+schedule still allows Scan now. Jobs are serialized, persist progress/results,
+can be cancelled, and are marked interrupted after an unclean restart.
+
+Successful work and chapter checkpoints persist in SQLite. Rescans enumerate
+folders and compare file identity, size, modification time, and change time.
+Unchanged chapter bodies and media are not read, hashed, or repacked. New and
+changed files are verified; failed or incomplete candidates retry on later scans.
+Work metadata and cover changes update the work index without rebuilding unchanged
+chapter packages. The scan still lists and stats the tree; it does not guarantee
+constant-time discovery or detect byte edits that preserve every recorded stat field.
+
+`GET /api/v1/admin/storage` returns the fixed path and current scan settings.
+`PATCH /api/v1/admin/storage` accepts only `mode`, `intervalMinutes`, and `enabled`.
+`POST /api/v1/admin/storage/scan` starts a manual scan. Folder-root CRUD routes
+have been removed.
 
 In Content, inspect revisions, select the default, move server chapters to trash,
 restore them, or permanently purge their server packages. These actions never
-modify connected source files. Rescanning does not resurrect server tombstones.
+modify original loose chapters or imported archives. Deletion moves only indexed
+server revision ZIPs to trash. Rescanning does not resurrect server tombstones.
 Devices can be blocked or unblocked independently. Personal reading records stay
 on each app and are never synchronized to the server.
 
@@ -246,4 +265,5 @@ procedure still applies; the console does not provide live backup.
 Administration REST routes are under `/api/v1/admin/` and require an administrator
 bearer token, including filesystem paths and scan results. OpenAPI includes the
 management routes. The Docker image builds and serves the same console assets.
-Mount source content and metadata read-only when deploying with containers.
+Mount the single data directory writable: SQLite, staging, trash, and generated
+packages share that directory. Existing source files remain unchanged by scans.

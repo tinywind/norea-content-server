@@ -471,9 +471,11 @@ Technical references:
 ## Administration console and existing-folder ingestion
 
 The server serves an administrator-only operational console at `/admin/`.
-The console uses the existing REST API, in-memory bearer sessions, and locally
+The console uses the existing REST API, tab session-storage bearer sessions, and locally
 built TypeScript/CSS assets. It has no separate frontend service or runtime.
-Its primary workflows are plugin repositories, connected folders, content and
+Reloads retain the session until expiry or logout and restore the current
+`/admin/<view>` route. Browser Back/Forward follows view navigation.
+Its primary workflows are plugin repositories, storage scanning, content and
 revision management, scan results, registered devices, and access policy.
 
 Multiple plugin repositories can be registered using a repository JSON URL or
@@ -489,11 +491,13 @@ Repository inventory is independent of folder scanning. Existing source IDs,
 including multi-source instances, come from local content metadata or package
 manifests. IDs and readable folder rules stay unchanged.
 
-A connected folder points to an existing Norea root containing `contents/`.
+The sole content root is `<NOREA_DATA_DIR>/contents`, selected at server startup.
+The console displays it but cannot add, select, edit, or detach content roots.
+Legacy connected-root records are ignored.
 Every source directory is eligible regardless of plugin registration, installation,
 or enabled status. The scan never queries plugin code, a repository, or an original
 site to verify a work's existence. Local imports follow the same completeness and
-identity rules. Each connection has manual, periodic, or change-driven scanning;
+identity rules. Storage has manual, periodic, or change-driven scanning;
 periodic reconciliation also covers missed filesystem events. A scan reports each registered, unchanged,
 skipped, or failed candidate. Unsupported old formats and incomplete assets are
 skipped without conversion or repair. Every work requires valid original identity
@@ -524,16 +528,24 @@ removed when the job ends. A chapter file that changes during its first copy is
 retried once; continued changes are skipped. Media manifests use stable key
 ordering compatible with app package exports.
 
-The original Norea folder and metadata files are read-only inputs: no manifests,
-locks, repairs, renames, deletions, or database side effects are written there.
-Symlink escapes and overlapping source/server storage are rejected. Complete
-chapter snapshots become portable ZIPs under server-owned storage and pass the
-same validation/publication path as app uploads. This uses additional disk space
-but preserves an immutable server copy independently of the source folder.
-Server deletions are not reversed by rescanning; loss of an original does not
-remove an already published package. Detaching a folder only stops scanning.
+The scanner indexes work metadata and covers in place and leaves their original
+files unchanged. Chapter snapshots become portable ZIPs under the work's hidden
+`.packages/<chapter>/` directory and use the same validation/publication path as
+app uploads. Symbolic paths are rejected. Generated packages do not become scan
+inputs or trigger further scans. Server deletion moves only indexed revision ZIPs
+to trash, preserving any original files in the same chapter folder.
 
-Console data includes per-source metadata/version, folder scan configuration,
+SQLite checkpoints record each successful source's stat inventory. Later scans
+still enumerate directories and stat files, but unchanged chapter payloads are
+not read, hashed, or repacked, including after a restart. Failed candidates have
+no success checkpoint and retry on subsequent scans. Metadata-only work changes
+do not rebuild unchanged chapters. New and changed candidates use full snapshot
+verification. Stat checks cannot detect edits that preserve every recorded field.
+A changed source chapter becomes the served default revision while retaining
+previous immutable revisions. App uploads keep their existing default-selection
+policy. Explicit deletion tombstones remain authoritative during rescans.
+
+Console data includes per-source metadata/version, the single storage scan configuration,
 content identities and revisions, package sizes, persistent job status and
 per-candidate reasons. Device administration shows registration and access metadata;
 personal reading history remains local. Server deletion, restoration, default
@@ -582,7 +594,7 @@ lookup is limited to a unique chapter in the exact canonical work.
 Files are authoritative. The server indexes valid owned work files at startup
 and removes obsolete inferred entries from its metadata and chapter indexes.
 Their files remain on disk. Source imports require valid `novel.json` and never
-write to the connected root. Cover descriptors select local image files.
+rewrite original content files. Cover descriptors select local image files.
 Identical metadata preserves the file timestamp; sync sequence numbers stay in
 the server database. Upload clients register work metadata before chapter packages.
 
