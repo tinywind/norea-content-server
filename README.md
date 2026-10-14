@@ -305,22 +305,36 @@ while the server process is running, without an open console. Disabling the
 schedule still allows Scan now. Jobs are serialized, persist progress/results,
 can be cancelled, and are marked interrupted after an unclean restart.
 
-Successful work and chapter checkpoints persist in SQLite. Rescans enumerate
-folders and compare file identity, size, modification time, and change time.
-Unchanged chapter bodies and media are not read, hashed, or repacked. New and
-changed files are verified; failed or incomplete candidates retry on later scans.
-Work metadata and cover changes update the work index without rebuilding unchanged
-chapter packages. The scan still lists and stats the tree; it does not guarantee
-constant-time discovery or detect byte edits that preserve every recorded stat field.
+**Scan now** and periodic scans list source and work directories to discover
+added or removed chapter folders. Known complete chapters reuse the database
+index without opening or statting their contents, including chapters uploaded by
+the app. Work metadata and covers are checked separately on every scan.
+SQLite also remembers unsupported chapter layouts, so they are not inspected
+again on every pass. Incomplete copies and transient failures are retried.
+The first pass still inspects every previously unclassified chapter folder.
+
+Changes mode retains the affected paths and inspects those chapters or works.
+Filesystem events can be missed, particularly on Docker host mounts. Periodic
+scans still discover additions and removals; use **Full inspection** after editing
+existing chapter files or repairing unsupported folders when no event was
+received. Full inspection compares file identity, size, modification time, and
+change time before revalidating changed payloads. No scan hashes or repacks
+payloads. Stat checks cannot detect edits that preserve every recorded field.
+Directory listings still scale with the number of folders; discovery is not
+constant-time. Jobs aggregate unchanged and cached skipped counts rather than
+persisting a detail row for each reused result.
 
 Uploaded and scanned chapters share the same directory layout and validation.
 Scans refresh changed file inventories and keep original chapter identities for
-known directories. Validation failures do not create deletion tombstones.
+known directories when inspected. Missing folders become unavailable in the
+index after successful enumeration. Neither missing folders nor validation
+failures create explicit deletion tombstones, so restoring valid files permits
+rediscovery. Failed directory enumeration does not remove cached availability.
 
 `GET /api/v1/admin/storage` returns the fixed path and current scan settings.
 `PATCH /api/v1/admin/storage` accepts only `mode`, `intervalMinutes`, and `enabled`.
-`POST /api/v1/admin/storage/scan` starts a manual scan. Folder-root CRUD routes
-have been removed.
+`POST /api/v1/admin/storage/scan` starts incremental discovery. Send
+`{"full":true}` for a full inspection. Folder-root CRUD routes have been removed.
 
 The server keeps one complete copy per chapter. An upload for a chapter that is
 already complete returns the existing entry without storing another version.

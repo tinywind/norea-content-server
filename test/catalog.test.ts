@@ -144,7 +144,7 @@ test('invalid scanned chapters leave available pages and return after repair wit
     try {
       const row = db.prepare('SELECT directory FROM chapters WHERE id=?').get(chapter.id) as { directory: string };
       const temporary = join(f.dataDir, row.directory, 'content.html.part'); await writeFile(temporary, 'partial');
-      const invalid = await scanFolder({ db, dataDir: f.dataDir, limits: defaultLimits });
+      const invalid = await scanFolder({ db, dataDir: f.dataDir, limits: defaultLimits, full: true });
       assert.equal(invalid.skipped, 1);
       assert.equal((await f.app.inject('/api/v1/catalog/works')).json().items[0].chapterCount, 0);
       assert.deepEqual((await f.app.inject(`/api/v1/catalog/works/${savedWork.id}/chapters`)).json(), { items: [], total: 0, hasMore: false });

@@ -1,30 +1,36 @@
 import { lstat, mkdir, readdir } from 'node:fs/promises';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { validateFiles, validateMedia } from './chapter-files.ts';
-import { chapterFileNames, completeChapter, digest, isUnfinishedContentName as unfinished, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { chapterFileNames, digest, isUnfinishedContentName as unfinished, publishChapter, recordEntry, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 import { isCoverFile, cacheWork, metadataWorkId, readNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { transaction } from './db.ts';
 
 export interface FolderIndexItem {
   path: string;
   sourceId?: string;
-  status: 'registered' | 'unchanged' | 'skipped' | 'failed';
+  status: 'registered' | 'unchanged' | 'skipped' | 'failed' | 'removed';
   reason?: string;
   chapterId?: string;
   workId?: string;
   revision?: string;
 }
-export interface FolderIndexSummary { scanned: number; registered: number; unchanged: number; skipped: number; failed: number; cancelled: boolean }
+export interface FolderIndexSummary { scanned: number; registered: number; unchanged: number; skipped: number; failed: number; removed: number; cancelled: boolean }
 export interface FolderIndexOptions {
   dataDir: string;
   db: DatabaseSync;
   limits: Limits;
   signal?: AbortSignal;
-  onItem?: (item: FolderIndexItem) => void | Promise<void>;
+  full?: boolean;
+  changedPaths?: readonly string[];
+  onItem?: (item: FolderIndexItem, reused?: boolean) => void | Promise<void>;
   onWorkChange?: () => void;
 }
 type ChapterMetadata = Pick<PackageManifest, 'identity' | 'novel' | 'chapter'>;
+interface IndexedChapter { id: string; work_id: string; directory: string; path: string | null; deleted_at: number | null; entry: string }
+interface IndexedWork { id: string; directory: string; entry: string }
+class UnsupportedChapterError extends Error {}
 const fail = (message: string): never => { throw new Error(message); };
 const segment = (value: string) => { const result = value.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96); return !result || result === '.' || result === '..' ? 'source' : result; };
 function aborted(signal?: AbortSignal): void { signal?.throwIfAborted(); }
@@ -37,7 +43,6 @@ async function noLinks(path: string): Promise<void> {
   }
 }
 async function signature(path: string): Promise<string> {
-  await noLinks(path);
   const value = await lstat(path, { bigint: true });
   if (!value.isFile()) fail('Expected a regular source file');
   return `${value.dev}:${value.ino}:${value.size}:${value.mtimeNs}:${value.ctimeNs}`;
@@ -47,8 +52,11 @@ async function inventorySignature(directory: string, signal?: AbortSignal): Prom
   const allEntries = await readdir(directory, { withFileTypes: true });
   const entries = allEntries.filter(entry => chapterFileNames.includes(entry.name)).sort((a, b) => a.name < b.name ? -1 : 1);
   if (allEntries.some(entry => unfinished(entry.name))) fail('Unfinished chapter files are present');
-  if (allEntries.some(entry => entry.isSymbolicLink())) fail('Symbolic chapter files are unsupported');
-  if (allEntries.some(entry => !entry.isFile())) fail('Unsupported chapter file; only current chapter files can be indexed');
+  if (allEntries.some(entry => entry.isSymbolicLink())) throw new UnsupportedChapterError('Symbolic chapter files are unsupported');
+  if (allEntries.some(entry => !entry.isFile())) throw new UnsupportedChapterError('Unsupported chapter file; only current chapter files can be indexed');
+  if (!entries.some(entry => ['content.html', 'content.pdf'].includes(entry.name)) && allEntries.some(entry => /\.zip$/i.test(entry.name) && entry.name !== 'media.zip')) {
+    throw new UnsupportedChapterError('Outer chapter ZIP files are unsupported; current chapter files are required');
+  }
   if (entries.filter(entry => ['content.html', 'content.pdf'].includes(entry.name)).length !== 1) fail('Chapter must contain exactly one supported body file');
   const parts: string[] = [];
   for (const entry of entries) { aborted(signal); parts.push(entry.name, await signature(join(directory, entry.name))); }
@@ -68,15 +76,34 @@ async function chapterManifest(directory: string, metadata: ChapterMetadata, opt
 }
 
 export async function scanFolder(options: FolderIndexOptions): Promise<FolderIndexSummary> {
-  const summary: FolderIndexSummary = { scanned: 0, registered: 0, unchanged: 0, skipped: 0, failed: 0, cancelled: false };
+  const summary: FolderIndexSummary = { scanned: 0, registered: 0, unchanged: 0, skipped: 0, failed: 0, removed: 0, cancelled: false };
   if (options.signal?.aborted) return { ...summary, cancelled: true };
   const dataDir = resolve(options.dataDir);
+  const contents = join(dataDir, 'contents');
+  const changes = options.changedPaths?.map(path => {
+    const target = resolve(contents, path);
+    if (target !== contents && !target.startsWith(contents + sep)) fail('Changed path is outside the content directory');
+    return target;
+  });
+  const related = (a: string, b: string) => a === b || a.startsWith(b + sep) || b.startsWith(a + sep);
+  const selected = (path: string) => !changes || changes.some(change => related(path, change));
+  const inspect = (path: string) => options.full || changes?.some(change => related(path, change));
   await noLinks(dataDir);
   if (!(await lstat(dataDir)).isDirectory()) fail('Server storage must be a directory');
-  const report = async (item: FolderIndexItem) => { summary.scanned++; summary[item.status]++; await options.onItem?.(item); };
-  const checkpoint = (path: string) => options.db.prepare('SELECT signature,entry FROM scan_checkpoints WHERE path=?').get(path) as { signature: string; entry: string } | undefined;
+  const report = async (item: FolderIndexItem, reused = false) => { summary.scanned++; summary[item.status]++; await options.onItem?.(item, reused); };
+  const checkpoints = new Map((options.db.prepare('SELECT path,signature,entry FROM scan_checkpoints').all() as { path: string; signature: string; entry: string }[]).map(row => [row.path, row]));
+  const checkpoint = (path: string) => checkpoints.get(path);
+  const chapters = new Map((options.db.prepare('SELECT id,work_id,directory,path,deleted_at,entry FROM chapters').all() as unknown as IndexedChapter[]).map(row => [row.directory, row]));
+  const works = options.db.prepare('SELECT id,directory,entry FROM works').all() as unknown as IndexedWork[];
+  const seen = new Set<string>();
   const remember = (path: string, key: string, item: FolderIndexItem) => options.db.prepare('INSERT INTO scan_checkpoints(path,signature,entry) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,entry=excluded.entry').run(path, key, JSON.stringify(item));
-  const process = async (path: string, metadata: ChapterMetadata) => {
+  const unavailable = (row: IndexedChapter, removed = false) => transaction(options.db, () => {
+    const result = options.db.prepare('UPDATE chapters SET path=NULL WHERE id=? AND path=directory AND deleted_at IS NULL AND entry=?').run(row.id, row.entry);
+    if (!result.changes) return false;
+    if (removed) recordEntry(options.db, { ...JSON.parse(row.entry) as CatalogEntry, deleted: true });
+    options.onWorkChange?.(); return true;
+  });
+  const process = async (path: string, metadata: ChapterMetadata, rejectionKey: string) => {
     const sourceId = metadata.identity.pluginId;
     const startedAt = uploadCursor(options.db);
     try {
@@ -86,9 +113,9 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       const saved = checkpoint(path);
       if (saved?.signature === before) {
         const item = JSON.parse(saved.entry) as FolderIndexItem;
-        const current = completeChapter(options.db, dataDir, item.chapterId!);
-        if (current?.revision === item.revision) {
-          await report({ ...item, status: 'unchanged' }); return;
+        const current = chapters.get(relative(dataDir, path));
+        if (current?.path === current?.directory && current?.deleted_at === null && JSON.parse(current.entry).revision === item.revision) {
+          await report({ ...item, status: 'unchanged' }, true); return;
         }
       }
       let manifest: PackageManifest;
@@ -110,20 +137,25 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       await report(item);
     } catch (error) {
       aborted(options.signal);
-      options.db.prepare('UPDATE chapters SET path=NULL WHERE directory=? AND path=directory AND deleted_at IS NULL').run(relative(dataDir, path));
+      const row = chapters.get(relative(dataDir, path)); if (row) unavailable(row);
       const code = (error as NodeJS.ErrnoException).code;
-      await report({ path, sourceId, status: code && ['EACCES', 'EPERM', 'EIO', 'ENOSPC'].includes(code) ? 'failed' : 'skipped', reason: (error as Error).message });
+      const item: FolderIndexItem = { path, sourceId, status: code && ['EACCES', 'EPERM', 'EIO', 'ENOSPC'].includes(code) ? 'failed' : 'skipped', reason: (error as Error).message };
+      if (error instanceof UnsupportedChapterError) remember(path, rejectionKey, item);
+      else options.db.prepare('DELETE FROM scan_checkpoints WHERE path=?').run(path);
+      await report(item);
     }
   };
   const indexWork = async (directory: string, sourceId: string) => {
     aborted(options.signal); await noLinks(directory);
     const entries = await readdir(directory, { withFileTypes: true });
+    seen.add(directory);
+    for (const entry of entries) seen.add(join(directory, entry.name));
     const metadataPath = join(directory, 'novel.json');
     if (!entries.some(entry => entry.name === 'novel.json')) { await report({ path: directory, sourceId, status: 'skipped', reason: 'Valid novel.json is required; work identity cannot be inferred' }); return; }
     let value: NovelMetadataV1;
     try {
       const workSignature = async () => {
-        const covers = (await readdir(directory)).filter(isCoverFile).sort();
+        const covers = entries.map(entry => entry.name).filter(isCoverFile).sort();
         return canonicalize([await signature(metadataPath), await Promise.all(covers.map(async name => [name, await signature(join(directory, name))]))]);
       };
       const saved = checkpoint(metadataPath);
@@ -132,7 +164,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       if (stored && options.db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(stored.id)) fail('Work was deleted from the server');
       if (saved && stored && saved.signature === await workSignature()) {
         value = stored.metadata;
-        await report({ ...JSON.parse(saved.entry) as FolderIndexItem, status: 'unchanged' });
+        await report({ ...JSON.parse(saved.entry) as FolderIndexItem, status: 'unchanged' }, true);
       } else {
         let before: string;
         for (let attempt = 0; ; attempt++) {
@@ -175,34 +207,71 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     for (const folder of folders) {
       aborted(options.signal);
       const path = join(directory, folder.name);
-      const published = options.db.prepare('SELECT entry FROM chapters WHERE directory=?').get(relative(dataDir, path)) as { entry: string } | undefined;
+      const key = canonicalize([value.identity, folder.name, isLocal ? null : numbers.get(folder.name.match(/^(\d+(?:\.\d+)?)-/)?.[1] ?? '') ?? null]);
+      const saved = checkpoint(path);
+      const published = chapters.get(relative(dataDir, path));
+      if (!published?.path && !inspect(path) && saved?.signature === key) { await report(JSON.parse(saved.entry) as FolderIndexItem, true); continue; }
       const entry = published ? JSON.parse(published.entry) as CatalogEntry : undefined;
-      if (entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'))) { await process(path, entry.manifest); continue; }
       const parts = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/);
-      if (!parts || (!isLocal && numbers.get(parts[1]) !== 1)) {
-        options.db.prepare('UPDATE chapters SET path=NULL WHERE directory=? AND path=directory AND deleted_at IS NULL').run(relative(dataDir, path));
+      const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
+      if (!exactIdentity && (!parts || (!isLocal && numbers.get(parts[1]) !== 1))) {
+        if (published) unavailable(published);
         await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must have a unique number followed by a hyphen and title' }); continue;
       }
+      if (entry && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
+        await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); continue;
+      }
+      if (exactIdentity) { await process(path, entry!.manifest, key); continue; }
       const files = await readdir(path);
       await process(path, {
-        identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${folder.name}` : `norea-folder:${parts[1]}` },
+        identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${folder.name}` : `norea-folder:${parts![1]}` },
         novel: { name: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal },
-        chapter: { name: parts[2], chapterNumber: parts[1], position: Number(parts[1]), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
-      });
+        chapter: { name: parts![2], chapterNumber: parts![1], position: Number(parts![1]), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
+      }, key);
     }
   };
   try {
-    const contents = join(dataDir, 'contents'); await noLinks(contents); await mkdir(contents, { recursive: true });
+    await noLinks(contents); await mkdir(contents, { recursive: true });
     for (const source of await readdir(contents, { withFileTypes: true })) {
       aborted(options.signal); const path = join(contents, source.name);
+      if (!selected(path)) continue;
       if (source.isFile() && source.name === '.nomedia') continue;
       if (!source.isDirectory() || source.isSymbolicLink() || unfinished(source.name)) { await report({ path, status: 'skipped', reason: 'Source entry is not a directory, is symbolic, or is unfinished' }); continue; }
       for (const work of await readdir(path, { withFileTypes: true })) {
         aborted(options.signal); const directory = join(path, work.name);
+        if (!selected(directory)) continue;
         if (work.isFile() && work.name === '.nomedia') continue;
         if (!work.isDirectory() || work.isSymbolicLink() || unfinished(work.name)) await report({ path: directory, sourceId: source.name, status: 'skipped', reason: 'Work entry is not a directory, is symbolic, or is unfinished' });
         else await indexWork(directory, source.name);
       }
+    }
+    const missing = async (path: string) => {
+      if (seen.has(path)) return false;
+      try { await lstat(path); return false; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true; throw error; }
+    };
+    for (const row of chapters.values()) {
+      aborted(options.signal);
+      if (row.path !== row.directory || row.deleted_at !== null || !selected(join(dataDir, row.directory)) || !await missing(join(dataDir, row.directory))) continue;
+      if (unavailable(row, true)) await report({ path: join(dataDir, row.directory), chapterId: row.id, status: 'removed', reason: 'Chapter folder no longer exists' });
+    }
+    for (const row of works) {
+      aborted(options.signal);
+      const path = join(dataDir, row.directory);
+      if (!selected(path) || !await missing(path)) continue;
+      const removed = transaction(options.db, () => {
+        if (!options.db.prepare('DELETE FROM works WHERE id=? AND entry=?').run(row.id, row.entry).changes) return false;
+        options.db.prepare('DELETE FROM chapters WHERE work_id=?').run(row.id);
+        const sequence = Number(options.db.prepare('INSERT INTO work_changes(work_id,entry) VALUES(?,?)').run(row.id, '{}').lastInsertRowid);
+        options.db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(JSON.stringify({ ...JSON.parse(row.entry), deleted: true, hasCover: false, sequence }), sequence);
+        return true;
+      });
+      if (removed) { options.onWorkChange?.(); await report({ path, workId: row.id, status: 'removed', reason: 'Work folder no longer exists' }); }
+    }
+    for (const path of checkpoints.keys()) {
+      aborted(options.signal);
+      if (!selected(path) || seen.has(path)) continue;
+      if (await missing(path)) options.db.prepare('DELETE FROM scan_checkpoints WHERE path=?').run(path);
     }
   } catch (error) { if (options.signal?.aborted) summary.cancelled = true; else throw error; }
   return summary;

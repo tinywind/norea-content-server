@@ -273,10 +273,10 @@ test('storage scans recognize current uploaded chapter directories without rewri
     assert.equal(result.skipped, 0, JSON.stringify(items));
     assert.equal(result.failed, 0, JSON.stringify(items));
     const indexed = items.find(item => item.chapterId === entry.id)!;
-    assert.equal(indexed.status, 'registered');
-    assert.notEqual(indexed.revision, entry.revision);
+    assert.equal(indexed.status, 'unchanged');
+    assert.equal(indexed.revision, entry.revision);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM catalog_changes').get() as { n: number }).n, 2);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM catalog_changes').get() as { n: number }).n, 1);
     assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${indexed.revision}&path=content.html`)).rawPayload, files['content.html']);
     assert.equal((await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits })).registered, 0);
   } finally { await s.close(); }
@@ -301,12 +301,12 @@ test('an unavailable indexed directory can be repaired by upload and removed by 
     const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
     const directory = join(s.dataDir, row.directory);
     await writeFile(join(directory, 'content.html.part'), 'unfinished');
-    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, full: true });
     assert.equal((s.db.prepare('SELECT path FROM chapters WHERE id=?').get(entry.id) as { path: string | null }).path, null);
     assert.equal((await upload(s, files)).statusCode, 200);
     assert.deepEqual(await readdir(directory), ['content.html']);
     await writeFile(join(directory, 'content.html.part'), 'unfinished');
-    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, full: true });
     assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers })).statusCode, 200);
     await assert.rejects(readdir(directory), { code: 'ENOENT' });
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).statusCode, 410);
@@ -328,27 +328,41 @@ test('restoring deleted files validates media again', async () => {
   } finally { await s.close(); }
 });
 
-test('the first scan assigns a new token to a changed same-size uploaded body', async () => {
+test('a completed upload supersedes a cached unsupported-layout scan result', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('complete body') };
+    const entry = (await upload(s, files)).json();
+    const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
+    await mkdir(join(s.dataDir, row.directory, 'loose-media'));
+    assert.equal((await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, full: true })).skipped, 1);
+    assert.equal((await upload(s, files)).statusCode, 200);
+    const result = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    assert.equal(result.skipped, 0); assert.equal(result.unchanged, 2);
+  } finally { await s.close(); }
+});
+
+test('full inspection assigns a new token to a changed same-size uploaded body', async () => {
   const s = await setup();
   try {
     const entry = (await upload(s, { 'content.html': Buffer.from('first') })).json();
     const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
     await writeFile(join(s.dataDir, row.directory, 'content.html'), 'other');
-    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, full: true });
     const current = JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry);
     assert.notEqual(current.revision, entry.revision);
     assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${current.revision}&path=content.html`)).body, 'other');
   } finally { await s.close(); }
 });
 
-test('the first storage scan validates uploaded files and preserves their identity after repair', async () => {
+test('full inspection validates uploaded files and preserves their identity after repair', async () => {
   const s = await setup();
   try {
     const files = { 'content.html': Buffer.from('original body'), 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[]}}') };
     const entry = (await upload(s, files)).json();
     const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
     const manifestPath = join(s.dataDir, row.directory, 'manifest.json'); await writeFile(manifestPath, Buffer.alloc(files['manifest.json'].length, 33));
-    const invalid = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    const invalid = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, full: true });
     assert.equal(invalid.skipped, 1);
     assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).statusCode, 410);
     await writeFile(manifestPath, files['manifest.json']);

@@ -553,15 +553,30 @@ current-file validation used for uploads. There are no snapshots or generated
 packages. Symbolic paths are rejected. Explicit server deletion moves the indexed
 chapter directory to trash, while whole-work deletion removes the work directory.
 
-SQLite checkpoints record each successful source's stat inventory. Later scans
-still enumerate directories and stat files, but unchanged chapter payloads are
-not read, hashed, or repacked, including after a restart. Failed candidates have
-no success checkpoint and retry on subsequent scans. Metadata-only work changes
-do not rebuild unchanged chapters. New and changed candidates are validated in
-place. Stat checks cannot detect edits that preserve every recorded field.
-Changed current files refresh the stored inventory. Validation failures make a
-chapter unavailable without creating a deletion tombstone; a later successful
-scan or upload can restore availability.
+Normal and periodic scans enumerate source and work directories, reuse known
+complete chapter rows without visiting those chapter directories, and validate
+new folders. This also reuses chapters validated during uploads before any scan.
+SQLite checkpoints retain successful stat inventories and stable unsupported
+layout results across restarts. Incomplete copies and transient failures retry;
+cached unsupported layouts wait for a change event or full inspection. Work
+metadata and cover stats are checked independently on each selected work.
+
+Changes mode debounces affected paths and inspects only related chapters or
+works. Events arriving during a scan remain pending. Periodic discovery finds
+added or removed folders even when a filesystem event is lost. Docker host
+mounts may not deliver all events, so the console also exposes Full inspection
+(`POST /api/v1/admin/storage/scan` with `{"full":true}`) for in-place edits and
+repaired unsupported folders. It checks stat inventories before validating
+changed payloads. No scanning mode hashes or repacks payloads. Directory
+enumeration still scales with folder count, and stat checks cannot detect edits
+that preserve every recorded field.
+
+Missing chapter or work folders update the index after successful enumeration;
+enumeration errors do not remove cached availability. Missing folders and
+validation failures do not create explicit deletion tombstones, allowing a
+later successful scan or upload to restore availability. Reused results update
+job totals without adding individual result rows; new results and errors retain
+their paths and reasons.
 Explicit deletion tombstones remain authoritative during server folder scans.
 
 Console data includes per-source metadata/version, the single storage scan configuration,

@@ -8,7 +8,7 @@ import { authenticate } from './auth.ts';
 import { problem, transaction } from './db.ts';
 import { chapterRow, type CatalogEntry, type Limits } from './packages.ts';
 import { listPlugins, registerPlugin, removePlugin, setPluginEnabled } from './plugin-registry.ts';
-import { scanFolder, type FolderIndexItem, type FolderIndexSummary } from './folder-indexer.ts';
+import { scanFolder, type FolderIndexItem, type FolderIndexOptions, type FolderIndexSummary } from './folder-indexer.ts';
 
 interface ScanSettings {
   path: string;
@@ -51,6 +51,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
   let closing = false;
   const active = new Map<string, { rootId: string; controller: AbortController; promise: Promise<void> }>();
   let pendingScan = false;
+  const pendingPaths = new Set<string>();
   let schedule: { timer: ReturnType<typeof setInterval>; debounce?: ReturnType<typeof setTimeout>; watcher?: FSWatcher } | undefined;
   const storageSettings = (): ScanSettings => {
     const saved = db.prepare("SELECT value FROM admin_settings WHERE key='scan'").get() as { value: string } | undefined;
@@ -68,18 +69,17 @@ export async function registerAdministration(app: FastifyInstance, context: {
     if (job.status === 'running') saveJob({ ...job, status: 'interrupted', finishedAt: Date.now(), error: 'Server stopped before the scan completed. Run the folder scan again.' });
   }
 
-  function startScan(root: ScanSettings): ScanJob {
+  function startScan(root: ScanSettings, options: Pick<FolderIndexOptions, 'full' | 'changedPaths'> = {}): ScanJob {
     if (closing) throw problem(503, 'Server is stopping');
     if (active.size) throw problem(409, 'A folder scan is already running');
     const job: ScanJob = { id: randomUUID(), rootId: 'contents', rootName: 'Contents', status: 'running', startedAt: Date.now(),
-      summary: { registered: 0, unchanged: 0, skipped: 0, failed: 0, scanned: 0, cancelled: false } };
+      summary: { registered: 0, unchanged: 0, skipped: 0, failed: 0, removed: 0, scanned: 0, cancelled: false } };
     saveJob(job);
     const controller = new AbortController();
     const pendingItems: FolderIndexItem[] = [];
     let lastFlushAt = Date.now();
     const insertItem = db.prepare('INSERT INTO admin_job_items(job_id,entry) VALUES(?,?)');
     const flushItems = () => {
-      if (!pendingItems.length) return;
       transaction(db, () => {
         for (const item of pendingItems) insertItem.run(job.id, JSON.stringify(item));
         saveJob(job);
@@ -89,13 +89,13 @@ export async function registerAdministration(app: FastifyInstance, context: {
     };
     const promise = new Promise<void>(accept => setImmediate(accept)).then(async () => {
       try {
-        job.summary = await scanFolder({ dataDir, db, limits, signal: controller.signal, onWorkChange: context.notify,
-          onItem(item: FolderIndexItem) {
-            pendingItems.push(item);
+        job.summary = await scanFolder({ dataDir, db, limits, ...options, signal: controller.signal, onWorkChange: context.notify,
+          onItem(item: FolderIndexItem, reused) {
+            if (!reused && item.status !== 'unchanged') pendingItems.push(item);
             job.summary.scanned++;
             job.summary[item.status]++;
             if (pendingItems.length >= 100 || Date.now() - lastFlushAt >= 200) flushItems();
-            if (item.status === 'registered') context.notify();
+            if (item.status === 'registered' || item.status === 'removed') context.notify();
           },
         });
         job.status = job.summary.cancelled || controller.signal.aborted ? 'cancelled' : 'completed';
@@ -117,13 +117,20 @@ export async function registerAdministration(app: FastifyInstance, context: {
 
   function stopSchedule(): void {
     pendingScan = false;
+    pendingPaths.clear();
     if (schedule) { clearInterval(schedule.timer); clearTimeout(schedule.debounce); schedule.watcher?.close(); schedule = undefined; }
   }
   function drainScheduledScans(): void {
-    if (closing || active.size || !pendingScan) return;
-    pendingScan = false;
+    if (closing || active.size || (!pendingScan && !pendingPaths.size)) return;
     const root = storageSettings();
-    if (root.enabled && root.mode !== 'manual') startScan(root);
+    if (!root.enabled || root.mode === 'manual') return;
+    if (pendingPaths.size) {
+      const changedPaths = [...pendingPaths]; pendingPaths.clear();
+      startScan(root, { changedPaths });
+    } else {
+      pendingScan = false;
+      startScan(root);
+    }
   }
   function scheduleScan(): void {
     stopSchedule();
@@ -140,14 +147,14 @@ export async function registerAdministration(app: FastifyInstance, context: {
           if (filename) {
             const path = filename.toString();
             if (path.split(/[\\/]/).some(part => part.startsWith('.'))) return;
-            if (db.prepare('SELECT 1 FROM chapters WHERE path=?').get(join('contents', path))) return;
             if (_event === 'change') {
               try { if (lstatSync(join(root.path, path)).isDirectory()) return; }
               catch { /* Missing paths still schedule reconciliation. */ }
             }
-          }
+            pendingPaths.add(path);
+          } else pendingScan = true;
           clearTimeout(current.debounce);
-          current.debounce = setTimeout(attempt, 2000);
+          current.debounce = setTimeout(drainScheduledScans, 2000);
           current.debounce.unref();
         });
         current.watcher.on('error', () => { current.watcher?.close(); current.watcher = undefined; });
@@ -202,7 +209,10 @@ export async function registerAdministration(app: FastifyInstance, context: {
       const value = { ...storageSettings(), ...request.body };
       saveSettings(value); scheduleScan(); return value;
     });
-    api.post('/storage/scan', async (_request, reply) => reply.code(202).send(startScan(storageSettings())));
+    api.post<{ Body: { full?: boolean } }>('/storage/scan', {
+      preValidation: async request => { request.body ??= {}; },
+      schema: { body: { type: 'object', additionalProperties: false, properties: { full: { type: 'boolean' } } } },
+    }, async (request, reply) => reply.code(202).send(startScan(storageSettings(), { full: request.body.full })));
     api.get('/jobs', async () => ({ items: (db.prepare('SELECT entry FROM admin_jobs ORDER BY rowid DESC LIMIT 100').all() as { entry: string }[]).map(row => JSON.parse(row.entry)) }));
     api.get<{ Params: { id: string }; Querystring: { offset: number; limit: number } }>('/jobs/:id', { schema: { params: identifier, querystring: { type: 'object', properties: pagination } } }, async request => ({
       job: getJob(request.params.id),

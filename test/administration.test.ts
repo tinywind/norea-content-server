@@ -80,6 +80,36 @@ test('storage root is fixed at startup and scan mutation inputs are strict', asy
   } finally { await s.close(); }
 });
 
+test('manual scans aggregate reused results and full inspection refreshes edited files', async () => {
+  const s = await setup();
+  try {
+    const headers = await s.admin();
+    const work = join(s.dataDir, 'contents/example/Work'); const chapter = join(work, '1-First');
+    await mkdir(chapter, { recursive: true });
+    await writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelPath: '/work' }, novel: { name: 'Work' } }));
+    await writeFile(join(chapter, 'content.html'), '<p>Saved chapter</p>');
+    await mkdir(join(work, '2-Unsupported', 'loose-media'), { recursive: true });
+    const scan = async (full: boolean) => {
+      const started = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers, payload: { full } });
+      assert.equal(started.statusCode, 202, started.body);
+      for (let i = 0; i < 200; i++) {
+        const detail = (await s.app.inject({ url: `/api/v1/admin/jobs/${started.json().id}`, headers })).json();
+        if (detail.job.status !== 'running') { assert.equal(detail.job.status, 'completed'); return detail; }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      assert.fail('Scan did not finish');
+    };
+    assert.equal((await scan(false)).total, 3);
+    const cached = await scan(false);
+    assert.equal(cached.total, 0); assert.equal(cached.job.summary.scanned, 3);
+    assert.equal(cached.job.summary.unchanged, 2); assert.equal(cached.job.summary.skipped, 1);
+    await writeFile(join(chapter, 'content.html'), '<p>Changed chapter body</p>');
+    assert.equal((await scan(false)).job.summary.registered, 0);
+    const inspected = await scan(true);
+    assert.equal(inspected.job.summary.registered, 1); assert.equal(inspected.total, 2);
+  } finally { await s.close(); }
+});
+
 test('access policy survives restart and protects anonymous reads immediately', async () => {
   const s = await setup();
   try {
@@ -173,6 +203,36 @@ test('in-place indexing does not cause repeated change-driven scans', async () =
     assert.equal(jobs.length, 1); assert.equal(jobs[0].status, 'completed'); assert.equal(jobs[0].summary.registered, 2);
     await new Promise(resolve => setTimeout(resolve, 2300));
     assert.equal((await s.app.inject({ url: '/api/v1/admin/jobs', headers })).json().items.length, 1);
+  } finally { await s.close(); }
+});
+
+test('filesystem events inspect only the changed work and reconcile removed chapter folders', async () => {
+  const s = await setup();
+  try {
+    const headers = await s.admin();
+    for (const name of ['First', 'Other']) {
+      const work = join(s.dataDir, 'contents/example', name);
+      await mkdir(join(work, '1-One'), { recursive: true });
+      await writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelPath: '/' + name }, novel: { name } }));
+      await writeFile(join(work, '1-One/content.html'), '<p>Original chapter</p>');
+    }
+    const waitForJob = async (count: number) => {
+      for (let i = 0; i < 200; i++) {
+        const jobs = (await s.app.inject({ url: '/api/v1/admin/jobs', headers })).json().items;
+        if (jobs.length >= count && jobs.every((job: { status: string }) => job.status === 'completed')) return jobs[0];
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.fail('Filesystem scan did not finish');
+    };
+    await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload: { mode: 'changes', intervalMinutes: 15 } });
+    assert.equal((await waitForJob(1)).summary.registered, 4);
+    const chapter = join(s.dataDir, 'contents/example/First/1-One');
+    await writeFile(join(chapter, 'content.html'), '<p>Edited chapter body</p>');
+    const changed = await waitForJob(2);
+    assert.equal(changed.summary.scanned, 2); assert.equal(changed.summary.registered, 1);
+    await rm(chapter, { recursive: true });
+    const removed = await waitForJob(3);
+    assert.equal(removed.summary.removed, 1); assert.equal(removed.summary.scanned, 2);
   } finally { await s.close(); }
 });
 

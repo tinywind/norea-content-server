@@ -34,7 +34,7 @@ async function fixture() {
   await writeFile(join(directory, 'media.zip'), await zip({ 'a.png': 'image' }));
   const db = openDatabase(dataDir);
   const items: FolderIndexItem[] = [];
-  const run = (overrides = {}) => scanFolder({ dataDir, db, limits: defaultLimits, onItem: item => { items.push(item); }, ...overrides });
+  const run = (overrides = {}) => scanFolder({ dataDir, db, limits: defaultLimits, full: true, onItem: item => { items.push(item); }, ...overrides });
   const close = async () => { db.close(); await rm(temp, { recursive: true, force: true }); };
   return { temp, dataDir, directory, db, items, run, close };
 }
@@ -377,7 +377,7 @@ test('outer chapter ZIPs and extracted media directories are unsupported', async
       if (input === 'media-directory') { await rm(join(f.directory, 'media.zip')); await mkdir(join(f.directory, 'media')); await writeFile(join(f.directory, 'media', 'a.png'), 'image'); }
       else { await rm(f.directory, { recursive: true }); await mkdir(f.directory); await writeFile(join(f.directory, input), input.endsWith('.zip') ? await zip({ 'content.html': '<p>Archived</p>' }) : '<p>Old body</p>'); }
       const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.skipped, 1);
-      assert.match(f.items.at(-1)!.reason!, /Unsupported chapter file|exactly one supported body file/);
+      assert.match(f.items.at(-1)!.reason!, /Unsupported chapter file|Outer chapter ZIP files are unsupported|exactly one supported body file/);
       assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
     } finally { await f.close(); }
   }
