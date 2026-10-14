@@ -7,7 +7,7 @@ import type { FastifyInstance } from 'fastify';
 import { authenticate } from './auth.ts';
 import { problem, transaction } from './db.ts';
 import { chapterRow, type CatalogEntry, type Limits } from './packages.ts';
-import { initializePluginRegistry, listPlugins, registerPlugin, removePlugin, setPluginEnabled } from './plugin-registry.ts';
+import { listPlugins, registerPlugin, removePlugin, setPluginEnabled } from './plugin-registry.ts';
 import { scanFolder, type FolderIndexItem, type FolderIndexSummary } from './folder-indexer.ts';
 
 interface ScanSettings {
@@ -28,16 +28,6 @@ const scanProperties = {
   intervalMinutes: { type: 'integer', minimum: 1, maximum: 1440 }, enabled: { type: 'boolean' },
 };
 
-export function initializeAdministration(db: DatabaseSync): void {
-  initializePluginRegistry(db);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS admin_jobs (id TEXT PRIMARY KEY, entry TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS admin_job_items (sequence INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, entry TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS admin_job_items_job ON admin_job_items(job_id,sequence);
-    CREATE TABLE IF NOT EXISTS admin_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-  `);
-}
-
 export function savedAnonymousRead(db: DatabaseSync, fallback: boolean): boolean {
   const row = db.prepare("SELECT value FROM admin_settings WHERE key='anonymousRead'").get() as { value: string } | undefined;
   return row ? row.value === 'true' : fallback;
@@ -53,7 +43,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     if ((await lstat(staging)).isSymbolicLink()) throw problem(400, 'Server staging must not be a symbolic link');
     if (relative(await realpath(dataDir), await realpath(staging)) !== 'staging') throw problem(400, 'Server staging must remain inside server storage');
     for (const entry of await readdir(staging, { withFileTypes: true })) {
-      if (entry.isDirectory() && !entry.isSymbolicLink() && /^(?:folder-[A-Za-z0-9]{6}|files-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.test(entry.name)) {
+      if (entry.isDirectory() && !entry.isSymbolicLink() && /^files-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(entry.name)) {
         await rm(join(staging, entry.name), { recursive: true, force: true });
       }
     }
@@ -150,7 +140,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
           if (filename) {
             const path = filename.toString();
             if (path.split(/[\\/]/).some(part => part.startsWith('.'))) return;
-            if (db.prepare('SELECT 1 FROM revisions WHERE path=?').get(join('contents', path))) return;
+            if (db.prepare('SELECT 1 FROM chapters WHERE path=?').get(join('contents', path))) return;
             if (_event === 'change') {
               try { if (lstatSync(join(root.path, path)).isDirectory()) return; }
               catch { /* Missing paths still schedule reconciliation. */ }
@@ -198,7 +188,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     api.get('/overview', async () => {
       const counts = db.prepare(`SELECT COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END),0) AS chapters,COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN work_id END) AS works,COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END),0) AS deletedChapters FROM chapters`).get() as object;
       const works = (db.prepare('SELECT COUNT(*) AS n FROM (SELECT id FROM works UNION SELECT work_id FROM chapters WHERE deleted_at IS NULL)').get() as { n: number }).n;
-      const packages = db.prepare("SELECT COUNT(*) AS revisions,COALESCE(SUM(json_extract(entry,'$.zipBytes')),0) AS zipBytes,COALESCE(SUM(COALESCE(json_extract(entry,'$.zipBytes'),json_extract(entry,'$.fileBytes'))),0) AS storedBytes FROM revisions WHERE path IS NOT NULL").get() as object;
+      const packages = db.prepare("SELECT COUNT(*) AS storedChapters,COALESCE(SUM(json_extract(entry,'$.fileBytes')),0) AS storedBytes FROM chapters WHERE path IS NOT NULL").get() as object;
       return { ...counts, works, ...packages, plugins: listPlugins(db).length, contentsPath: storageSettings().path, runningJobs: active.size };
     });
     api.get('/plugins', async () => ({ items: listPlugins(db) }));

@@ -29,7 +29,7 @@ test('installation secret, console sessions and automatically admitted devices s
     const identity = registered.json();
     assert.deepEqual(Object.keys(identity).sort(), ['deviceName', 'id']);
     assert.deepEqual((await register()).json(), identity);
-    assert.equal((await app.inject({ url: '/api/v1/chapters', headers: device })).statusCode, 200);
+    assert.equal((await app.inject({ url: '/api/v1/catalog/changes', headers: device })).statusCode, 200);
     assert.equal((await app.inject({ url: '/api/v1/admin/settings', headers: device })).statusCode, 403);
     const listed = (await app.inject({ url: '/api/v1/admin/devices', headers: admin })).json().items;
     assert.equal(listed.length, 1);
@@ -48,7 +48,7 @@ test('installation secret, console sessions and automatically admitted devices s
     assert.equal((await app.inject({ url: '/api/v1/admin/devices', headers: admin })).statusCode, 200);
     assert.equal((await app.inject({ method: 'PATCH', url: `/api/v1/admin/devices/${identity.id}`, headers: admin, payload: { blocked: true } })).statusCode, 200);
     assert.equal((await register()).statusCode, 403);
-    assert.equal((await app.inject({ url: '/api/v1/chapters', headers: device })).statusCode, 403);
+    assert.equal((await app.inject({ url: '/api/v1/catalog/changes', headers: device })).statusCode, 403);
     await app.close();
     app = await buildApp({ dataDir, anonymousRead: false });
     assert.equal((await register()).statusCode, 403);
@@ -56,35 +56,21 @@ test('installation secret, console sessions and automatically admitted devices s
     assert.deepEqual((await register()).json(), identity);
     assert.equal((await app.inject({ method: 'DELETE', url: '/api/v1/console-sessions/current', headers: admin })).statusCode, 204);
     assert.equal((await app.inject({ url: '/api/v1/admin/devices', headers: admin })).statusCode, 401);
-    assert.equal((await app.inject({ url: '/api/v1/chapters', headers: device })).statusCode, 200);
+    assert.equal((await app.inject({ url: '/api/v1/catalog/changes', headers: device })).statusCode, 200);
   } finally { await app.close(); await rm(dataDir, { recursive: true }); }
 });
 
-test('legacy data is preserved inertly and old sessions and state routes are unavailable', async () => {
+test('account sessions and personal-state routes are unavailable', async () => {
   await mkdir('.tmp', { recursive: true });
-  const dataDir = await mkdtemp(join('.tmp', 'legacy-access-'));
-  const legacy = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
-  legacy.exec(`CREATE TABLE accounts (id TEXT PRIMARY KEY, username TEXT, password TEXT, role TEXT);
-    CREATE TABLE sessions (id TEXT PRIMARY KEY, account_id TEXT, token_hash TEXT, device_name TEXT, expires_at INTEGER);
-    CREATE TABLE state (account_id TEXT, key TEXT, entry TEXT, candidate TEXT);
-    CREATE TABLE state_changes (sequence INTEGER PRIMARY KEY, account_id TEXT, entry TEXT);
-    CREATE TABLE operations (account_id TEXT, operation_id TEXT, request TEXT, response TEXT, status INTEGER);
-    INSERT INTO accounts VALUES('legacy','legacy','unused','admin');
-    INSERT INTO state VALUES('legacy','position','original reading position','candidate');
-    INSERT INTO state_changes VALUES(1,'legacy','original event');
-    INSERT INTO operations VALUES('legacy','op','request','response',200);`);
-  const oldToken = randomBytes(32).toString('hex');
-  legacy.prepare('INSERT INTO sessions VALUES(?,?,?,?,?)').run('old', 'legacy', createHash('sha256').update(oldToken).digest('hex'), 'old', Date.now() + 100000);
-  const before = ['accounts', 'sessions', 'state', 'state_changes', 'operations'].map(table => legacy.prepare(`SELECT * FROM ${table}`).all());
-  legacy.close();
+  const dataDir = await mkdtemp(join('.tmp', 'removed-access-'));
   const app = await buildApp({ dataDir, anonymousRead: false });
   try {
-    assert.equal((await app.inject({ url: '/api/v1/admin/devices', headers: { authorization: `Bearer ${oldToken}` } })).statusCode, 401);
+    assert.equal((await app.inject({ url: '/api/v1/admin/devices', headers: { authorization: `Bearer ${randomBytes(32).toString('hex')}` } })).statusCode, 401);
     for (const [method, url] of [['GET', '/api/v1/state'], ['PUT', '/api/v1/state'], ['GET', '/api/v1/state/changes'], ['POST', '/api/v1/sessions'], ['GET', '/api/v1/sessions'], ['DELETE', '/api/v1/sessions/current'], ['POST', '/api/v1/accounts'], ['GET', '/api/v1/admin/accounts']] as const) {
       assert.equal((await app.inject({ method, url })).statusCode, 404, url);
     }
     const db = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
-    try { assert.deepEqual(['accounts', 'sessions', 'state', 'state_changes', 'operations'].map(table => db.prepare(`SELECT * FROM ${table}`).all()), before); }
+    try { assert.equal(db.prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name IN ('accounts','sessions','state','state_changes','operations')").get()?.count, 0); }
     finally { db.close(); }
   } finally { await app.close(); await rm(dataDir, { recursive: true }); }
 });
@@ -107,7 +93,7 @@ test('console expiry, credential separation and registration input validation ar
   try {
     const admin = await consoleHeaders(app, dataDir);
     const device = await deviceHeaders(app);
-    assert.equal((await app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...admin, 'content-type': 'application/zip' }, payload: Buffer.from('unused') })).statusCode, 403);
+    assert.equal((await app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...admin, 'content-type': 'multipart/form-data; boundary=unused' }, payload: Buffer.from('unused') })).statusCode, 403);
     assert.equal((await app.inject({ method: 'DELETE', url: '/api/v1/console-sessions/current', headers: device })).statusCode, 403);
     for (const payload of [{ deviceKey: 'short', deviceName: 'Phone' }, { deviceKey: 'A'.repeat(64), deviceName: 'Phone' }, { deviceKey: 'a'.repeat(64), deviceName: '   ' }, { deviceKey: 'a'.repeat(64), deviceName: '' }, { deviceKey: 'a'.repeat(64), deviceName: 'x'.repeat(201) }]) {
       assert.equal((await app.inject({ method: 'POST', url: '/api/v1/devices/register', payload })).statusCode, 400);
@@ -120,7 +106,7 @@ test('console expiry, credential separation and registration input validation ar
       db.prepare('UPDATE console_sessions SET expires_at=?').run(Date.now() - 1);
     } finally { db.close(); }
     assert.equal((await app.inject({ url: '/api/v1/admin/devices', headers: admin })).statusCode, 401);
-    assert.equal((await app.inject({ url: '/api/v1/changes?waitSeconds=0', headers: device })).statusCode, 200);
+    assert.equal((await app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=0&waitSeconds=0', headers: device })).statusCode, 200);
     assert.equal((await app.inject('/admin-password.hash')).statusCode, 404);
   } finally { await app.close(); await rm(dataDir, { recursive: true }); }
 });

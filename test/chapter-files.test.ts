@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ZipFile } from 'yazl';
 import { buildApp } from '../src/app.ts';
 import { openDatabase } from '../src/db.ts';
-import { defaultLimits, digest, discardChapterHistory, type PackageManifest } from '../src/packages.ts';
+import { defaultLimits, digest, type PackageManifest } from '../src/packages.ts';
 import { scanFolder, type FolderIndexItem } from '../src/folder-indexer.ts';
 import { saveWork } from '../src/works.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
@@ -62,14 +62,14 @@ test('a complete server copy ignores later uploads and can be replaced after del
     const ignored = await upload(s, changed);
     assert.equal(ignored.statusCode, 200, ignored.body);
     assert.deepEqual(ignored.json(), first);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/revision`, headers: await consoleHeaders(s.app, s.dataDir), payload: { revision: first.revision } })).statusCode, 404);
     await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${first.id}`, headers: s.headers });
     const replacement = await upload(s, changed);
     assert.equal(replacement.statusCode, 200, replacement.body);
     assert.equal(replacement.json().deleted, false);
     assert.notEqual(replacement.json().revision, first.revision);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     assert.deepEqual((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${replacement.json().revision}&path=content.html`)).rawPayload, changed['content.html']);
     assert.equal((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${first.revision}&path=content.html`)).statusCode, 404);
   } finally { await s.close(); }
@@ -80,7 +80,7 @@ test('missing server files are repaired by the next completed upload', async () 
   try {
     const files = { 'content.html': Buffer.from('<p>First</p>') };
     const first = (await upload(s, files)).json();
-    const stored = (s.db.prepare('SELECT path FROM revisions WHERE chapter_id=?').get(first.id) as { path: string }).path;
+    const stored = (s.db.prepare('SELECT path FROM chapters WHERE id=?').get(first.id) as { path: string }).path;
     await writeFile(join(s.dataDir, stored, 'content.html'), 'truncated');
     const query = new URLSearchParams(first.manifest.identity);
     assert.equal((await s.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
@@ -88,25 +88,7 @@ test('missing server files are repaired by the next completed upload', async () 
     const repaired = await upload(s, files);
     assert.equal(repaired.statusCode, 200, repaired.body);
     assert.deepEqual(await readFile(join(s.dataDir, stored, 'content.html')), files['content.html']);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
-  } finally { await s.close(); }
-});
-
-test('upgrade keeps the complete current copy and removes historical files and rows', async () => {
-  const s = await setup();
-  try {
-    const files = { 'content.html': Buffer.from('complete') };
-    const first = (await upload(s, files)).json();
-    const stored = (s.db.prepare('SELECT path FROM revisions WHERE chapter_id=?').get(first.id) as { path: string }).path;
-    const extra = { ...first, revision: 'f'.repeat(64) };
-    const extraPath = join(dirname(stored), `${extra.revision}.files`);
-    await mkdir(join(s.dataDir, extraPath)); await writeFile(join(s.dataDir, extraPath, 'content.html'), 'complete');
-    s.db.exec('DROP INDEX revisions_chapter');
-    s.db.prepare('INSERT INTO revisions(chapter_id,revision,entry,path) VALUES(?,?,?,?)').run(extra.id, extra.revision, JSON.stringify(extra), extraPath);
-    discardChapterHistory(s.db, s.dataDir);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
-    assert.deepEqual(await readFile(join(s.dataDir, stored, 'content.html')), files['content.html']);
-    await assert.rejects(readdir(join(s.dataDir, extraPath)), /ENOENT/);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
   } finally { await s.close(); }
 });
 
@@ -126,18 +108,18 @@ test('original chapter files round trip without rewriting or an outer archive', 
     assert.deepEqual(entry.manifest.files, description(files).files);
     assert.equal(entry.zipBytes, undefined);
     assert.equal(entry.fileBytes, Object.values(files).reduce((sum, file) => sum + file.length, 0));
-    const revision = s.db.prepare('SELECT path FROM revisions WHERE chapter_id=? AND revision=?').get(entry.id, entry.revision) as { path: string };
+    const chapter = s.db.prepare('SELECT path FROM chapters WHERE id=?').get(entry.id) as { path: string };
     for (const [path, expected] of Object.entries(files)) {
-      assert.deepEqual(await readFile(join(s.dataDir, revision.path, path)), expected);
+      assert.deepEqual(await readFile(join(s.dataDir, chapter.path, path)), expected);
       const download = await s.app.inject({ url: `/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=${path}` });
       assert.equal(download.statusCode, 200, download.body);
       assert.deepEqual(download.rawPayload, expected);
       assert.equal(download.headers.etag, `"${entry.revision}:${path}"`);
       assert.equal(download.headers['content-length'], String(expected.length));
     }
-    assert.deepEqual((await readdir(join(s.dataDir, revision.path))).sort(), ['content.html', 'manifest.json', 'media.zip']);
+    assert.deepEqual((await readdir(join(s.dataDir, chapter.path))).sort(), ['content.html', 'manifest.json', 'media.zip']);
     assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.pdf`)).statusCode, 404);
-    assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/package`)).statusCode, 406);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/package`)).statusCode, 404);
     assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers })).statusCode, 200);
     assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).statusCode, 410);
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).statusCode, 200);
@@ -145,9 +127,10 @@ test('original chapter files round trip without rewriting or an outer archive', 
     await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
     const purged = await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/purge`, headers: await consoleHeaders(s.app, s.dataDir) });
     assert.equal(purged.statusCode, 200, purged.body);
-    const purgedRevision = s.db.prepare('SELECT path FROM revisions WHERE chapter_id=? AND revision=?').get(entry.id, entry.revision) as { path: string | null };
-    assert.equal(purgedRevision.path, null);
-    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).json().deleted, true);
+    const purgedChapter = s.db.prepare('SELECT path FROM chapters WHERE id=?').get(entry.id) as { path: string | null };
+    assert.equal(purgedChapter.path, null);
+    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).statusCode, 410);
+    assert.equal(JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry).deleted, true);
     assert.equal((await upload(s, files)).statusCode, 200);
   } finally { await s.close(); }
 });
@@ -179,34 +162,17 @@ test('raw uploads require a nonnegative safe integer modification time instead o
       const response = await upload(s, files, metadata);
       assert.equal(response.statusCode, 400, response.body);
     }
-    const checksum = description(files); checksum.files = [{ path: 'content.html', size: 4, sha256: digest('body') }];
+    const checksum = description(files); Object.assign(checksum.files[0], { sha256: digest('body') });
     assert.equal((await upload(s, files, checksum)).statusCode, 400);
+    Reflect.deleteProperty(checksum.files[0], 'modifiedAt');
+    assert.equal((await upload(s, files, checksum)).statusCode, 400);
+    const noLayout = description(files); Reflect.deleteProperty(noLayout, 'layout');
+    assert.equal((await upload(s, files, noLayout)).statusCode, 400);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
     const metadata = description(files); metadata.files[0].modifiedAt = 0;
     const valid = await upload(s, files, metadata);
     assert.equal(valid.statusCode, 200, valid.body);
     assert.deepEqual(valid.json().manifest.files, [{ path: 'content.html', size: 4, modifiedAt: 0 }]);
-  } finally { await s.close(); }
-});
-
-test('published raw descriptors with legacy checksums remain readable', async () => {
-  const s = await setup();
-  try {
-    const files = { 'content.html': Buffer.from('body') };
-    const response = await upload(s, files);
-    assert.equal(response.statusCode, 200, response.body);
-    const entry = response.json();
-    entry.manifest.files = [{ path: 'content.html', size: 4, sha256: digest('body') }];
-    const saved = JSON.stringify(entry);
-    s.db.prepare('UPDATE chapters SET entry=? WHERE id=?').run(saved, entry.id);
-    s.db.prepare('UPDATE revisions SET entry=? WHERE chapter_id=? AND revision=?').run(saved, entry.id, entry.revision);
-    s.db.prepare('UPDATE catalog_changes SET entry=? WHERE sequence=?').run(saved, entry.sequence);
-    const catalog = await s.app.inject('/api/v1/chapters');
-    assert.equal(catalog.statusCode, 200, catalog.body);
-    assert.deepEqual(catalog.json().items[0].manifest.files, entry.manifest.files);
-    const download = await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`);
-    assert.equal(download.statusCode, 200, download.body);
-    assert.deepEqual(download.rawPayload, files['content.html']);
   } finally { await s.close(); }
 });
 
@@ -224,7 +190,7 @@ test('concurrent and changed uploads retain the complete stored copy', async () 
     assert.equal(next.statusCode, 200, next.body);
     const second = next.json();
     assert.deepEqual(first, second);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM catalog_changes').get() as { n: number }).n, 1);
     for (const [entry, body] of [[first, files['content.html']], [second, files['content.html']]] as const) {
       assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).rawPayload, body);
@@ -235,7 +201,7 @@ test('concurrent and changed uploads retain the complete stored copy', async () 
   } finally { await s.close(); }
 });
 
-test('storage scans recognize raw revision directories without importing or rewriting them', async () => {
+test('storage scans recognize current uploaded chapter directories without rewriting them', async () => {
   const s = await setup();
   try {
     const files = { 'content.html': Buffer.from('<img src="norea-media://reader-asset/preserve">') };
@@ -244,48 +210,93 @@ test('storage scans recognize raw revision directories without importing or rewr
     const result = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, onItem: item => { items.push(item); } });
     assert.equal(result.skipped, 0, JSON.stringify(items));
     assert.equal(result.failed, 0, JSON.stringify(items));
-    assert.ok(items.some(item => item.chapterId === entry.id && item.revision === entry.revision && item.status === 'unchanged'));
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM catalog_changes').get() as { n: number }).n, 1);
-    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).rawPayload, files['content.html']);
+    const indexed = items.find(item => item.chapterId === entry.id)!;
+    assert.equal(indexed.status, 'registered');
+    assert.notEqual(indexed.revision, entry.revision);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM catalog_changes').get() as { n: number }).n, 2);
+    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${indexed.revision}&path=content.html`)).rawPayload, files['content.html']);
+    assert.equal((await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits })).registered, 0);
   } finally { await s.close(); }
 });
 
-test('a complete legacy ZIP is kept when an app attempts a raw-file upload', async () => {
-  const s = await setup();
-  try {
-    const files = { 'content.html': Buffer.from('legacy body') };
-    const metadata = description(files); delete metadata.layout;
-    metadata.files = Object.entries(files).map(([path, data]) => ({ path, size: data.length, sha256: digest(data) }));
-    const bytes = await archive({ ...files, 'manifest.json': Buffer.from(JSON.stringify(metadata)) });
-    const legacy = await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...s.headers, 'content-type': 'application/zip' }, payload: bytes });
-    assert.equal(legacy.statusCode, 200, legacy.body);
-    const entry = legacy.json();
-    const raw = (await upload(s, files)).json();
-    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/package`)).rawPayload, bytes);
-    assert.deepEqual(raw, entry);
-    const headers = await consoleHeaders(s.app, s.dataDir);
-    const overview = (await s.app.inject({ url: '/api/v1/admin/overview', headers })).json();
-    assert.equal(overview.storedBytes, bytes.length);
-    assert.equal(overview.zipBytes, bytes.length);
-    await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
-    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).statusCode, 200);
-    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/package`)).rawPayload, bytes);
-    assert.equal((await s.app.inject(`/api/v1/chapters/${raw.id}/files?revision=${raw.revision}&path=content.html`)).statusCode, 404);
-    await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
-    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/purge`, headers })).statusCode, 200);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions WHERE path IS NOT NULL').get() as { n: number }).n, 0);
-  } finally { await s.close(); }
-});
-
-test('a ZIP upload cannot claim the raw chapter-file layout', async () => {
+test('outer ZIP package uploads are unsupported', async () => {
   const s = await setup();
   try {
     const files = { 'content.html': Buffer.from('body') };
     const bytes = await archive({ ...files, 'manifest.json': Buffer.from(JSON.stringify(description(files))) });
     const response = await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...s.headers, 'content-type': 'application/zip' }, payload: bytes });
-    assert.equal(response.statusCode, 400, response.body);
+    assert.equal(response.statusCode, 404, response.body);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
+  } finally { await s.close(); }
+});
+
+test('an unavailable indexed directory can be repaired by upload and removed by deletion', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original body') };
+    const entry = (await upload(s, files)).json();
+    const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
+    const directory = join(s.dataDir, row.directory);
+    await writeFile(join(directory, 'content.html.part'), 'unfinished');
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    assert.equal((s.db.prepare('SELECT path FROM chapters WHERE id=?').get(entry.id) as { path: string | null }).path, null);
+    assert.equal((await upload(s, files)).statusCode, 200);
+    assert.deepEqual(await readdir(directory), ['content.html']);
+    await writeFile(join(directory, 'content.html.part'), 'unfinished');
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers })).statusCode, 200);
+    await assert.rejects(readdir(directory), { code: 'ENOENT' });
+    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).statusCode, 410);
+  } finally { await s.close(); }
+});
+
+test('restoring deleted files validates media again', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[]}}') };
+    const entry = (await upload(s, files)).json();
+    const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
+    await writeFile(join(s.dataDir, row.directory, 'manifest.json'), Buffer.alloc(files['manifest.json'].length, 33));
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
+    const restore = await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers });
+    assert.equal(restore.statusCode, 400, restore.body);
+    assert.equal(JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry).deleted, true);
+  } finally { await s.close(); }
+});
+
+test('the first scan assigns a new token to a changed same-size uploaded body', async () => {
+  const s = await setup();
+  try {
+    const entry = (await upload(s, { 'content.html': Buffer.from('first') })).json();
+    const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
+    await writeFile(join(s.dataDir, row.directory, 'content.html'), 'other');
+    await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    const current = JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry);
+    assert.notEqual(current.revision, entry.revision);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${current.revision}&path=content.html`)).body, 'other');
+  } finally { await s.close(); }
+});
+
+test('the first storage scan validates uploaded files and preserves their identity after repair', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original body'), 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[]}}') };
+    const entry = (await upload(s, files)).json();
+    const row = s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(entry.id) as { directory: string };
+    const manifestPath = join(s.dataDir, row.directory, 'manifest.json'); await writeFile(manifestPath, Buffer.alloc(files['manifest.json'].length, 33));
+    const invalid = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    assert.equal(invalid.skipped, 1);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).statusCode, 410);
+    await writeFile(manifestPath, files['manifest.json']);
+    const repaired = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits });
+    assert.equal(repaired.registered, 1);
+    const current = JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry);
+    assert.deepEqual(current.manifest.identity, entry.manifest.identity);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapter_tombstones').get() as { n: number }).n, 0);
+    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${current.revision}&path=content.html`)).rawPayload, files['content.html']);
   } finally { await s.close(); }
 });
 
@@ -374,7 +385,7 @@ test('deletion and restoration during a streaming upload prevent publication', {
     request.end(body.payload.subarray(split));
     const result = await response;
     assert.equal(result.status, 409, result.body);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
   } finally { await s.close(); }
 });

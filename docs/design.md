@@ -101,8 +101,8 @@ and does not prevent somebody from registering a different key. Device credentia
 do not grant console access. Use HTTPS outside local device testing.
 
 Removing server access does not prevent local reading. Source-site credentials
-are never server credentials. Old account sessions are invalid after this change;
-existing legacy database tables remain inert to preserve previously stored data.
+are never server credentials. Account sessions and personal-state tables are not
+part of the current schema.
 
 ## Data ownership
 
@@ -126,7 +126,7 @@ revision. Local numeric database IDs are only mappings within a device.
 
 For source content, identify a work by its existing plugin ID and original work
 path, and a chapter by that work identity and original chapter path when retained.
-Legacy folder ingestion can preserve missing addresses as local folder identities,
+Current folder scanning identifies chapters by their folder numbers,
 as specified under administration below. Do not add
 repository UUIDs, distribution namespaces, or automatic cross-plugin merging.
 Local numeric row IDs remain device-specific. Matching plugin IDs and paths from
@@ -153,8 +153,8 @@ availability before creating a transfer snapshot. Missing or wrong-sized files
 allow a completed upload to repair the stored copy. To replace complete content,
 delete the server copy and start a new upload. Device copies remain unchanged.
 The revision field is a transfer/cache token, not a selectable version history.
-Upgrades retain the complete current copy, falling back to the latest available
-copy, and remove historical files and rows.
+The database stores one path per chapter. There is no historical-copy table or
+upgrade path for previous storage formats.
 
 A canonical metadata manifest identifies a revision. Original-file manifests list
 each file's relative path, byte size, and source modification time as a nonnegative
@@ -162,10 +162,9 @@ safe integer Unix timestamp in milliseconds. Use RFC 8785 JSON canonicalization
 and SHA-256 for this small manifest; do not hash original file payloads. Exclude
 uploader identity and transfer timestamps. A same-size edit with a changed source
 modification time changes the transfer token after deletion and republication.
-Payload changes that preserve both size
-and modification time cannot be distinguished. Legacy ZIP manifests retain file
-`sha256` fields for format compatibility, without comparing file payload hashes.
-Legacy ZIP records also retain their archive checksum for ETags.
+Payload changes that preserve both size and modification time cannot be
+distinguished by upload metadata. Scanning also records file identity and change
+time to detect external edits without reading file payloads.
 
 ## Complete chapter transfers
 
@@ -183,9 +182,8 @@ stored assets, and the media ZIP's central directory must match their names and
 sizes. This inventory check does not extract assets or verify ZIP CRCs. Store work
 covers separately at work scope and cache them locally when needed.
 
-Legacy ZIP uploads and downloads remain available. Their package `manifest.json`
-contains metadata and the file inventory. Assets use portable relative paths;
-clients restore local media references when installing these legacy packages.
+Only this original-file format is supported. No outer ZIP encoder, decoder,
+media-path conversion, or older manifest reader is retained.
 
 Initial configurable package limits are 512 MiB of ZIP data, 2 GiB of expanded
 data, and 10,000 files. These are provisional operating defaults, not measured
@@ -294,8 +292,6 @@ membership stay in the app's local database. Content synchronization neither
 uploads nor downloads these records. Reading on a PC and tablet can therefore
 progress independently, including rereading or moving backward.
 
-Existing local values and release-line database compatibility must be preserved.
-Old pending personal-state caches and server legacy state are no longer consumed.
 Content changes retain their durable journal and catalog cursors. Reading-only
 changes must not enqueue uploads or trigger content synchronization.
 
@@ -313,8 +309,11 @@ while retaining the existing `/api/v1` route prefix. Query
 supported protocol versions, package versions, and capabilities when connecting.
 Unsupported versions must produce a clear sync error while local reading
 continues. Publish the supported app/server combinations before release.
-App-side data changes must also follow Norea's active release-line compatibility
-policy.
+During early development, support only the current schema and wire format.
+Do not add upgrade migrations, old field defaults, or compatibility readers.
+The app recreates a database with a different schema checksum. An incompatible
+server database fails startup and requires a fresh state volume. Existing current
+chapter folders can then be scanned again; old files are not converted.
 
 Publish an OpenAPI document from the same route schemas used for request and
 response validation. The selected stack is TypeScript, Fastify, REST/OpenAPI,
@@ -516,7 +515,6 @@ manifests. IDs and readable folder rules stay unchanged.
 
 The sole content root is `<NOREA_DATA_DIR>/contents`, selected at server startup.
 The console displays it but cannot add, select, edit, or detach content roots.
-Legacy connected-root records are ignored.
 Every source directory is eligible regardless of plugin registration, installation,
 or enabled status. The scan never queries plugin code, a repository, or an original
 site to verify a work's existence. Local imports follow the same completeness and
@@ -539,32 +537,31 @@ metadata skips the whole work; folder names, cover sidecars, and old databases
 cannot establish a work identity. No plugin or source-site requests are made.
 
 Discover actual chapters from `<number>-<title>` folders, splitting at the first
-hyphen. Keep original chapter paths in valid package manifests whose work identity
-matches `novel.json`. Raw folders use `norea-folder:<number>` within that exact
+hyphen. Already indexed directories retain their original chapter identity.
+New folders use `norea-folder:<number>` within that exact
 work. Synthetic work identities are rejected. Duplicate chapter numbers,
 conflicting bodies, incomplete media, and changing files are skipped.
 
 Metadata-only works and covers can be registered independently. A removed source
 work or plugin does not prevent importing a complete local copy with valid work
-metadata. Explicit server deletions remain authoritative. Snapshot files are
-removed when the job ends. A chapter file that changes during its first copy is
-retried once; continued changes are skipped. Media manifests use stable key
-ordering compatible with app package exports.
+metadata. Explicit server deletions remain authoritative. Files that change
+during validation are skipped and retried on a later scan.
 
 The scanner indexes work metadata and covers in place and leaves their original
-files unchanged. Chapter snapshots become portable ZIPs under the work's hidden
-`.packages/<chapter>/` directory and use the same validation/publication path as
-app uploads. Symbolic paths are rejected. Generated packages do not become scan
-inputs or trigger further scans. Server deletion moves only indexed revision ZIPs
-to trash, preserving any original files in the same chapter folder.
+files unchanged. Chapter directories are registered in place after the same
+current-file validation used for uploads. There are no snapshots or generated
+packages. Symbolic paths are rejected. Explicit server deletion moves the indexed
+chapter directory to trash, while whole-work deletion removes the work directory.
 
 SQLite checkpoints record each successful source's stat inventory. Later scans
 still enumerate directories and stat files, but unchanged chapter payloads are
 not read, hashed, or repacked, including after a restart. Failed candidates have
 no success checkpoint and retry on subsequent scans. Metadata-only work changes
-do not rebuild unchanged chapters. New and changed candidates use full snapshot
-verification. Stat checks cannot detect edits that preserve every recorded field.
-A changed source chapter does not replace an already complete server copy.
+do not rebuild unchanged chapters. New and changed candidates are validated in
+place. Stat checks cannot detect edits that preserve every recorded field.
+Changed current files refresh the stored inventory. Validation failures make a
+chapter unavailable without creating a deletion tombstone; a later successful
+scan or upload can restore availability.
 Explicit deletion tombstones remain authoritative during server folder scans.
 
 Console data includes per-source metadata/version, the single storage scan configuration,
@@ -627,8 +624,8 @@ the server database. Upload clients register work metadata before chapter packag
 `GET` and `PUT /api/v1/works/:id/cover` transfer image bytes separately, up to 10 MiB.
 The work ID hashes the exact plugin ID and novel path. Metadata and cover changes
 advance the work cursor. Clients retain file fingerprints to preserve pending local
-edits and avoid unchanged uploads. Complete chapter ZIPs remain package version 1.
+edits and avoid unchanged uploads. Chapters transfer only their original files.
 
 The console offers work-cover grids and lists, search, chapter counts, a metadata
-dialog, and chapter/revision actions. Cover requests carry console authentication
+dialog, and chapter deletion and restoration actions. Cover requests carry console authentication
 in headers rather than URLs.

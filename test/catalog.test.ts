@@ -3,10 +3,10 @@ import { test } from 'node:test';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { ZipFile } from 'yazl';
 import { buildApp } from '../src/app.ts';
 import { openDatabase } from '../src/db.ts';
-import { digest } from '../src/packages.ts';
+import { defaultLimits, digest } from '../src/packages.ts';
+import { scanFolder } from '../src/folder-indexer.ts';
 import type { PackageManifest } from '../src/packages.ts';
 import type { NovelMetadataV1 } from '../src/works.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
@@ -28,10 +28,12 @@ async function fixture(anonymousRead = true) {
     const id = digest(JSON.stringify([work.identity.pluginId, work.identity.novelPath]));
     if ((await app.inject({ url: `/api/v1/works/${id}`, headers })).statusCode === 404) await putWork(work);
     const bytes = Buffer.from('Chapter content');
-    const manifest: PackageManifest = { packageVersion: 1, identity: { ...work.identity, chapterPath: path }, novel: { name: work.novel.name, isLocal: work.novel.isLocal }, chapter: { name: path, position, chapterNumber: String(position), contentType: 'text', page: '1' }, bodyPath: 'content.txt', files: [{ path: 'content.txt', size: bytes.length, sha256: digest(bytes) }] };
-    const zip = new ZipFile(); zip.addBuffer(Buffer.from(JSON.stringify(manifest)), 'manifest.json'); zip.addBuffer(bytes, 'content.txt'); zip.end();
-    const chunks: Buffer[] = []; for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
-    const response = await app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...headers, 'content-type': 'application/zip' }, payload: Buffer.concat(chunks) });
+    const manifest: PackageManifest = { packageVersion: 1, layout: 'chapter-files', identity: { ...work.identity, chapterPath: path }, novel: { name: work.novel.name, isLocal: work.novel.isLocal }, chapter: { name: path, position, chapterNumber: String(position), contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: bytes.length, modifiedAt: 1 }] };
+    const form = new FormData();
+    form.append('metadata', JSON.stringify(manifest));
+    form.append('content.html', new Blob([bytes]), 'content.html');
+    const request = new Request('http://localhost', { method: 'POST', body: form });
+    const response = await app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...headers, 'content-type': request.headers.get('content-type')! }, payload: Buffer.from(await request.arrayBuffer()) });
     assert.equal(response.statusCode, 200, response.body); return response.json();
   };
   return { app, dataDir, headers, putWork, putChapter, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
@@ -118,6 +120,37 @@ test('resolves folder chapters only within the exact canonical work', async () =
   } finally { await f.close(); }
 });
 
+test('invalid scanned chapters leave available pages and return after repair with the same identity', async () => {
+  const f = await fixture();
+  try {
+    const work = metadata('source-a', 'Alpha'); const savedWork = await f.putWork(work);
+    const chapter = await f.putChapter(work, '/chapter/one', 1);
+    const db = openDatabase(f.dataDir);
+    try {
+      const row = db.prepare('SELECT directory FROM chapters WHERE id=?').get(chapter.id) as { directory: string };
+      const temporary = join(f.dataDir, row.directory, 'content.html.part'); await writeFile(temporary, 'partial');
+      const invalid = await scanFolder({ db, dataDir: f.dataDir, limits: defaultLimits });
+      assert.equal(invalid.skipped, 1);
+      assert.equal((await f.app.inject('/api/v1/catalog/works')).json().items[0].chapterCount, 0);
+      assert.deepEqual((await f.app.inject(`/api/v1/catalog/works/${savedWork.id}/chapters`)).json(), { items: [], total: 0, hasMore: false });
+      const query = new URLSearchParams(chapter.manifest.identity);
+      assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
+      assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}&includeUnavailable=true`)).json().id, chapter.id);
+      query.set('chapterPath', 'norea-folder:1'); query.set('chapterNumber', '1');
+      assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
+      assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}&includeUnavailable=true`)).json().id, chapter.id);
+      assert.equal((db.prepare('SELECT count(*) AS n FROM chapter_tombstones').get() as { n: number }).n, 0);
+      await rm(temporary);
+      const repaired = await scanFolder({ db, dataDir: f.dataDir, limits: defaultLimits });
+      assert.equal(repaired.registered, 1);
+      assert.equal((await f.app.inject('/api/v1/catalog/works')).json().items[0].chapterCount, 1);
+      assert.equal((await f.app.inject(`/api/v1/catalog/works/${savedWork.id}/chapters`)).json().items[0].id, chapter.id);
+      assert.deepEqual((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).json().manifest.identity, chapter.manifest.identity);
+      assert.equal((db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    } finally { db.close(); }
+  } finally { await f.close(); }
+});
+
 test('catalog reads follow anonymous, invalid-key and blocked-device policies and expose schemas', async () => {
   const f = await fixture(false);
   try {
@@ -166,34 +199,30 @@ test('incremental availability pages preserve ordered deletions and restores wit
     assert.deepEqual((await f.app.inject('/api/v1/catalog/changes?after=999999')).json(), { items: [], cursor: 999999, hasMore: false });
     const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
     try {
-      db.prepare("UPDATE catalog_changes SET entry=json_set(entry,'$.manifest.files',json(?))").run(JSON.stringify(Array.from({ length: 1000 }, (_, i) => ({ path: `media/${i}.png`, sha256: 'a'.repeat(64), size: 10 }))));
+      db.prepare("UPDATE catalog_changes SET entry=json_set(entry,'$.manifest.novel.summary',?)").run('A long work summary. '.repeat(1000));
     } finally { db.close(); }
     const lightweight = await f.app.inject('/api/v1/catalog/changes');
     assert.ok(lightweight.rawPayload.length < 2000, lightweight.rawPayload.length.toString());
     assert.deepEqual(lightweight.json().items, [first, second, deletion.json(), restore.json()].map(summarize));
-    const original = (await f.app.inject('/api/v1/chapters?limit=1')).json();
-    assert.equal(original.items[0].manifest.files.length, 1000);
     for (const suffix of ['after=-1', 'after=1.5', 'after=9007199254740992', 'limit=0', 'limit=101']) assert.equal((await f.app.inject(`/api/v1/catalog/changes?${suffix}`)).statusCode, 400, suffix);
   } finally { await f.close(); }
 });
 
-test('default work pages stay bounded and browsing indexes are added to existing databases', async () => {
+test('default work pages stay bounded and the current schema provides browsing indexes', async () => {
   const f = await fixture();
   try {
     for (let i = 0; i < 42; i++) await f.putWork(metadata('source', `Book ${String(i).padStart(2, '0')}`));
     const page = (await f.app.inject('/api/v1/catalog/works')).json();
     assert.equal(page.items.length, 40); assert.equal(page.total, 42); assert.equal(page.hasMore, true);
     assert.deepEqual((await f.app.inject('/api/v1/catalog/works?offset=40')).json().items.map((item: { novel: { name: string } }) => item.novel.name), ['Book 40', 'Book 41']);
-    const existing = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    try { existing.exec('DROP INDEX works_catalog_name; DROP INDEX works_catalog_source; DROP INDEX chapters_catalog_work'); } finally { existing.close(); }
     const db = openDatabase(f.dataDir);
     try {
       const plans = [
         ["SELECT id FROM works ORDER BY json_extract(entry,'$.metadata.novel.name'),id LIMIT 40", 'works_catalog_name'],
         ["SELECT id FROM works WHERE json_extract(entry,'$.metadata.identity.pluginId')='source' ORDER BY json_extract(entry,'$.metadata.novel.name'),id LIMIT 40", 'works_catalog_source'],
         ["SELECT json_extract(entry,'$.metadata.identity.pluginId'),COUNT(*) FROM works GROUP BY json_extract(entry,'$.metadata.identity.pluginId')", 'works_catalog_source'],
-        ["SELECT entry FROM chapters WHERE work_id='work' AND deleted_at IS NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT 100", 'chapters_catalog_work'],
-        ["SELECT COUNT(*) FROM chapters WHERE work_id='work' AND deleted_at IS NULL", 'chapters_catalog_work'],
+        ["SELECT entry FROM chapters WHERE work_id='work' AND deleted_at IS NULL AND path IS NOT NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT 100", 'chapters_catalog_work'],
+        ["SELECT COUNT(*) FROM chapters WHERE work_id='work' AND deleted_at IS NULL AND path IS NOT NULL", 'chapters_catalog_work'],
       ];
       for (const [sql, index] of plans) {
         const details = (db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map(row => row.detail).join('\n');

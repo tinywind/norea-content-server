@@ -7,7 +7,7 @@ interface Plugin { id: string; name: string; url: string; enabled: boolean; upda
 interface StorageSettings { path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
-interface Entry { id: string; revision: string; zipSha256?: string; zipBytes?: number; fileBytes?: number; deleted: boolean; sequence: number; manifest: { layout?: 'chapter-files'; identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; sha256?: string; modifiedAt?: number }[] } }
+interface Entry { id: string; revision: string; fileBytes: number; deleted: boolean; sequence: number; manifest: { layout: 'chapter-files'; identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; modifiedAt: number }[] } }
 interface NovelMetadata {
   schemaVersion: 1;
   identity: { pluginId: string; novelPath: string };
@@ -17,7 +17,7 @@ interface NovelMetadata {
 interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount?: number; downloadedChapters?: number }
 interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
 interface Settings { anonymousRead: boolean; limits: { zipBytes: number; expandedBytes: number; files: number }; dataDir: string }
-interface Overview { works: number; chapters: number; revisions: number; storedBytes: number; deletedChapters: number; plugins: number; contentsPath: string; runningJobs: number }
+interface Overview { works: number; chapters: number; storedChapters: number; storedBytes: number; deletedChapters: number; plugins: number; contentsPath: string; runningJobs: number }
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 const sessionKey = 'norea-console-session';
@@ -236,7 +236,7 @@ async function overview(current: number) {
   const stats = el('div', 'stats');
   for (const [label, value, detail] of [
     ['Works', data.works.toLocaleString(), 'Distinct novels in the catalog'], ['Chapters', data.chapters.toLocaleString(), 'Available to connected readers'],
-    ['Content storage', bytes(data.storedBytes), `${data.revisions.toLocaleString()} stored chapters`], ['Running scans', data.runningJobs.toLocaleString(), 'Content directory'],
+    ['Content storage', bytes(data.storedBytes), `${data.storedChapters.toLocaleString()} stored chapters`], ['Running scans', data.runningJobs.toLocaleString(), 'Content directory'],
   ]) stats.append(el('div', 'stat', el('div', 'stat-label', label), el('div', 'stat-value', value), el('div', 'stat-detail', detail)));
   const inventory = panel('Server inventory');
   for (const [label, value] of [['Registered repositories', data.plugins], ['Chapters in trash', data.deletedChapters]]) inventory.body.append(el('div', 'health-line', el('span', '', label), el('strong', '', value)));
@@ -407,7 +407,7 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
       if (work && deleted.value !== 'Trash') work.downloadedChapters = data.total;
       results.replaceChildren(table(['Chapter', 'Source', 'Stored content', 'Actions'], data.items.map(entry => [
         el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
-        el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.zipBytes ?? entry.fileBytes ?? 0), el('div', 'hint mono', entry.revision.slice(0, 12))),
+        el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.fileBytes), el('div', 'hint mono', entry.revision.slice(0, 12))),
         el('div', 'actions', action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'), entry.deleted ? null : action('Delete', async () => {
           if (!confirm(`Delete “${entry.manifest.chapter.name}” from the server? Local device copies remain. You can upload a replacement after deletion.`)) return;
           await api(`/chapters/${encodeURIComponent(entry.id)}`, 'DELETE'); await load(offset);
@@ -441,11 +441,10 @@ async function inspectEntry(id: string, changed: () => Promise<void>) {
     const metadata: [string, Child][] = [['Status', badge(entry.deleted ? 'deleted' : 'active')], ['Position', entry.manifest.chapter.position], ['Content type', entry.manifest.chapter.contentType]];
     if (entry.manifest.novel.author) metadata.push(['Author', entry.manifest.novel.author]);
     if (entry.manifest.novel.summary) metadata.push(['Summary', entry.manifest.novel.summary]);
-    metadata.push(['Chapter ID', el('span', 'mono', entry.id)], ['Plugin ID', entry.manifest.identity.pluginId], ['Novel path', el('span', 'mono', entry.manifest.identity.novelPath)], ['Chapter path', el('span', 'mono', entry.manifest.identity.chapterPath)], ['Revision', el('span', 'mono', entry.revision)], ['Storage format', entry.manifest.layout === 'chapter-files' ? 'Original chapter files' : 'Legacy ZIP package'], ['Stored size', bytes(entry.zipBytes ?? entry.fileBytes ?? 0)]);
-    if (entry.zipSha256) metadata.push(['ZIP SHA-256', el('span', 'mono', entry.zipSha256)]);
+    metadata.push(['Chapter ID', el('span', 'mono', entry.id)], ['Plugin ID', entry.manifest.identity.pluginId], ['Novel path', el('span', 'mono', entry.manifest.identity.novelPath)], ['Chapter path', el('span', 'mono', entry.manifest.identity.chapterPath)], ['Current file token', el('span', 'mono', entry.revision)], ['Storage format', 'Original chapter files'], ['Stored size', bytes(entry.fileBytes)]);
     modal.body.replaceChildren(el('div', '', el('h3', '', entry.manifest.chapter.name), el('p', 'hint', entry.manifest.novel.name)),
       details(metadata),
-      ...(entry.manifest.layout === 'chapter-files' ? [table(['Original file', 'Size'], entry.manifest.files.map(file => [el('span', 'mono', file.path), bytes(file.size)]), 'No stored files.')] : []),
+      table(['Original file', 'Size'], entry.manifest.files.map(file => [el('span', 'mono', file.path), bytes(file.size)]), 'No stored files.'),
       el('div', 'notice', 'Only one complete copy is kept. Delete it before uploading a replacement. These actions affect this server only.'), actions, errors);
   } catch (error) { showError(modal.body, error); }
 }
@@ -521,7 +520,7 @@ async function settings(current: number) {
     await api('/admin/settings', 'PATCH', { anonymousRead: anonymous.checked }); notify('Reading access settings saved.');
   }, errors)), errors); access.body.append(form);
   const config = panel('Server configuration', 'Package limits are configured on the server and are read-only here.');
-  config.body.append(details([['Data directory', el('span', 'mono', data.dataDir)], ['Maximum ZIP or media archive size', bytes(data.limits.zipBytes)], ['Chapter files or expanded ZIP limit', bytes(data.limits.expandedBytes)], ['Files per legacy package', data.limits.files.toLocaleString()]]));
+  config.body.append(details([['Data directory', el('span', 'mono', data.dataDir)], ['Maximum media archive size', bytes(data.limits.zipBytes)], ['Chapter and expanded media limit', bytes(data.limits.expandedBytes)], ['Media files per chapter', data.limits.files.toLocaleString()]]));
   page.replaceChildren(access.node, config.node);
 }
 

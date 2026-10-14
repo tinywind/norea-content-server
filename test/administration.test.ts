@@ -4,9 +4,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { test } from 'node:test';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
-import { ZipFile } from 'yazl';
 import { buildApp } from '../src/app.ts';
-import { digest } from '../src/packages.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 async function setup() {
@@ -33,21 +31,15 @@ test('administration requires a console session and does not expose filesystem p
   } finally { await s.close(); }
 });
 
-test('single-root scan registers an archived ZIP without plugins and preserves originals', async () => {
+test('single-root scan registers current chapter files without plugins and preserves originals', async () => {
   const s = await setup();
   try {
     const headers = await s.admin();
     assert.deepEqual((await s.app.inject({ url: '/api/v1/admin/plugins', headers })).json(), { items: [] });
-    const body = '<p>Archived chapter</p>';
-    const manifest = { packageVersion: 1, identity: { pluginId: 'removed-source', novelPath: '/gone', chapterPath: '/first' },
-      novel: { name: 'Removed work', isLocal: false }, chapter: { name: 'First', position: 1, contentType: 'html', page: '1' },
-      bodyPath: 'content.html', files: [{ path: 'content.html', size: Buffer.byteLength(body), sha256: digest(body) }] };
-    const zip = new ZipFile(); zip.addBuffer(Buffer.from(JSON.stringify(manifest)), 'manifest.json'); zip.addBuffer(Buffer.from(body), 'content.html'); zip.end();
-    const chunks: Buffer[] = []; for await (const chunk of zip.outputStream) chunks.push(Buffer.from(chunk));
-    const bytes = Buffer.concat(chunks);
+    const body = '<p>Original chapter</p>';
     const source = join(s.original, 'contents/removed-source/Removed/1-First'); await mkdir(source, { recursive: true });
-    await writeFile(join(source, '..', 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'removed-source', novelPath: '/gone' }, novel: { ...manifest.novel, author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null }, cover: null }));
-    const archive = join(source, 'archived.zip'); await writeFile(archive, bytes);
+    await writeFile(join(source, '..', 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'removed-source', novelPath: '/gone' }, novel: { name: 'Removed work', isLocal: false, author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null }, cover: null }));
+    await writeFile(join(source, 'content.html'), body);
     const started = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers });
     assert.equal(started.statusCode, 202, started.body);
     let detail;
@@ -58,11 +50,11 @@ test('single-root scan registers an archived ZIP without plugins and preserves o
     }
     assert.equal(detail.job.status, 'completed');
     assert.equal(detail.job.summary.registered, 2);
-    const chapterId = detail.items.find((item: { chapterId?: string }) => item.chapterId).chapterId;
+    const chapter = detail.items.find((item: { chapterId?: string }) => item.chapterId);
     assert.equal((await s.app.inject({ method: 'DELETE', url: '/api/v1/admin/roots/contents', headers })).statusCode, 404);
     assert.equal(await readFile(join(s.original, 'untouched.txt'), 'utf8'), 'Original stays unchanged');
-    assert.deepEqual(await readFile(archive), bytes);
-    assert.equal((await s.app.inject(`/api/v1/chapters/${chapterId}/package`)).statusCode, 200);
+    assert.equal(await readFile(join(source, 'content.html'), 'utf8'), body);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${chapter.chapterId}/files?revision=${chapter.revision}&path=content.html`)).body, body);
     assert.equal((await s.app.inject({ url: `/api/v1/admin/jobs/${started.json().id}`, headers })).json().job.status, 'completed');
   } finally { await s.close(); }
 });
@@ -94,7 +86,7 @@ test('access policy survives restart and protects anonymous reads immediately', 
     const headers = await s.admin();
     const update = await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/settings', headers, payload: { anonymousRead: false } });
     assert.equal(update.statusCode, 200, update.body);
-    assert.equal((await s.app.inject('/api/v1/chapters')).statusCode, 401);
+    assert.equal((await s.app.inject('/api/v1/catalog/changes')).statusCode, 401);
     await s.app.close();
     const restarted = await buildApp({ dataDir: s.dataDir });
     try { assert.equal((await restarted.inject('/api/v1/capabilities')).json().anonymousRead, false); }
@@ -119,21 +111,18 @@ test('console HTML has a strict local-only content policy and catalog supports e
     assert.deepEqual(result.json(), { items: [], total: 0 });
   } finally { await s.close(); }
 });
-test('startup removes abandoned importer and multipart snapshots but preserves unrelated staging files', async () => {
+test('startup removes abandoned multipart files but preserves unrelated staging files', async () => {
   const s = await setup();
   try {
     await s.app.close();
-    const abandoned = join(s.dataDir, 'staging', 'folder-ABC123');
     const unrelated = join(s.dataDir, 'staging', 'keep-me');
     const multipart = join(s.dataDir, 'staging', 'files-12345678-1234-4123-8123-123456789abc');
-    await mkdir(abandoned, { recursive: true }); await mkdir(unrelated, { recursive: true });
+    await mkdir(unrelated, { recursive: true });
     await mkdir(multipart);
-    await writeFile(join(abandoned, 'metadata.sqlite'), 'Private snapshot');
     await writeFile(join(multipart, 'content.html'), 'Partial upload');
     await writeFile(join(unrelated, 'keep.txt'), 'Keep');
     const app = await buildApp({ dataDir: s.dataDir });
     try {
-      await assert.rejects(readFile(join(abandoned, 'metadata.sqlite')), /ENOENT/);
       await assert.rejects(readFile(join(multipart, 'content.html')), /ENOENT/);
       assert.equal(await readFile(join(unrelated, 'keep.txt'), 'utf8'), 'Keep');
     } finally { await app.close(); }
@@ -165,7 +154,7 @@ test('change-driven folder watching schedules a new durable scan after a filesys
 });
 
 
-test('generated packages do not cause repeated change-driven scans', async () => {
+test('in-place indexing does not cause repeated change-driven scans', async () => {
   const s = await setup();
   try {
     const headers = await s.admin();

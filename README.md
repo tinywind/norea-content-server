@@ -1,8 +1,8 @@
 # Norea Content Server
 
 An optional content server for Norea. One Node.js 24 process stores catalog and
-device metadata in SQLite and original chapter files on local disk. Existing ZIP
-packages remain readable. Reading state stays on each device. The API and
+device metadata in SQLite and original chapter files on local disk.
+Reading state stays on each device. The API and
 package versions remain 1.
 
 The server is an optional shadow backup. App navigation, reading, local downloads,
@@ -54,17 +54,13 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   Device requests use `Authorization: Bearer <deviceKey>` without an account login.
 - `GET /api/v1/admin/devices` lists devices. Console administrators can set
   `{blocked:true}` or `{blocked:false}` with `PATCH /api/v1/admin/devices/:id`.
-- `GET /api/v1/chapters?after=0&limit=100` returns ordered catalog changes.
-  Apply every entry in order, including repeated chapter IDs and tombstones, and
-  save the returned cursor. Follow `hasMore` before considering the catalog current.
 - `GET /api/v1/catalog/changes?after=0&limit=100` returns lightweight availability
   changes as `{items,cursor,hasMore}`. Each item contains only
   `{identity:{pluginId,novelPath,chapterPath},deleted,sequence}`. Apply repeated
   identities in sequence order, including deletions and restorations. The cursor
   is the last returned sequence, or `after` when the page is empty. Limits range
   from 1 to 100. Package file inventories are excluded; use the exact chapter
-  lookup when a download needs the full manifest. The existing `/chapters` change
-  endpoint retains its full-entry response for older clients.
+  lookup when a download needs the full manifest.
 - `GET /api/v1/catalog/works?q=title&source=plugin-id&offset=0&limit=40` browses current work
   summaries without downloading change history. Omit `source` to include all sources;
   otherwise it matches an exact plugin ID. `q` matches a literal title substring,
@@ -83,7 +79,7 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `GET /api/v1/catalog/chapter?pluginId=...&novelPath=...&chapterPath=...` resolves
   one available chapter by its exact, URL-encoded identity. Missing or deleted
   entries return 404. Use its ID and revision with the chapter-file download route
-  when `manifest.layout` is `chapter-files`; older entries use the ZIP route.
+  with `manifest.layout` set to `chapter-files`.
   Optional numeric `chapterNumber` matches a unique chapter within the exact
   same plugin ID and novel path. Exact identities take priority;
   an exact deletion is not replaced by a folder match. Multiple matches return
@@ -106,7 +102,7 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   `content.pdf`; HTML, text, and Markdown chapters use `content.html`.
   The media manifest must report a complete download with all assets stored.
   `media.zip` requires `manifest.json`; a nonempty media inventory requires
-  `media.zip`. Loose legacy `media/` files are rejected by this endpoint.
+  `media.zip`. Loose `media/` files are unsupported.
   Body bytes, media URLs, media-manifest formatting and timestamps, and media ZIP
   bytes are preserved. The server creates no outer ZIP and does not extract or
   recompress the media archive. Its central directory must match the media
@@ -118,30 +114,14 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   identity is SHA-256 of the canonical metadata manifest, including each file's
   modification time. A retry returns the same immutable record. Payload changes
   that preserve sizes and modification times cannot be distinguished.
-  Raw records include `fileBytes`, the sum of original file sizes; ZIP records
-  retain `zipBytes` and `zipSha256`. Clients must allow those ZIP fields to be absent.
+  Every catalog record includes `fileBytes`, the sum of original file sizes.
 - `GET /api/v1/chapters/:id/files?revision=<revision>&path=<original-path>` streams
-  one original file from that immutable revision. Its ETag is the quoted revision,
+  one original file from the current copy. A stale revision returns 404.
+  Its ETag is the quoted revision,
   a colon, and the original path;
   Content-Length is its declared size. The route uses the same read policy as the
   catalog and checks supplied device keys even when anonymous reading is enabled.
   Check each file's size and receive the complete chapter before installing it.
-- `POST /api/v1/packages` retains the legacy authenticated `application/zip` upload.
-  Register the exact work with `PUT /api/v1/works/:id` first; missing work
-  metadata returns 409. Every declared file is checked for size, and undeclared files,
-  unsafe paths, duplicates, symlinks, encryption and invalid metadata are rejected.
-  HTML resource URLs must be embedded data or declared package files. CSS imports
-  and escaped CSS URLs are rejected; nested resource references inside separate
-  CSS files and Markdown image syntax are not currently inspected.
-  Legacy file `sha256` fields remain in manifests for format compatibility;
-  uploads do not compare them with file payloads. Revision identity is SHA-256
-  of the RFC 8785 canonical manifest. The stored ZIP checksum remains available
-  for legacy ETags. Retrying a revision returns its original immutable package record.
-- `GET /api/v1/chapters/:id/package` streams a legacy ZIP default. Raw-file defaults
-  return 406 and must use the original-file route. ZIP downloads support
-  one byte range, suffix ranges, ETag and If-Range. A mismatching If-Range returns
-  the entire package. Check the received size and package inventory before
-  installing content on the client.
 - Registered devices and console administrators use `DELETE /api/v1/chapters/:id`
   and `POST /api/v1/chapters/:id/restore` to manage shared availability.
   There is no revision selection endpoint. A complete copy is retained until
@@ -151,27 +131,31 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `DELETE /api/v1/admin/works/:id` permanently removes the selected work folder,
   chapters, cover and metadata. It requires a console session. Explicit device
   rescans can republish metadata using `PUT /api/v1/works/:id?restore=true`.
-- `GET /api/v1/changes?catalogAfter=0&waitSeconds=20` returns `{catalogCursor}`.
-  It waits up to 20 seconds for catalog changes. Disabling anonymous reading also
+- `GET /api/v1/changes?catalogAfter=0&workAfter=0&waitSeconds=20` returns
+  `{catalogCursor,workCursor}`. Both cursors are required. It waits up to 20 seconds
+  for catalog or work metadata changes. Disabling anonymous reading also
   protects this endpoint. Fetch catalog pages to consume a hint; persist only
   successfully applied page cursors. Authorization is checked again after waiting.
   A cursor ahead of the visible log returns HTTP 409 and requires cursor recovery.
-  Include `workAfter` to wait for work metadata changes as well. Change polling,
-  work change pages, and catalog lists use the SQLite index without rescanning
+  Change polling, work change pages, and catalog lists use the SQLite index without rescanning
   the content tree. API writes and folder import scans update the index as they
   publish. Direct edits to server files are indexed at startup; opening one work
   refreshes only that work from its authoritative `novel.json` and cover.
 
 Capabilities include `authentication: "device-key"` and `personalStateSync: false`.
-Old account, session, and personal-state endpoints are removed. Existing legacy
-database tables are retained without being used; existing content remains available.
+Account sessions and personal-state endpoints are unsupported. This development
+version supports only the current database and original-file protocol. There are
+no upgrade migrations, ZIP package endpoints, or format conversion paths.
+An incompatible server database fails startup. Stop the server and use a fresh
+state volume, retaining the `contents` mount and installation password, then scan
+current chapter folders. Older formats remain untouched but are not registered.
 
 ## Storage and limits
 
 Original files use the Norea readable directory rules:
-`contents/<plugin>/<work-name>-<work-id-prefix>/<chapter-number>-<chapter-name>/<revision>.files/`.
-Each revision directory contains the original body, media manifest, and media
-archive that were uploaded. Older revisions keep their `<revision>.zip` paths.
+`contents/<plugin>/<work-name>-<work-path>/<chapter-number>-<chapter-name>/`.
+The chapter directory directly contains the original body, media manifest, and
+media archive. SQLite stores one current path per chapter, without revision rows.
 An identity that collides with another chapter's sanitized directory is rejected.
 Uploads stream through a staging directory and are validated before becoming
 visible in SQLite. The catalog metadata stays in SQLite; the uploaded media
@@ -183,9 +167,8 @@ Raw transfers accept at most three files, 64 KiB of metadata JSON, 16 MiB for
 `manifest.json`, 512 MiB for `media.zip`, and 2 GiB for the total original files.
 The media inventory is limited to 10,000 assets, with a 2 GiB total for their
 declared uncompressed sizes plus the original body and media manifest.
-Legacy ZIP limits remain 512 MiB ZIP bytes, 2 GiB expanded bytes, and 10,000 content
-files plus a package `manifest.json` of at most 4 MiB. Tests can supply smaller
-limits through `buildApp`. Ordinary JSON requests are limited to 1 MiB.
+Tests can supply smaller limits through `buildApp`. Ordinary JSON requests are
+limited to 1 MiB.
 
 Deleting a chapter moves its single copy to `trash/` and immediately blocks new
 downloads. Files older than 30 days are purged at server startup. Explicit purge
@@ -225,12 +208,11 @@ To retain an existing host password file, also mount that file at
 `Norea/contents`, not the entire `Norea` directory, so database and staging writes
 stay out of the host content folder and cloud-sync clients.
 
-When replacing an older container, stop it first and copy `metadata.sqlite` and
-any remaining `metadata.sqlite-wal` and `metadata.sqlite-shm` files into the state
-volume. Preserve `trash/` and the installation secret there unless the secret is
-mounted separately. Keep a stopped-server backup until the new container can
-read the existing catalog. Preserve the content bind mount without moving or
-rewriting its files. Back up state and content together while the server is stopped.
+Reuse a state volume only with the exact current schema. For an incompatible
+development build, create a fresh state volume and scan the current content
+folders. Retain the previous volume separately until verification finishes.
+Preserve the content bind mount and installation password without moving or
+rewriting their files. Back up state and content together while the server is stopped.
 
 Content and state may reside on different filesystems. Publication and trash
 moves copy into a temporary sibling of the destination, then rename the complete
@@ -245,8 +227,8 @@ pnpm typecheck
 ```
 
 Tests use real SQLite databases, chapter files, and ZIP archives under `.tmp/`. They cover access
-control, installation-secret persistence, device registration/blocking, immutable
-revisions, Range, corrupt packages, limits, tombstones, catalog long polling,
+control, installation-secret persistence, device registration/blocking, current
+file publication, incomplete media, limits, tombstones, catalog long polling,
 shutdown/disconnect cleanup, byte-identical multipart transfers, and disconnected
 HTTP uploads.
 
@@ -273,8 +255,7 @@ and are visible in the authenticated management console.
 
 The server scans only `<NOREA_DATA_DIR>/contents/`. Configure `NOREA_DATA_DIR`
 at startup; the console cannot add, select, or detach roots. Storage displays
-this path and controls its scan schedule. Legacy connected-root records are no
-longer used. Scans traverse source directories regardless of plugin registration,
+this path and controls its scan schedule. Scans traverse source directories regardless of plugin registration,
 installation, or enabled status.
 They never check the original site or whether it still publishes the work.
 Each work folder must contain valid `novel.json` with its original plugin ID,
@@ -290,9 +271,8 @@ are indexed separately. Metadata-only works can be registered without chapters.
 See [Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1).
 
 Chapter folders follow `<number>-<title>`. Additional hyphens belong to the title.
-The scanner discovers actual `content.html` or `content.pdf` files and complete
-chapter packages. Package manifests retain original chapter paths only when their
-work identity matches `novel.json`. Raw folders use `norea-folder:<number>` as a
+The scanner discovers actual `content.html` or `content.pdf` files. Already indexed
+directories retain their exact chapter identity. New folders use `norea-folder:<number>` as a
 chapter identity within that exact work. Duplicate numbers, conflicting body
 formats, unfinished files, and incomplete media are skipped with reasons in Jobs.
 
@@ -302,18 +282,16 @@ incomplete even when the manifest says `complete`; all referenced media must be
 stored locally. Work covers and `.nomedia` markers are not chapter candidates.
 
 The scanner reads existing work metadata, covers, and chapter files in place.
-It snapshots new or changed chapters into staging, verifies them, and publishes
-immutable packages under `<work>/.packages/<chapter>/<revision>.zip`. Originals
-are not rewritten. Server-created packages are excluded from source discovery
-and change notifications. Symbolic source and package paths are rejected.
-Abandoned importer snapshots are removed from staging at startup.
+It validates new or changed chapters and registers their existing directories.
+There is no copying, repacking, body rewriting, or payload hashing during scans.
+Symbolic paths are rejected. Older ZIP packages and loose media are not converted.
 
 SQLite indexes valid server-owned work files and available chapter packages.
 Startup excludes obsolete inferred work metadata and its chapter index entries,
 while retaining those files on disk. Metadata and cover changes use the work
 cursor independently of chapter packages. Unchanged metadata does not rewrite
-`novel.json`. Source chapter disappearance does not delete a generated package; explicit server
-deletions and tombstones remain authoritative.
+`novel.json`. A chapter that fails validation is unavailable until a later scan or
+completed upload repairs it. Explicit server deletions remain authoritative.
 
 Choose Manual, Periodic, or Changes scanning. Changes uses filesystem events
 with a two-second debounce plus periodic reconciliation. Automatic scanning runs
@@ -329,10 +307,9 @@ Work metadata and cover changes update the work index without rebuilding unchang
 chapter packages. The scan still lists and stats the tree; it does not guarantee
 constant-time discovery or detect byte edits that preserve every recorded stat field.
 
-Registered `.files` revision directories are recognized as unchanged server
-content. Scans do not reimport or repackage them. The existing loose-folder import
-path still builds legacy ZIP revisions from source snapshots; it is separate from
-the original-file upload route, and it leaves those source folders unchanged.
+Uploaded and scanned chapters share the same directory layout and validation.
+Scans refresh changed file inventories and keep original chapter identities for
+known directories. Validation failures do not create deletion tombstones.
 
 `GET /api/v1/admin/storage` returns the fixed path and current scan settings.
 `PATCH /api/v1/admin/storage` accepts only `mode`, `intervalMinutes`, and `enabled`.
@@ -342,13 +319,11 @@ have been removed.
 The server keeps one complete copy per chapter. An upload for a chapter that is
 already complete returns the existing entry without storing another version.
 The app checks the server before copying or sending local files. Missing or
-wrong-sized server files can be repaired by a completed upload. On upgrade,
-historical copies are removed while keeping the complete current copy, or the
-most recent available copy if the current one is missing.
+wrong-sized server files can be repaired by a completed upload.
 
 In Content, each chapter has **Delete** beside **Inspect**. Chapter deletion moves
-its indexed server copy to trash; local device copies and original scan inputs
-remain intact. A new upload after deletion replaces it and removes the trash
+the indexed chapter directory to trash; local device copies remain intact.
+A new upload after deletion replaces it and removes the trash
 copy. Scanning alone does not restore deleted chapters. In the app, select
 chapters and choose **Delete from server**, then use **Rescan local files and
 sync** to upload replacements. Background sync respects deletion records.

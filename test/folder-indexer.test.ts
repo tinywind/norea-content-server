@@ -3,12 +3,13 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { test } from 'node:test';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, statSync, utimesSync, watch } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, statSync, utimesSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { openDatabase } from '../src/db.ts';
-import { defaultLimits, deleteChapter, digest, packageStream } from '../src/packages.ts';
+import { chapterFileStream } from '../src/chapter-files.ts';
+import { completeChapter, defaultLimits, deleteChapter, digest, type CatalogEntry } from '../src/packages.ts';
 import { scanFolder, type FolderIndexItem } from '../src/folder-indexer.ts';
 import { getWork } from '../src/works.ts';
 
@@ -25,18 +26,17 @@ async function fixture() {
   await mkdir('.tmp', { recursive: true });
   const temp = await mkdtemp(resolve('.tmp/folder-index-'));
   const dataDir = join(temp, 'server');
-  const rootPath = dataDir;
-  const directory = join(rootPath, 'contents/example/Book-book/1-First');
+  const directory = join(dataDir, 'contents/example/Book-book/1-First');
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
-  await writeFile(join(directory, 'content.html'), '<p>norea-media://reader-asset/prose</p><img src="norea-media://reader-asset/a.png">');
+  await writeFile(join(directory, 'content.html'), '\ufeff<p>norea-media://reader-asset/prose</p>\r\n<img src="norea-media://reader-asset/a.png">');
   await writeFile(join(directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, updatedAt: 12, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 5, status: 'stored', updatedAt: 12 }] } }));
   await writeFile(join(directory, 'media.zip'), await zip({ 'a.png': 'image' }));
   const db = openDatabase(dataDir);
   const items: FolderIndexItem[] = [];
   const run = (overrides = {}) => scanFolder({ dataDir, db, limits: defaultLimits, onItem: item => { items.push(item); }, ...overrides });
   const close = async () => { db.close(); await rm(temp, { recursive: true, force: true }); };
-  return { temp, rootPath, dataDir, directory, db, items, run, close };
+  return { temp, dataDir, directory, db, items, run, close };
 }
 
 function workMetadata() {
@@ -49,194 +49,171 @@ async function snapshot(root: string): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
-    if (entry.name === '.packages' || entry.name === 'staging' || entry.name.startsWith('metadata.sqlite')) continue;
     if (entry.isDirectory()) Object.assign(result, await snapshot(path));
-    else { const info = await stat(path); result[path] = `${info.size}/${info.mtimeMs}/${digest(await readFile(path))}`; }
+    else { const info = await stat(path); result[path] = `${info.size}/${info.mtimeMs}/${(await readFile(path)).toString('base64')}`; }
   }
   return result;
 }
 
-async function extractPackage(buffer: Buffer): Promise<Record<string, string>> {
-  const archive = await new Promise<yauzl.ZipFile>((accept, reject) => yauzl.fromBuffer(buffer, { lazyEntries: true }, (error, value) => error ? reject(error) : accept(value!)));
-  const files: Record<string, string> = {};
-  await new Promise<void>((accept, reject) => {
-    archive.on('error', reject); archive.on('end', accept);
-    archive.on('entry', entry => { archive.openReadStream(entry, (error, stream) => {
-      if (error) return reject(error);
-      void (async () => { const chunks: Buffer[] = []; for await (const chunk of stream!) chunks.push(chunk); files[entry.fileName] = Buffer.concat(chunks).toString(); archive.readEntry(); })().catch(reject);
-    }); }); archive.readEntry();
-  });
-  return files;
+function stored(f: Awaited<ReturnType<typeof fixture>>): CatalogEntry {
+  return JSON.parse((f.db.prepare('SELECT entry FROM chapters').get() as { entry: string }).entry);
 }
 
-test('indexes a complete chapter, verifies downloadable portable media, and rescans without changes or original writes', async () => {
+async function download(f: Awaited<ReturnType<typeof fixture>>, entry: CatalogEntry, path: string): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of chapterFileStream(f.db, f.dataDir, entry.id, entry.revision, path).open()) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+test('indexes original chapter files in place without rewriting, copying or archiving their bytes', async t => {
   const f = await fixture();
   try {
-    const before = await snapshot(f.rootPath);
-    assert.equal((await f.run()).registered, 2);
-    const id = f.items.find(item => item.status === 'registered' && item.chapterId)!.chapterId!;
-    const chunks: Buffer[] = []; for await (const chunk of packageStream(f.db, f.dataDir, id).open()) chunks.push(chunk);
-    const files = await extractPackage(Buffer.concat(chunks));
-    assert.equal(files['media/a.png'], 'image');
-    assert.match(files['content.html'], /src="media\/a.png"/);
-    assert.match(files['content.html'], /<p>norea-media:\/\/reader-asset\/prose<\/p>/);
-    assert.equal(JSON.parse(files['media-manifest.json']).updatedAt, 0);
+    const before = await snapshot(join(f.dataDir, 'contents'));
+    const reads = t.mock.method(fs, 'createReadStream', () => { throw new Error('Scanner must not read chapter payload streams'); });
+    const writes = t.mock.method(fs, 'createWriteStream', () => { throw new Error('Scanner must not copy chapter files'); });
+    const archives = t.mock.method(ZipFile.prototype, 'addFile', () => { throw new Error('Scanner must not archive chapter files'); });
+    syncBuiltinESMExports();
+    try {
+      assert.equal((await f.run()).registered, 2, JSON.stringify(f.items));
+      assert.equal(reads.mock.callCount(), 0); assert.equal(writes.mock.callCount(), 0); assert.equal(archives.mock.callCount(), 0);
+    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+    const entry = stored(f);
+    const row = f.db.prepare('SELECT path,directory FROM chapters').get() as { path: string; directory: string };
+    assert.equal(row.path, relative(f.dataDir, f.directory)); assert.equal(row.directory, row.path);
+    assert.equal(entry.manifest.layout, 'chapter-files');
+    assert.equal(entry.manifest.identity.chapterPath, 'norea-folder:1');
+    assert.equal(entry.manifest.identity.novelPath, workMetadata().identity.novelPath);
+    for (const file of entry.manifest.files) {
+      assert.deepEqual(await download(f, entry, file.path), await readFile(join(f.directory, file.path)));
+      assert.deepEqual(Object.keys(file).sort(), ['modifiedAt', 'path', 'size']);
+    }
     assert.equal((await f.run()).unchanged, 2);
     assert.equal((f.db.prepare('SELECT count(*) AS n FROM catalog_changes').get() as { n: number }).n, 1);
-    assert.deepEqual(await snapshot(f.rootPath), before);
+    assert.equal(existsSync(join(f.dataDir, 'staging')), false);
+    assert.deepEqual(await snapshot(join(f.dataDir, 'contents')), before);
   } finally { await f.close(); }
 });
 
-test('rejects extra media entries, preserves tombstones, and stops on cancellation', async () => {
+test('rejects extra media entries and retries a repaired archive without a success checkpoint', async () => {
   const f = await fixture();
   try {
-    await writeFile(join(f.directory, 'media.zip'), await zip({ 'a.png': 'image', 'unexpected.png': 'extra' }));
-    assert.equal((await f.run()).registered, 1);
+    for (const bytes of [await zip({ 'a.png': 'image', 'unexpected.png': 'extra' }), Buffer.from('incomplete zip')]) {
+      await writeFile(join(f.directory, 'media.zip'), bytes);
+      assert.equal((await f.run()).skipped, 1);
+      assert.equal(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory), undefined);
+    }
     await writeFile(join(f.directory, 'media.zip'), await zip({ 'a.png': 'image' }));
+    assert.equal((await f.run()).registered, 1);
+    assert.ok(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory));
+    await rm(join(f.directory, 'content.html'));
+    assert.equal((await f.run()).skipped, 1);
+    assert.equal(existsSync(join(f.directory, 'content.html')), false);
+    await writeFile(join(f.directory, 'content.html'), '<p>Repaired body</p>');
+    assert.equal((await f.run()).registered, 1);
+    assert.equal((await download(f, stored(f), 'content.html')).toString(), '<p>Repaired body</p>');
+  } finally { await f.close(); }
+});
+
+test('deleted chapters cannot be reimported by putting their directory back', async () => {
+  const f = await fixture();
+  try {
     await f.run();
-    const id = f.items.find(item => item.status === 'registered' && item.chapterId)!.chapterId!;
-    deleteChapter(f.db, f.dataDir, id);
+    const original = await readFile(join(f.directory, 'content.html'));
+    const entry = stored(f); deleteChapter(f.db, f.dataDir, entry.id);
+    await mkdir(f.directory); await writeFile(join(f.directory, 'content.html'), original);
     assert.equal((await f.run()).registered, 0);
-    assert.ok(f.items.some(item => /deleted/i.test(item.reason ?? '')));
-    const controller = new AbortController(); controller.abort();
-    assert.equal((await f.run({ signal: controller.signal })).cancelled, true);
+    assert.match(f.items.at(-1)!.reason!, /deleted/i);
+    assert.equal(stored(f).deleted, true);
+  } finally { await f.close(); }
+});
+
+test('invalid current files become unavailable and recover without deletion tombstones', async () => {
+  const f = await fixture();
+  try {
+    await f.run(); const first = stored(f);
+    const manifestPath = join(f.directory, 'manifest.json'); const original = await readFile(manifestPath);
+    for (const invalid of ['unfinished', 'manifest']) {
+      if (invalid === 'unfinished') await writeFile(join(f.directory, 'content.html.part'), 'partial');
+      else await writeFile(manifestPath, Buffer.alloc(original.length, 33));
+      assert.equal((await f.run()).skipped, 1);
+      assert.equal(completeChapter(f.db, f.dataDir, first.id), undefined);
+      assert.equal((f.db.prepare('SELECT path FROM chapters WHERE id=?').get(first.id) as { path: string | null }).path, null);
+      assert.throws(() => chapterFileStream(f.db, f.dataDir, first.id, stored(f).revision, 'content.html'), /unavailable/);
+      assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapter_tombstones').get() as { n: number }).n, 0);
+      assert.equal(stored(f).deleted, false);
+      if (invalid === 'unfinished') await rm(join(f.directory, 'content.html.part'));
+      else await writeFile(manifestPath, original);
+      assert.equal((await f.run()).registered, 1);
+      assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+      assert.deepEqual(await download(f, stored(f), 'manifest.json'), original);
+    }
   } finally { await f.close(); }
 });
 
 test('rejects symlink storage roots and media traversal names', async () => {
   const f = await fixture();
   try {
-    const alias = join(f.temp, 'alias'); await symlink(f.rootPath, alias, 'junction');
+    const alias = join(f.temp, 'alias'); await symlink(f.dataDir, alias, 'junction');
     await assert.rejects(f.run({ dataDir: alias }), /symbolic|symlink/i);
     await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ fileName: '../a.png', path: 'media/../a.png', bytes: 5, status: 'stored' }] } }));
+    assert.equal((await f.run()).skipped, 1);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+test('cancels between items without creating staging files or changing source files', async () => {
+  const f = await fixture();
+  try {
+    const before = await snapshot(join(f.dataDir, 'contents'));
+    const controller = new AbortController();
+    const result = await f.run({ signal: controller.signal, onItem: () => { controller.abort(); } });
+    assert.equal(result.cancelled, true); assert.equal(result.registered, 1); assert.equal(result.scanned, 1);
+    assert.equal(existsSync(join(f.dataDir, 'staging')), false);
+    assert.deepEqual(await snapshot(join(f.dataDir, 'contents')), before);
+    assert.equal((await f.run({ signal: controller.signal })).scanned, 0);
+  } finally { await f.close(); }
+});
+
+test('source changes during media validation are skipped and retried on the next scan', async t => {
+  const f = await fixture();
+  try {
+    const originalOpen = yauzl.open;
+    const body = join(f.directory, 'content.html');
+    t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => {
+      const info = statSync(body); utimesSync(body, info.atime, new Date(info.mtimeMs + 1000));
+      return originalOpen(...args);
+    });
+    assert.equal((await f.run()).skipped, 1);
+    assert.match(f.items.at(-1)!.reason!, /changed during indexing/);
+    assert.equal(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory), undefined);
+    t.mock.restoreAll();
     assert.equal((await f.run()).registered, 1);
   } finally { await f.close(); }
 });
-
-test('converts only asset attributes and preserves quoted greater-than characters and prose', async () => {
-  const f = await fixture();
-  try {
-    await writeFile(join(f.directory, 'content.html'), '<img title="1 > 0" src="norea-media://reader-asset/a.png"><div style="background:url(\'norea-media://reader-asset/a.png\')">body</div><!-- <img src="norea-media://reader-asset/comment"> -->');
-    assert.equal((await f.run()).registered, 2, JSON.stringify(f.items));
-    const id = f.items.find(item => item.status === 'registered' && item.chapterId)!.chapterId!;
-    const chunks: Buffer[] = []; for await (const chunk of packageStream(f.db, f.dataDir, id).open()) chunks.push(chunk);
-    const files = await extractPackage(Buffer.concat(chunks));
-    assert.match(files['content.html'], /title="1 > 0" src="media\/a.png"/);
-    assert.match(files['content.html'], /url\('media\/a.png'\)/);
-    assert.match(files['content.html'], /reader-asset\/comment/);
-  } finally { await f.close(); }
-});
-
-test('cancels between chapter operations and removes only owned server staging files', async () => {
-  const f = await fixture();
-  try {
-    await mkdir(join(f.rootPath, 'contents/example/Book-book/2-Second'));
-    const before = await snapshot(f.rootPath);
-    const controller = new AbortController();
-    const result = await f.run({ signal: controller.signal, onItem: (item: FolderIndexItem) => { f.items.push(item); controller.abort(); } });
-    assert.equal(result.cancelled, true);
-    assert.equal(result.registered, 1);
-    assert.equal(result.scanned, 1);
-    assert.deepEqual(await readdir(join(f.dataDir, 'staging')), []);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
-test('rejects a staging symlink before any writes can reach the original root', async () => {
-  const f = await fixture();
-  try {
-    const before = await snapshot(f.rootPath);
-    await symlink(f.rootPath, join(f.dataDir, 'staging'), 'junction');
-    await assert.rejects(f.run(), /symbolic|symlink/i);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
-test('retries one changed snapshot and still rejects a source that changes on both attempts', async () => {
-  for (const keepChanging of [false, true]) {
-    const f = await fixture();
-    let watcher: ReturnType<typeof watch> | undefined;
-    try {
-      const body = join(f.directory, 'content.html');
-      await writeFile(body, `<p>${'chapter '.repeat(1024 * 1024)}</p>`);
-      let changes = 0;
-      watcher = watch(f.dataDir, { recursive: true }, (event, name) => {
-        if (event !== 'rename' || !name || !name.toString().replaceAll('\\', '/').endsWith('/source/content.html') || !existsSync(join(f.dataDir, name.toString())) || (!keepChanging && changes > 0)) return;
-        const info = statSync(body); utimesSync(body, info.atime, new Date(info.mtimeMs + 1000)); changes++;
-      });
-      const result = await f.run();
-      assert.ok(changes >= (keepChanging ? 2 : 1), `Observed source changes: ${changes}`);
-      assert.equal(result.registered, keepChanging ? 1 : 2, JSON.stringify(f.items));
-      if (keepChanging) assert.match(f.items.at(-1)!.reason!, /changed during snapshot/i);
-      assert.deepEqual(await readdir(join(f.dataDir, 'staging')), []);
-    } finally { watcher?.close(); await f.close(); }
-  }
-});
-
-test('media manifest key order does not create another revision for the same content', async () => {
-  const f = await fixture();
-  try {
-    assert.equal((await f.run()).registered, 2);
-    const original = f.items.find(item => item.status === 'registered' && item.chapterId)!;
-    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ media: { files: [{ updatedAt: 99, status: 'stored', bytes: 5, path: 'media/a.png', fileName: 'a.png' }] }, updatedAt: 99, complete: true, version: 1 }));
-    const result = await f.run();
-    assert.equal(result.unchanged, 2, JSON.stringify(f.items));
-    assert.equal(f.items.at(-1)!.revision, original.revision);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM revisions').get() as { n: number }).n, 1);
-    const chunks: Buffer[] = []; for await (const chunk of packageStream(f.db, f.dataDir, original.chapterId!).open()) chunks.push(chunk);
-    const files = await extractPackage(Buffer.concat(chunks));
-    assert.equal(files['media-manifest.json'], '{"complete":true,"media":{"files":[{"bytes":5,"fileName":"a.png","path":"media/a.png","status":"stored","updatedAt":0}]},"updatedAt":0,"version":1}');
-  } finally { await f.close(); }
-});
-
-
-test('requires metadata-only novel.json and discovers chapters without guessed work identities', async () => {
-  const f = await fixture();
-  try {
-    await rm(join(f.directory, '..', 'novel.json'));
-    const noMetadata = await f.run();
-    assert.equal(noMetadata.registered, 0);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 0);
-    const value = workMetadata();
-    const portable = value;
-    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(portable));
-    const before = await snapshot(f.rootPath);
-    const result = await f.run();
-    assert.equal(result.registered, 2, JSON.stringify(f.items));
-    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', portable.identity.novelPath])));
-    assert.deepEqual(work.metadata, portable);
-    const chapter = JSON.parse((f.db.prepare('SELECT entry FROM chapters').get() as { entry: string }).entry);
-    assert.equal(chapter.manifest.identity.chapterPath, 'norea-folder:1');
-    assert.equal(chapter.manifest.identity.novelPath, portable.identity.novelPath);
-    assert.deepEqual(await snapshot(f.rootPath), before);
-  } finally { await f.close(); }
-});
-
 
 test('metadata-only works and covers import without source requests or chapter files', async t => {
   const network = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected source request'); });
   const f = await fixture();
   try {
-    await rm(f.directory, { recursive: true });
-    await writeFile(join(f.directory, '..', 'cover.png'), 'cover bytes');
-    const before = await snapshot(f.rootPath);
+    await rm(f.directory, { recursive: true }); await writeFile(join(f.directory, '..', 'cover.png'), 'cover bytes');
+    const before = await snapshot(join(f.dataDir, 'contents'));
     assert.equal((await f.run()).registered, 1);
     const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', workMetadata().identity.novelPath])));
     assert.equal(work.hasCover, true); assert.deepEqual(work.metadata, workMetadata());
-    assert.equal((await f.run()).unchanged, 1);
-    assert.equal(network.mock.callCount(), 0); assert.deepEqual(await snapshot(f.rootPath), before);
+    assert.equal((await f.run()).unchanged, 1); assert.equal(network.mock.callCount(), 0);
+    assert.deepEqual(await snapshot(join(f.dataDir, 'contents')), before);
   } finally { await f.close(); }
 });
 
-test('missing or invalid work metadata never falls back to covers, databases, or folder names', async () => {
+test('missing or invalid work metadata never infers identities from folders or old files', async () => {
   const f = await fixture();
   try {
     await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify({ version: 1, sourceId: 'example', novelPath: '/book', fileName: 'cover.png' }));
-    await writeFile(join(f.rootPath, 'norea.sqlite'), 'Old database is not read');
+    await writeFile(join(f.dataDir, 'norea.sqlite'), 'Old database is not read');
     for (const value of [null, '{broken', { ...workMetadata(), identity: { pluginId: 'example', novelPath: 'norea-folder:Book' } }, { ...workMetadata(), chapters: [] }]) {
       const file = join(f.directory, '..', 'novel.json');
       if (value === null) await rm(file); else await writeFile(file, typeof value === 'string' ? value : JSON.stringify(value));
-      const result = await f.run(); assert.equal(result.registered, 0);
+      assert.equal((await f.run()).registered, 0);
       assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 0);
       assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
     }
@@ -265,6 +242,21 @@ test('remote media and ambiguous body formats are skipped without losing work me
   } finally { await f.close(); }
 });
 
+test('a newly duplicated number disables a previously indexed folder until resolved', async () => {
+  const f = await fixture();
+  try {
+    await f.run();
+    const first = stored(f);
+    const duplicate = join(f.directory, '..', '1-Duplicate');
+    await cp(f.directory, duplicate, { recursive: true });
+    assert.equal((await f.run()).skipped, 2);
+    assert.equal(completeChapter(f.db, f.dataDir, first.id), undefined);
+    await rm(duplicate, { recursive: true });
+    assert.equal((await f.run()).registered, 1);
+    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+  } finally { await f.close(); }
+});
+
 test('text-only and PDF folders need no media manifest and preserve title hyphens', async () => {
   const f = await fixture();
   try {
@@ -272,155 +264,93 @@ test('text-only and PDF folders need no media manifest and preserve title hyphen
     for (const [name, body] of [['2-Title-with-hyphens', 'content.html'], ['10-Tenth', 'content.pdf']]) {
       const directory = join(f.directory, '..', name); await mkdir(directory); await writeFile(join(directory, body), body === 'content.pdf' ? '%PDF-1.4\n%%EOF' : '<p>Text</p>');
     }
-    const result = await f.run(); assert.equal(result.registered, 3, JSON.stringify(f.items));
+    assert.equal((await f.run()).registered, 3, JSON.stringify(f.items));
     const chapters = (f.db.prepare("SELECT entry FROM chapters ORDER BY json_extract(entry,'$.manifest.chapter.position')").all() as { entry: string }[]).map(row => JSON.parse(row.entry).manifest);
     assert.deepEqual(chapters.map(value => [value.chapter.name, value.chapter.chapterNumber, value.chapter.contentType]), [['Title-with-hyphens', '2', 'html'], ['Tenth', '10', 'pdf']]);
   } finally { await f.close(); }
 });
 
-test('package manifests retain exact chapter paths only when their work matches novel.json', async () => {
-  for (const novelPath of [workMetadata().identity.novelPath, '/wrong']) {
+test('outer chapter ZIPs and extracted media directories are unsupported', async () => {
+  for (const input of ['package.zip', 'media-directory', 'chapter.html']) {
     const f = await fixture();
     try {
-      await rm(f.directory, { recursive: true }); await mkdir(f.directory);
-      const body = '<p>Saved package</p>';
-      const manifest = { packageVersion: 1, identity: { pluginId: 'example', novelPath, chapterPath: '/original/chapter?number=1' }, novel: { name: 'Portable Book', isLocal: false }, chapter: { name: 'Original title', chapterNumber: '1', position: 1, page: '3', contentType: 'html' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: Buffer.byteLength(body), sha256: digest(body) }] };
-      await writeFile(join(f.directory, 'package.zip'), await zip({ 'manifest.json': JSON.stringify(manifest), 'content.html': body }));
-      const result = await f.run();
-      assert.equal(result.registered, novelPath === workMetadata().identity.novelPath ? 2 : 1);
-      const row = f.db.prepare('SELECT entry FROM chapters').get() as { entry: string } | undefined;
-      if (row) assert.deepEqual(JSON.parse(row.entry).manifest.identity, manifest.identity);
-      else assert.match(f.items.at(-1)!.reason!, /work identity differs/);
+      if (input === 'media-directory') { await rm(join(f.directory, 'media.zip')); await mkdir(join(f.directory, 'media')); await writeFile(join(f.directory, 'media', 'a.png'), 'image'); }
+      else { await rm(f.directory, { recursive: true }); await mkdir(f.directory); await writeFile(join(f.directory, input), input.endsWith('.zip') ? await zip({ 'content.html': '<p>Archived</p>' }) : '<p>Old body</p>'); }
+      const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.skipped, 1);
+      assert.match(f.items.at(-1)!.reason!, /Unsupported chapter file/);
+      assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
     } finally { await f.close(); }
   }
 });
 
-
-test('persistent checkpoints avoid reading and repacking unchanged payloads after restart', async t => {
+test('persistent checkpoints avoid reading unchanged payloads and archives after restart', async t => {
   const f = await fixture();
   try {
-    await f.run();
-    f.db.close();
-    const db = openDatabase(f.dataDir);
+    await f.run(); f.db.close(); const db = openDatabase(f.dataDir);
     try {
-      const reads = t.mock.method(fs, 'createReadStream', () => { throw new Error('Unchanged files must not be read'); });
+      const reads = t.mock.method(fs, 'createReadStream', () => { throw new Error('Unchanged payloads must not be read'); });
       const archives = t.mock.method(yauzl, 'open', () => { throw new Error('Unchanged archives must not be opened'); });
-      const packaging = t.mock.method(ZipFile.prototype, 'addFile', () => { throw new Error('Unchanged chapters must not be repacked'); });
       syncBuiltinESMExports();
       try {
         const result = await scanFolder({ dataDir: f.dataDir, db, limits: defaultLimits });
         assert.equal(result.unchanged, 2); assert.equal(result.skipped, 0); assert.equal(result.failed, 0);
-        assert.equal(reads.mock.callCount(), 0); assert.equal(archives.mock.callCount(), 0); assert.equal(packaging.mock.callCount(), 0);
+        assert.equal(reads.mock.callCount(), 0); assert.equal(archives.mock.callCount(), 0);
       } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
     } finally { db.close(); }
   } finally { await rm(f.temp, { recursive: true, force: true }); }
 });
 
-test('incremental scans discover new works and chapters and reprocess only changed chapters', async t => {
+test('incremental scans discover new entries and refresh only the changed current chapter', async t => {
   const f = await fixture();
   try {
-    await f.run(); f.items.length = 0;
+    await f.run(); const first = stored(f);
     const second = join(f.directory, '..', '0-New'); await mkdir(second); await writeFile(join(second, 'content.html'), '<p>New</p>');
     const newWork = join(f.dataDir, 'contents/example/Another'); await mkdir(newWork);
     await writeFile(join(newWork, 'novel.json'), JSON.stringify({ ...workMetadata(), identity: { pluginId: 'example', novelPath: '/another' } }));
-    const originalRead = fs.createReadStream;
-    const reads = t.mock.method(fs, 'createReadStream', (...args: Parameters<typeof fs.createReadStream>) => originalRead(...args));
-    syncBuiltinESMExports();
-    try {
-      const result = await f.run();
-      assert.equal(result.registered, 2); assert.equal(result.unchanged, 2);
-      assert.ok(reads.mock.calls.every(call => !String(call.arguments[0]).startsWith(f.directory)));
-      await writeFile(join(f.directory, 'content.html'), '<p>Changed body</p>');
-      reads.mock.resetCalls(); f.items.length = 0;
-      const changed = await f.run(); assert.equal(changed.registered, 0); assert.equal(changed.unchanged, 4);
-      assert.ok(reads.mock.calls.some(call => String(call.arguments[0]) === join(f.directory, 'content.html')));
-      assert.ok(reads.mock.calls.every(call => !String(call.arguments[0]).startsWith(second)));
-      const changedItem = f.items.find(item => item.path === f.directory && item.chapterId)!;
-      const chunks: Buffer[] = []; for await (const chunk of packageStream(f.db, f.dataDir, changedItem.chapterId!).open()) chunks.push(chunk);
-      assert.match((await extractPackage(Buffer.concat(chunks)))['content.html'], /reader-asset\/prose/);
-      const current = packageStream(f.db, f.dataDir, changedItem.chapterId!).catalog;
-      assert.equal(current.revision, changedItem.revision);
-      await writeFile(join(f.directory, 'content.html'), '<p>norea-media://reader-asset/prose</p><img src="norea-media://reader-asset/a.png">');
-      assert.equal((await f.run()).registered, 0);
-      const reverted = packageStream(f.db, f.dataDir, changedItem.chapterId!);
-      const restored: Buffer[] = []; for await (const chunk of reverted.open()) restored.push(chunk);
-      assert.match((await extractPackage(Buffer.concat(restored)))['content.html'], /reader-asset\/prose/);
-      assert.equal(reverted.catalog.sequence, current.sequence);
-      assert.equal((f.db.prepare('SELECT COUNT(*) AS count FROM revisions WHERE chapter_id=?').get(changedItem.chapterId!) as { count: number }).count, 1);
-    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+    const originalOpen = yauzl.open;
+    const archives = t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => originalOpen(...args));
+    const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.unchanged, 2); assert.equal(archives.mock.callCount(), 0);
+    await writeFile(join(f.directory, 'content.html'), '<p>Changed body</p>');
+    const changed = await f.run(); assert.equal(changed.registered, 1); assert.equal(changed.unchanged, 3); assert.equal(archives.mock.callCount(), 1);
+    const current = JSON.parse((f.db.prepare('SELECT entry FROM chapters WHERE id=?').get(first.id) as { entry: string }).entry) as CatalogEntry;
+    assert.notEqual(current.revision, first.revision);
+    assert.equal((await download(f, current, 'content.html')).toString(), '<p>Changed body</p>');
+    assert.throws(() => chapterFileStream(f.db, f.dataDir, first.id, first.revision, 'content.html'), /copy not found/);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters WHERE id=?').get(first.id) as { n: number }).n, 1);
   } finally { await f.close(); }
 });
 
-test('failed sources have no success checkpoint and retry after repair', async () => {
+test('work metadata and cover changes leave unchanged chapter payloads unopened', async t => {
   const f = await fixture();
   try {
-    await writeFile(join(f.directory, 'media.zip'), 'incomplete zip');
-    assert.equal((await f.run()).skipped, 1);
-    assert.equal(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory), undefined);
-    assert.equal((await f.run()).skipped, 1);
-    await writeFile(join(f.directory, 'media.zip'), await zip({ 'a.png': 'image' }));
+    await f.run(); const metadata = workMetadata(); metadata.novel.name = 'Updated title';
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(metadata)); await writeFile(join(f.directory, '..', 'cover.png'), 'updated cover');
+    const archives = t.mock.method(yauzl, 'open', () => { throw new Error('Unchanged archive must not be opened'); });
+    const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.unchanged, 1); assert.equal(archives.mock.callCount(), 0);
+    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', metadata.identity.novelPath])));
+    assert.equal(work.metadata.novel.name, 'Updated title'); assert.equal(work.hasCover, true);
+  } finally { await f.close(); }
+});
+
+test('same-size source changes refresh the current token even when the modification millisecond is preserved', async () => {
+  const f = await fixture();
+  try {
+    const path = join(f.directory, 'content.html'); utimesSync(path, 1700000000, 1700000000);
+    await f.run(); const first = stored(f); const info = await stat(path);
+    await writeFile(path, Buffer.alloc(info.size, 65)); utimesSync(path, 1700000000, 1700000000);
     assert.equal((await f.run()).registered, 1);
-    assert.ok(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory));
-    const revision = f.db.prepare('SELECT path FROM revisions').get() as { path: string };
-    await rm(join(f.dataDir, revision.path));
-    assert.equal((await f.run()).failed, 0);
-    assert.ok(existsSync(join(f.dataDir, revision.path)));
+    const current = stored(f);
+    assert.deepEqual(current.manifest.files, first.manifest.files);
+    assert.notEqual(current.revision, first.revision);
+    assert.deepEqual(await download(f, current, 'content.html'), Buffer.alloc(info.size, 65));
   } finally { await f.close(); }
 });
 
-test('scanner packages stay separate and chapter deletion preserves original files', async () => {
+test('current chapter directory lookups use an index for large filesystem inventories', async () => {
   const f = await fixture();
   try {
-    const before = await snapshot(f.rootPath); await f.run();
-    const chapter = f.db.prepare('SELECT id,directory FROM chapters').get() as { id: string; directory: string };
-    assert.ok(chapter.directory.split(/[\\/]/).includes('.packages'));
-    assert.deepEqual(await snapshot(f.rootPath), before);
-    const adjacentOriginal = join(f.dataDir, chapter.directory, 'content.html');
-    await writeFile(adjacentOriginal, 'Original beside a server revision');
-    deleteChapter(f.db, f.dataDir, chapter.id);
-    assert.equal(await readFile(adjacentOriginal, 'utf8'), 'Original beside a server revision');
-    assert.equal(await readFile(join(f.directory, 'content.html'), 'utf8'), '<p>norea-media://reader-asset/prose</p><img src="norea-media://reader-asset/a.png">');
-    assert.equal((await f.run()).registered, 0);
-    assert.ok(f.items.some(item => /deleted/.test(item.reason ?? '')));
-  } finally { await f.close(); }
-});
-
-test('a symbolic generated-package directory cannot redirect scanner writes', async () => {
-  const f = await fixture();
-  try {
-    const outside = join(f.temp, 'outside'); await mkdir(outside);
-    await symlink(outside, join(f.directory, '..', '.packages'), 'junction');
-    const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.skipped, 1);
-    assert.deepEqual(await readdir(outside), []);
-  } finally { await f.close(); }
-});
-
-
-test('work metadata and cover changes do not reread unchanged chapter payloads', async t => {
-  const f = await fixture();
-  try {
-    await f.run();
-    const metadata = workMetadata(); metadata.novel.name = 'Updated title';
-    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(metadata));
-    await writeFile(join(f.directory, '..', 'cover.png'), 'updated cover');
-    const originalRead = fs.createReadStream;
-    const reads = t.mock.method(fs, 'createReadStream', (...args: Parameters<typeof fs.createReadStream>) => originalRead(...args));
-    syncBuiltinESMExports();
-    try {
-      const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.unchanged, 1);
-      assert.ok(reads.mock.calls.every(call => !String(call.arguments[0]).startsWith(f.directory)));
-      const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', metadata.identity.novelPath])));
-      assert.equal(work.metadata.novel.name, 'Updated title'); assert.equal(work.hasCover, true);
-    } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
-  } finally { await f.close(); }
-});
-
-
-test('revision path lookups use an index for large filesystem inventories', async () => {
-  const f = await fixture();
-  try {
-    const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT chapter_id,revision FROM revisions WHERE path=?').all('contents/example/work/chapter/revision.zip') as { detail: string }[];
-    assert.ok(plan.some(row => /USING INDEX revisions_path/.test(row.detail)), JSON.stringify(plan));
-    assert.ok(plan.every(row => !/SCAN revisions/.test(row.detail)));
+    const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT entry FROM chapters WHERE directory=?').all('contents/example/work/1-First') as { detail: string }[];
+    assert.ok(plan.some(row => /USING INDEX sqlite_autoindex_chapters_/.test(row.detail)), JSON.stringify(plan));
+    assert.ok(plan.every(row => !/SCAN chapters/.test(row.detail)));
   } finally { await f.close(); }
 });

@@ -1,18 +1,17 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { DatabaseSync } from 'node:sqlite';
+import { openDatabase } from '../src/db.ts';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { createServer } from 'node:http';
-import { initializePluginRegistry, listPlugins, registerPlugin, removePlugin, setPluginEnabled, enabledSources } from '../src/plugin-registry.ts';
+import { listPlugins, registerPlugin, removePlugin, setPluginEnabled, enabledSources } from '../src/plugin-registry.ts';
 
 const source = (id: string, installMode = 'single') => ({ id, name: id, lang: 'en', version: '1.0.0', apiVersion: '0.2', url: `https://example.com/${id}.js`, iconUrl: '', installMode });
 
 async function setup() {
   await mkdir('.tmp', { recursive: true });
   const directory = await mkdtemp(resolve('.tmp', 'registry-'));
-  const db = new DatabaseSync(join(directory, 'test.sqlite'));
-  initializePluginRegistry(db);
+  const db = openDatabase(directory);
   const index = async (name: string, value: unknown) => { const path = join(directory, name); await writeFile(path, JSON.stringify(value)); return path; };
   return { db, directory, index, close: async () => { db.close(); await rm(directory, { recursive: true }); } };
 }
@@ -30,8 +29,7 @@ test('registers several actual repository indexes, reloads stable identities and
     assert.equal(updated.id, first.id);
     assert.equal(updated.name, 'Public sources');
     setPluginEnabled(context.db, first.id, false);
-    const reopened = new DatabaseSync(join(context.directory, 'test.sqlite'));
-    initializePluginRegistry(reopened);
+    const reopened = openDatabase(context.directory);
     assert.deepEqual(enabledSources(reopened).map(item => item.id), ['komga']);
     reopened.close();
     assert.equal(removePlugin(context.db, first.id), true);

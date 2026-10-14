@@ -65,7 +65,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const rows = db.prepare(`SELECT w.id,json_extract(w.entry,'$.sequence') AS sequence,
       json_extract(w.entry,'$.metadata.identity') AS identity,json_extract(w.entry,'$.metadata.novel') AS novel,
       json_extract(w.entry,'$.hasCover') AS hasCover,
-      (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL) AS chapterCount
+      (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS chapterCount
       FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, limit, offset) as { id: string; sequence: number; identity: string; novel: string; hasCover: number; chapterCount: number }[];
     const items: WorkSummary[] = rows.map(row => ({ ...row, identity: JSON.parse(row.identity), novel: JSON.parse(row.novel), hasCover: Boolean(row.hasCover) }));
     return { items, total, hasMore: offset + items.length < total };
@@ -88,11 +88,11 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     requireRead(request);
     const { id } = request.params; const { offset, limit } = request.query;
     if (!db.prepare('SELECT 1 FROM works WHERE id=?').get(id) && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
-    const total = (db.prepare('SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL').get(id) as { n: number }).n;
+    const total = (db.prepare('SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL').get(id) as { n: number }).n;
     const items = db.prepare(`SELECT id,json_extract(entry,'$.manifest.identity.chapterPath') AS chapterPath,
       json_extract(entry,'$.manifest.chapter.position') AS position,json_extract(entry,'$.manifest.chapter.name') AS name,
       json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType
-      FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
+      FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
     return { items, total, hasMore: offset + items.length < total };
   });
   app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string; includeUnavailable?: boolean } }>('/api/v1/catalog/chapter', { schema: {
@@ -114,7 +114,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     }
     if (!chapterNumber) throw problem(404, 'Chapter not found');
     const work = digest(JSON.stringify([pluginId, novelPath]));
-    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL").all(work, chapterNumber) as { entry: string }[];
+    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR path IS NOT NULL)").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
     if (!matches.length) throw problem(404, 'Chapter not found');
     if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
     if (request.query.includeUnavailable) return JSON.parse(matches[0].entry) as CatalogEntry;

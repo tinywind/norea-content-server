@@ -6,8 +6,8 @@
 Goal: run a real local content server and synchronize complete Norea chapters and
 content with the connected S25, preserving local reading state and folder names.
 
-Architecture: a Fastify REST server stores metadata in SQLite and immutable ZIP
-revisions in readable chapter folders. Norea maps its local IDs to plugin/path
+Architecture: a Fastify REST server stores metadata in SQLite and original files
+in readable chapter folders. Norea maps its local IDs to plugin/path
 identities, delegates file transfer to native code, and keeps sync independent of
 the reader. The protocol below is the shared implementation contract.
 
@@ -15,7 +15,7 @@ Tech stack: TypeScript, Fastify, REST/OpenAPI, SQLite, existing Tauri/Rust/Andro
 Spec: [design.md](design.md).
 
 Status: the original implementation has been followed by account-free device access.
-The current authentication contract and migration scope are recorded in
+The current authentication contract and development schema policy are recorded in
 [device-access-plan.md](device-access-plan.md).
 Its integration results are in [verification-2026-10-12.md](verification-2026-10-12.md).
 See [verification-2026-10-11.md](verification-2026-10-11.md) for executed checks
@@ -42,13 +42,12 @@ A PackageManifest is:
 ```typescript
 interface PackageManifest {
   packageVersion: 1;
-  layout?: "chapter-files";
+  layout: "chapter-files";
   identity: { pluginId: string; novelPath: string; chapterPath: string };
   novel: { name: string; author?: string | null; summary?: string | null; isLocal: boolean };
   chapter: { name: string; position: number; chapterNumber?: string | null; contentType: "html" | "text" | "markdown" | "pdf"; page: string };
   bodyPath: string;
-  files: ({ path: string; size: number } &
-    ({ modifiedAt: number; sha256?: never } | { sha256: string; modifiedAt?: never }))[];
+  files: { path: string; size: number; modifiedAt: number }[];
 }
 ```
 
@@ -60,12 +59,9 @@ body (`content.html` or `content.pdf`), optional `manifest.json`, and optional
 all file bytes and media references. Media must be complete; validate archive
 central-directory names and sizes without extracting assets or checking CRCs.
 
-Legacy ZIP manifests omit `layout` and retain file `sha256` fields. Their package
-`manifest.json` is the envelope and is not listed in files. Other entries are the
-body, optional `media-manifest.json`, and expanded assets under `media/`. Legacy
-transfers restore local media references on import. File SHA-256 comparisons are
-removed from both transfer formats. Check declared sizes, complete receive, and
-inventory before publication or installation.
+Only the current original-file format is supported. Check declared sizes,
+complete receive, and inventory before publication or installation. Do not retain
+outer ZIP transfers, previous manifest readers, or file payload hashes.
 
 Hash the RFC 8785 canonical JSON metadata manifest for revision identity. Files
 are sorted by path. Modification times distinguish same-size changes to original
@@ -82,21 +78,18 @@ Endpoints (all under `/api/v1`):
 - `GET /admin/devices` -> `{items:[{id,deviceName,createdAt,lastSeenAt,blocked}]}`.
 - `PATCH /admin/devices/:id` `{blocked:boolean}`: console-only access control.
 - `GET /chapters?after=<integer>&limit=<1..100>` -> `{items:CatalogEntry[],cursor,hasMore}`.
-- `POST /packages`: raw ZIP with device bearer key -> CatalogEntry.
-- `GET /chapters/:id/package`: current ZIP, ETag, Content-Length, Range.
 - `POST /chapter-files`: original files as multipart with device bearer key -> CatalogEntry.
 - `GET /chapters/:id/files?revision=...&path=...`: original bytes, Content-Length,
   and an ETag containing the quoted revision, a colon, and original path.
 - `DELETE /chapters/:id`: device or console tombstone and trash.
 - `POST /chapters/:id/restore`: explicit device or console restoration.
-- `POST /chapters/:id/revision` `{revision}`: console-only default selection.
-- `POST /chapters/:id/purge`: console-only permanent removal of deleted ZIPs.
-- `GET /changes?catalogAfter=0&waitSeconds=20` -> `{catalogCursor}`.
+- `POST /chapters/:id/purge`: console-only permanent removal of deleted files.
+- `GET /changes?catalogAfter=0&workAfter=0&waitSeconds=20` -> `{catalogCursor,workCursor}`.
 
-CatalogEntry is `{id,revision,zipSha256?,zipBytes?,fileBytes?,manifest,deleted,sequence}`.
-Original-file records use `fileBytes`; legacy ZIP records retain `zipSha256` and
-`zipBytes`. Previously published original-file descriptors with `sha256` remain
-readable; new original-file uploads require `modifiedAt`.
+CatalogEntry is `{id,revision,fileBytes,manifest,deleted,sequence}`.
+`revision` identifies the current copy during a download; it is not version history.
+There are no database upgrades or conversions from previous formats. Server
+schema mismatch requires a fresh state volume. The app resets a mismatched schema.
 Catalog pages include tombstones to suppress stale reuploads. Account, old session,
 and personal-state routes are removed. Device keys are random 32-byte hex values;
 servers persist only their hashes. Local reading records never enter the protocol.

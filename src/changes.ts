@@ -21,7 +21,7 @@ export function createChangeNotifications(db: DatabaseSync) {
       closed = true;
       for (const waiter of pending) waiter.stop();
     },
-    wait(after: { catalogCursor: number; workCursor?: number }, waitSeconds: number, response: ServerResponse): Promise<void> {
+    wait(after: ChangeCursors, waitSeconds: number, response: ServerResponse): Promise<void> {
       if (closed) return Promise.reject(problem(503, 'Server is shutting down'));
       return new Promise((resolve, reject) => {
         const finish = (error?: Error) => {
@@ -35,7 +35,7 @@ export function createChangeNotifications(db: DatabaseSync) {
           check: () => {
             try {
               const current = readChangeCursors(db);
-              if (current.catalogCursor > after.catalogCursor || (after.workCursor !== undefined && current.workCursor > after.workCursor)) finish();
+              if (current.catalogCursor > after.catalogCursor || current.workCursor > after.workCursor) finish();
             } catch (error) { finish(error as Error); }
           },
           stop: () => finish(problem(503, 'Server is shutting down')),

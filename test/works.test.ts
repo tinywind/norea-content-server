@@ -45,7 +45,7 @@ test('admin work deletion removes the whole folder and DB rows while preserving 
     assert.equal(response.statusCode, 200, response.body);
     await assert.rejects(readdir(join(f.dataDir, directory)), /ENOENT/);
     assert.equal(await readFile(join(sibling, 'keep.txt'), 'utf8'), 'Other work');
-    for (const table of ['works', 'chapters', 'revisions']) assert.equal((db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n, 0);
+    for (const table of ['works', 'chapters']) assert.equal((db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n, 0);
     assert.equal((await f.app.inject({ url: '/api/v1/catalog/works', headers: f.headers })).json().total, 0);
     const history = (await f.app.inject({ url: '/api/v1/works', headers: f.headers })).json().items;
     assert.equal(history.length, 1);
@@ -152,7 +152,7 @@ test('work change waits wake on metadata writes and reject cursors ahead of the 
     const write = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
     const result = await waiting;
     assert.equal(result.statusCode, 200); assert.equal(result.json().workCursor, write.json().sequence);
-    assert.equal((await f.app.inject({ url: `/api/v1/changes?workAfter=${write.json().sequence + 1}&waitSeconds=0`, headers: f.headers })).statusCode, 409);
+    assert.equal((await f.app.inject({ url: `/api/v1/changes?catalogAfter=0&workAfter=${write.json().sequence + 1}&waitSeconds=0`, headers: f.headers })).statusCode, 409);
   } finally { await f.close(); }
 });
 
@@ -187,13 +187,13 @@ test('catalog pages and change hints read the index without rescanning authorita
     const source = join(f.dataDir, 'contents/example'); const [folder] = await readdir(source); const file = join(source, folder, 'novel.json');
     const updated = { ...metadata(), novel: { ...metadata().novel, name: 'File edited now' } };
     await writeFile(file, JSON.stringify(updated));
-    const changes = (await f.app.inject({ url: `/api/v1/changes?workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json();
+    const changes = (await f.app.inject({ url: `/api/v1/changes?catalogAfter=0&workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json();
     assert.equal(changes.workCursor, first.sequence);
     const list = (await f.app.inject({ url: `/api/v1/works?after=${first.sequence}`, headers: f.headers })).json();
     assert.deepEqual(list, { items: [], cursor: first.sequence, hasMore: false });
     await writeFile(file, '{broken');
     assert.deepEqual((await f.app.inject({ url: '/api/v1/works', headers: f.headers })).json().items[0], first);
-    assert.equal((await f.app.inject({ url: `/api/v1/changes?workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json().workCursor, first.sequence);
+    assert.equal((await f.app.inject({ url: `/api/v1/changes?catalogAfter=0&workAfter=${first.sequence}&waitSeconds=0`, headers: f.headers })).json().workCursor, first.sequence);
     const admin = await consoleHeaders(f.app, f.dataDir);
     assert.equal((await f.app.inject({ url: '/api/v1/admin/works', headers: admin })).statusCode, 200);
     assert.equal((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).statusCode, 400);

@@ -9,9 +9,9 @@ import type { Multipart } from '@fastify/multipart';
 import { canonicalize } from 'json-canonicalize';
 import yauzl from 'yauzl';
 import { problem } from './db.ts';
-import { chapterRow, completeChapter, digest, publishRevision, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { chapterRow, chapterStoragePath, completeChapter, digest, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 
-function validateFiles(value: unknown, limits: Limits): asserts value is PackageManifest {
+export function validateFiles(value: unknown, limits: Limits): asserts value is PackageManifest {
   validateManifest(value);
   const body = value.chapter.contentType === 'pdf' ? 'content.pdf' : 'content.html';
   if (value.layout !== 'chapter-files' || value.bodyPath !== body || value.files.length > 3) throw problem(400, 'Unsupported chapter file layout');
@@ -26,16 +26,20 @@ function validateFiles(value: unknown, limits: Limits): asserts value is Package
   if (value.files.some(file => file.path === 'media.zip') && !value.files.some(file => file.path === 'manifest.json')) throw problem(400, 'Media manifest is missing');
 }
 
-async function validateMedia(stage: string, manifest: PackageManifest, limits: Limits): Promise<void> {
+export async function validateMedia(directory: string, manifest: PackageManifest, limits: Limits, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
   if (!manifest.files.some(file => file.path === 'manifest.json')) return;
   let media: { version?: number; complete?: boolean; media?: { files?: { fileName: string; path: string; bytes: number; status: string }[] } };
-  try { media = JSON.parse(await readFile(join(stage, 'manifest.json'), 'utf8')); } catch { throw problem(400, 'Invalid media manifest JSON'); }
+  try { media = JSON.parse(await readFile(join(directory, 'manifest.json'), { encoding: 'utf8', signal })); }
+  catch { signal?.throwIfAborted(); throw problem(400, 'Invalid media manifest JSON'); }
   if (media?.version !== 1 || media.complete !== true || !Array.isArray(media.media?.files)) throw problem(400, 'Chapter media download is incomplete');
   if (media.media.files.length > limits.files) throw problem(413, 'Media file count limit exceeded');
   const expected = new Map<string, number>();
   const names = new Set<string>();
   let expanded = manifest.files.filter(file => file.path !== 'media.zip').reduce((sum, file) => sum + file.size, 0);
   for (const file of media.media.files) {
+    signal?.throwIfAborted();
+    if (file?.status === 'remote') throw problem(400, 'Chapter media is not downloaded');
     const name = file?.fileName;
     if (typeof name !== 'string' || !safeArchivePath(name) || !/^[A-Za-z0-9._-]+$/.test(name) || names.has(name.toLowerCase()) || file.path !== `media/${name}` || file.status !== 'stored' || !Number.isSafeInteger(file.bytes) || file.bytes < 0) throw problem(400, 'Invalid or incomplete media manifest');
     names.add(name.toLowerCase()); expected.set(name, file.bytes); expanded += file.bytes;
@@ -45,13 +49,14 @@ async function validateMedia(stage: string, manifest: PackageManifest, limits: L
     if (expected.size) throw problem(400, 'Chapter media archive is missing');
     return;
   }
-  const zip = await new Promise<yauzl.ZipFile>((accept, reject) => yauzl.open(join(stage, 'media.zip'), { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true }, (error, value) => error ? reject(problem(400, 'Invalid chapter media archive')) : accept(value!)));
+  const zip = await new Promise<yauzl.ZipFile>((accept, reject) => yauzl.open(join(directory, 'media.zip'), { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true }, (error, value) => error ? reject(problem(400, 'Invalid chapter media archive')) : accept(value!)));
   const found = new Set<string>();
   try {
     await new Promise<void>((accept, reject) => {
       zip.on('error', () => reject(problem(400, 'Invalid chapter media archive')));
       zip.on('end', () => found.size === expected.size ? accept() : reject(problem(400, 'Chapter media archive is incomplete')));
       zip.on('entry', (entry: yauzl.Entry) => {
+        if (signal?.aborted) { reject(signal.reason); return; }
         const type = (entry.externalFileAttributes >>> 16) & 0xf000;
         if (!expected.has(entry.fileName) || found.has(entry.fileName) || expected.get(entry.fileName) !== entry.uncompressedSize || (type !== 0 && type !== 0x8000) || (entry.generalPurposeBitFlag & 1)) {
           reject(problem(400, 'Media archive inventory does not match its manifest')); return;
@@ -108,7 +113,7 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
     await validateMedia(stage, manifest, limits);
     const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
     const entry: CatalogEntry = { id, revision: digest(canonicalize(manifest)), manifest, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
-    return publishRevision(db, dataDir, stage, entry, startedAt);
+    return publishChapter(db, dataDir, stage, entry, startedAt);
   } catch (error) {
     if (error instanceof Error && /unexpected end|premature close/i.test(error.message)) throw problem(400, 'Chapter upload was interrupted');
     throw error;
@@ -116,13 +121,14 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
 }
 
 export function chapterFileStream(db: DatabaseSync, dataDir: string, id: string, revisionId: string, path: string) {
-  if (chapterRow(db, id).catalog.deleted) throw problem(410, 'Chapter was deleted');
-  const revision = db.prepare('SELECT path,entry FROM revisions WHERE chapter_id=? AND revision=? AND deleted=0').get(id, revisionId) as { path: string | null; entry: string } | undefined;
-  if (!revision?.path) throw problem(404, 'Chapter revision not found');
-  const entry = JSON.parse(revision.entry) as CatalogEntry;
+  const chapter = chapterRow(db, id);
+  const entry = chapter.catalog;
+  if (entry.deleted) throw problem(410, 'Chapter was deleted');
+  if (entry.revision !== revisionId) throw problem(404, 'Chapter copy not found');
   const file = entry.manifest.files.find(file => file.path === path);
-  if (entry.manifest.layout !== 'chapter-files' || !file) throw problem(404, 'Chapter file not found');
-  const target = join(dataDir, revision.path, file.path);
+  if (!file) throw problem(404, 'Chapter file not found');
+  if (!chapter.path) throw problem(410, 'Chapter file is unavailable');
+  const target = chapterStoragePath(dataDir, join(chapter.path, file.path));
   if (!existsSync(target)) throw problem(410, 'Chapter file is unavailable');
   const stat = lstatSync(target);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== file.size) throw problem(410, 'Chapter file is unavailable');

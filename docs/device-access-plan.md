@@ -4,8 +4,8 @@
 
 Remove accounts and cross-device personal reading-state synchronization. New
 devices are admitted automatically, as explicitly selected by the operator.
-Existing chapter packages, revisions, source folders, and local reading data are
-preserved. Content journals and manual, periodic, and change-driven sync remain.
+Content journals and manual, periodic, and change-driven sync remain. The current
+development format has no backward-compatibility or database upgrade paths.
 
 ## Authentication contract
 
@@ -27,31 +27,29 @@ preserved. Content journals and manual, periodic, and change-driven sync remain.
 - `GET /api/v1/admin/devices` returns `{items:[{id,deviceName,createdAt,lastSeenAt,blocked}]}`.
   `PATCH /api/v1/admin/devices/:id` accepts `{blocked:boolean}`.
 - Registered devices may upload, soft-delete, and restore content. Only console
-  sessions may manage settings, sources, folders, devices, purge, or select the
-  default revision. Existing anonymous download policy remains supported.
+  sessions may manage settings, sources, devices, and purge. Anonymous download
+  policy remains supported.
 - Capabilities advertise `apiVersion:1`, `packageVersion:1`,
   `authentication:'device-key'`, and `personalStateSync:false`. Clients must reject
   incompatible authentication protocols before transferring data.
-- `/changes` accepts only `catalogAfter` and `waitSeconds`, and returns
-  `{catalogCursor}`. Account, old session, and personal-state endpoints are removed.
+- `/changes` requires `catalogAfter` and `workAfter`, accepts `waitSeconds`, and
+  returns `{catalogCursor,workCursor}`. Account and personal-state endpoints are absent.
 
-## Data preservation
+## Current data model
 
-New databases have no account or personal-state tables. Existing legacy tables
-are retained inertly to avoid deleting previously stored information during an
-automatic startup migration; no live endpoint reads or writes them. Existing
-account sessions cannot authorize requests. Device and console sessions use new
-tables. Original Norea folders and databases remain read-only importer inputs.
-App reading positions, bookmarks, read flags, and library membership stay local.
-Existing app schema migrations are not rewritten. Local cache/journal evolution
-must not reset local reader data or re-upload unchanged packages unnecessarily.
+The schema contains only device and console credentials, content indexes, and
+operational state. Account and personal-state tables do not exist. An incompatible
+server database requires a fresh state volume; the app recreates its cache when
+the schema checksum changes. Current chapter folders can be indexed again.
+Scanning reads current files in place without conversion or rewriting. Reading
+positions, bookmarks, read flags, and library membership stay local during sync.
 
 ## Implementation and verification
 
 1. Server: replace account authentication and state routes, add persistent device
    registration/blocking and initialization secret, retain catalog-only change
    notifications. Update integration tests for authentication boundaries, restart
-   stability, blocked retries, removed endpoints, and legacy-data preservation.
+   stability, blocked retries, removed endpoints, and incompatible-schema rejection.
 2. App: persist device credentials, automatically register during sync, remove
    account UI and all personal-state traffic, retain content scheduling and
    transfer. Update tests for restart persistence, key/server isolation, blocking,

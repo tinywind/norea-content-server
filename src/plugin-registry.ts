@@ -34,13 +34,6 @@ export interface RegisterPluginInput {
   enabled?: boolean;
 }
 
-export function initializePluginRegistry(db: DatabaseSync): void {
-  db.exec(`CREATE TABLE IF NOT EXISTS plugin_registrations (
-    id TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), sources TEXT NOT NULL, updated_at TEXT NOT NULL
-  )`);
-}
-
 export function listPlugins(db: DatabaseSync): RegisteredPlugin[] {
   return db.prepare('SELECT * FROM plugin_registrations ORDER BY name,id').all().map(row => ({
     id: String(row.id), name: String(row.name), url: String(row.url), enabled: row.enabled === 1,

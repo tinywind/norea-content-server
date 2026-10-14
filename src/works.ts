@@ -123,7 +123,7 @@ export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
       db.prepare('DELETE FROM work_changes WHERE work_id=?').run(row.id);
       db.prepare('DELETE FROM works WHERE id=?').run(row.id);
     }
-    db.exec('DELETE FROM catalog_changes WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works) AND work_id NOT IN (SELECT work_id FROM work_tombstones)); DELETE FROM revisions WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works)); DELETE FROM chapters WHERE work_id NOT IN (SELECT id FROM works)');
+    db.exec('DELETE FROM catalog_changes WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works) AND work_id NOT IN (SELECT work_id FROM work_tombstones)); DELETE FROM chapters WHERE work_id NOT IN (SELECT id FROM works)');
   });
 }
 function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
@@ -163,7 +163,7 @@ export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkE
   const retired = join(dirname(folder), `.norea-delete-${randomUUID()}`);
   const moved = existsSync(folder);
   if (moved) renameSync(folder, retired);
-  const external = db.prepare('SELECT r.path FROM revisions r JOIN chapters c ON c.id=r.chapter_id WHERE c.work_id=? AND r.path IS NOT NULL').all(id) as { path: string }[];
+  const external = db.prepare('SELECT path FROM chapters WHERE work_id=? AND path IS NOT NULL').all(id) as { path: string }[];
   let entry: WorkEntry;
   try {
     entry = transaction(db, () => {
@@ -176,7 +176,6 @@ export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkE
       db.prepare('INSERT INTO work_tombstones VALUES(?,1,?) ON CONFLICT(work_id) DO UPDATE SET deleted=1,sequence=excluded.sequence').run(id, sequence);
       const deleted = { ...JSON.parse(row.entry) as WorkEntry, deleted: true, hasCover: false, sequence };
       db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(JSON.stringify(deleted), sequence);
-      db.prepare('DELETE FROM revisions WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id=?)').run(id);
       db.prepare('DELETE FROM chapters WHERE work_id=?').run(id);
       db.prepare('DELETE FROM works WHERE id=?').run(id);
       db.prepare("DELETE FROM scan_checkpoints WHERE path=? OR substr(path,1,?)=?").run(folder, folder.length + 1, folder + sep);
@@ -246,7 +245,7 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     authenticate(db, request, true); reply.header('Cache-Control', 'no-store');
     const where = "WHERE (?='' OR instr(lower(json_extract(w.entry,'$.metadata.novel.name') || ' ' || json_extract(w.entry,'$.metadata.identity.pluginId')),lower(?))>0)";
     const args = [request.query.search, request.query.search];
-    const rows = db.prepare(`SELECT w.entry,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL) AS downloadedChapters FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string; downloadedChapters: number }[];
+    const rows = db.prepare(`SELECT w.entry,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS downloadedChapters FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string; downloadedChapters: number }[];
     return { items: rows.map(row => { const entry = JSON.parse(row.entry) as WorkEntry; return { ...entry, chapterCount: row.downloadedChapters, downloadedChapters: row.downloadedChapters }; }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n };
   });
 }
