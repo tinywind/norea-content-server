@@ -11,8 +11,8 @@ interface Entry { id: string; revision: string; fileBytes: number; deleted: bool
 interface NovelMetadata {
   schemaVersion: 1;
   identity: { pluginId: string; novelPath: string };
-  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
-  cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
+  novel: { name: string; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
+  cover: { fileName: string; contentType: string | null } | null;
 }
 interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount?: number; downloadedChapters?: number }
 interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
@@ -314,9 +314,9 @@ function inspectWork(work: Work) {
   const values: [string, Child][] = [
     ['Title', novel.name], ['Author', novel.author ?? '—'], ['Artist', novel.artist ?? '—'],
     ['Status', novel.status ?? '—'], ['Rating', novel.rating ?? '—'], ['Genres', novel.genres ?? '—'], ['Summary', el('span', 'preserve-lines', novel.summary ?? '—')],
-    ['Local work', novel.isLocal ? 'Yes' : 'No'], ['Source cover URL', novel.cover ?? '—'],
+    ['Local work', novel.isLocal ? 'Yes' : 'No'],
     ['Plugin ID', el('span', 'mono', identity.pluginId)], ['Novel path', el('span', 'mono', identity.novelPath)],
-    ['Cover file', cover?.fileName ?? '—'], ['Cover content type', cover?.contentType ?? '—'], ['Cover source URL', cover?.sourceUrl ?? '—'],
+    ['Cover file', cover?.fileName ?? '—'], ['Cover content type', cover?.contentType ?? '—'],
     ['Stored cover', work.hasCover ? 'Available' : 'Not available'],
     ['Schema version', metadata.schemaVersion], ['Work ID', el('span', 'mono', work.id)], ['Sequence', work.sequence],
   ];
