@@ -176,12 +176,12 @@ can remove them earlier. Existing device content and local reading state remain 
 Complete current copies are never automatically evicted.
 
 For backup, stop the server and copy both the server state volume and the host
-content directory, including SQLite, its WAL files, revision files, and trash.
+content directory. The state volume contains SQLite, its WAL files, staging,
+and trash; the host content directory contains works and their current chapter files.
 Include a separately mounted password file. Restore all mounts before restart.
 This offline procedure gives a consistent database/files snapshot. Live backup,
-whole-work administration, work cover transfer, obsolete-revision removal,
-automatic scheduled trash cleanup, storage quotas, and historical operator metrics are
-not implemented. Protect public deployments with proxy-level rate limits and TLS.
+automatic scheduled trash cleanup, storage quotas, and historical operator metrics
+are not implemented. Protect public deployments with proxy-level rate limits and TLS.
 
 ## Docker
 
