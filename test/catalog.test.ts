@@ -120,6 +120,21 @@ test('resolves folder chapters only within the exact canonical work', async () =
   } finally { await f.close(); }
 });
 
+test('keeps different local files separate when their chapter numbers match', async () => {
+  const f = await fixture();
+  try {
+    const work = metadata('local', 'local');
+    work.novel.isLocal = true;
+    const stored = await f.putChapter(work, 'norea-folder:1', 1);
+    const query = new URLSearchParams({ ...work.identity, chapterPath: 'local:markdown:different/chapter-0001', chapterNumber: '1' });
+    assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
+    query.set('includeUnavailable', 'true');
+    assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
+    query.set('chapterPath', stored.manifest.identity.chapterPath);
+    assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).json().id, stored.id);
+  } finally { await f.close(); }
+});
+
 test('invalid scanned chapters leave available pages and return after repair with the same identity', async () => {
   const f = await fixture();
   try {

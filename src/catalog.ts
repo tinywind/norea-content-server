@@ -112,7 +112,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
       if (!entry) throw problem(404, 'Chapter files are unavailable');
       return entry;
     }
-    if (!chapterNumber) throw problem(404, 'Chapter not found');
+    if (!chapterNumber || pluginId === 'local') throw problem(404, 'Chapter not found');
     const work = digest(JSON.stringify([pluginId, novelPath]));
     const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR path IS NOT NULL)").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
     if (!matches.length) throw problem(404, 'Chapter not found');
