@@ -162,11 +162,23 @@ test('complete ZIP publication is idempotent, readable, resumable, and persisten
   } finally { await s.close(); }
 });
 
-test('invalid, incomplete, unlisted, and unsafe package data never publishes', async () => {
+test('legacy ZIP transfer retains checksum metadata without comparing file payload hashes', async () => {
+  const s = await setup();
+  try {
+    const payload = await archive('body', manifest => { manifest.files[0].sha256 = '0'.repeat(64); });
+    const response = await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...await s.device(), 'content-type': 'application/zip' }, payload });
+    assert.equal(response.statusCode, 200, response.body);
+    const entry = response.json();
+    assert.equal(entry.manifest.files[0].sha256, '0'.repeat(64));
+    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/package`)).rawPayload, payload);
+  } finally { await s.close(); }
+});
+
+test('invalid, incomplete, wrong-sized, unlisted, and unsafe package data never publishes', async () => {
   const s = await setup();
   try {
     const headers = { ...await s.device(), 'content-type': 'application/zip' };
-    const bad = [Buffer.from('torn zip'), await archive('body', m => { m.files[0].sha256 = '0'.repeat(64); }), await archive('body', m => { m.files.push({ path: 'media/missing.png', size: 3, sha256: '0'.repeat(64) }); }), await archive('body', () => {}, true), await archive('body', m => { m.bodyPath = '../escape.html'; })];
+    const bad = [Buffer.from('torn zip'), await archive('body', m => { m.files[0].size = 3; }), await archive('body', m => { m.files.push({ path: 'media/missing.png', size: 3, sha256: '0'.repeat(64) }); }), await archive('body', () => {}, true), await archive('body', m => { m.bodyPath = '../escape.html'; })];
     for (const payload of bad) assert.equal((await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers, payload })).statusCode, 400);
     assert.deepEqual((await s.app.inject('/api/v1/chapters')).json().items, []);
   } finally { await s.close(); }

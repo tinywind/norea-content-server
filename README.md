@@ -1,8 +1,14 @@
 # Norea Content Server
 
 An optional content server for Norea. One Node.js 24 process stores catalog and
-device metadata in SQLite and complete chapter ZIPs on local disk. Reading state
-stays on each device. The API capability version is 2; package format remains 1.
+device metadata in SQLite and original chapter files on local disk. Existing ZIP
+revisions remain available. Reading state stays on each device. The API and
+package versions remain 1.
+
+The server is an optional shadow backup. App navigation, reading, local downloads,
+and metadata updates must finish without waiting for server discovery or uploads.
+Clients may copy completed downloads in the background and retry a failed transfer
+later. An unavailable server must not prevent local use.
 
 ## Run locally
 
@@ -20,7 +26,7 @@ pnpm start
 
 The default address is `127.0.0.1:8787`. `NOREA_HOST` and `NOREA_PORT` override it.
 `NOREA_DATA_DIR` defaults to `data`. Set `NOREA_ANONYMOUS_READ=false` to require
-authentication for catalog and package access. External access requires a TLS
+authentication for catalog and content access. External access requires a TLS
 reverse proxy. Run exactly one server process against a data directory.
 
 First startup creates `admin-password.hash` inside `NOREA_DATA_DIR`. Enter that
@@ -76,7 +82,8 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   writes can shift offset pages; these pages are for browsing, not change tracking.
 - `GET /api/v1/catalog/chapter?pluginId=...&novelPath=...&chapterPath=...` resolves
   one available chapter by its exact, URL-encoded identity. Missing or deleted
-  entries return 404. Use its ID with the existing chapter package download route.
+  entries return 404. Use its ID and revision with the chapter-file download route
+  when `manifest.layout` is `chapter-files`; older entries use the ZIP route.
   Optional numeric `chapterNumber` matches a unique chapter within the exact
   same plugin ID and novel path. Exact identities take priority;
   an exact deletion is not replaced by a folder match. Multiple matches return
@@ -86,27 +93,64 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   Import scans, API writes, and startup indexing populate that index. Use
   `GET /api/v1/works/:id` for full work metadata and
   `GET /api/v1/works/:id/cover` for the selected cover.
-- `POST /api/v1/packages` streams an authenticated raw `application/zip` upload.
+- `POST /api/v1/chapter-files` accepts an authenticated `multipart/form-data`
+  upload of the original files in a completed app chapter directory. Register the
+  exact work with `PUT /api/v1/works/:id` first; missing work metadata returns 409.
+  The first part is a plain text field named `metadata`, containing the version-1
+  package manifest with `layout: "chapter-files"`. Its sorted `files` list declares
+  each original `path`, byte `size`, and `modifiedAt` as a nonnegative safe integer
+  Unix timestamp in milliseconds. Send subsequent file parts with the
+  original path as their field name and basename as their filename.
+  Upload exactly one `content.html` or `content.pdf`, plus `manifest.json` and
+  `media.zip` when present. `bodyPath` names that body file. PDF chapters use
+  `content.pdf`; HTML, text, and Markdown chapters use `content.html`.
+  The media manifest must report a complete download with all assets stored.
+  `media.zip` requires `manifest.json`; a nonempty media inventory requires
+  `media.zip`. Loose legacy `media/` files are rejected by this endpoint.
+  Body bytes, media URLs, media-manifest formatting and timestamps, and media ZIP
+  bytes are preserved. The server creates no outer ZIP and does not extract or
+  recompress the media archive. Its central directory must match the media
+  manifest's names and sizes, without extra, duplicate, symbolic, or encrypted
+  entries. This inventory check does not decode assets or verify their ZIP CRCs.
+  Every file must match its declared size before the revision becomes visible.
+  Missing, duplicate, wrong-sized, oversized, and interrupted uploads are rejected
+  and their staged files are removed. File payloads are not hashed. Revision
+  identity is SHA-256 of the canonical metadata manifest, including each file's
+  modification time. A retry returns the same immutable record. Payload changes
+  that preserve sizes and modification times cannot be distinguished.
+  Raw records include `fileBytes`, the sum of original file sizes; ZIP records
+  retain `zipBytes` and `zipSha256`. Clients must allow those ZIP fields to be absent.
+- `GET /api/v1/chapters/:id/files?revision=<revision>&path=<original-path>` streams
+  one original file from that immutable revision. Its ETag is the quoted revision,
+  a colon, and the original path;
+  Content-Length is its declared size. The route uses the same read policy as the
+  catalog and checks supplied device keys even when anonymous reading is enabled.
+  Check each file's size and receive the complete chapter before installing it.
+- `POST /api/v1/packages` retains the legacy authenticated `application/zip` upload.
   Register the exact work with `PUT /api/v1/works/:id` first; missing work
-  metadata returns 409. Every declared file is checked for size and SHA-256, and undeclared files,
+  metadata returns 409. Every declared file is checked for size, and undeclared files,
   unsafe paths, duplicates, symlinks, encryption and invalid metadata are rejected.
   HTML resource URLs must be embedded data or declared package files. CSS imports
   and escaped CSS URLs are rejected; nested resource references inside separate
   CSS files and Markdown image syntax are not currently inspected.
-  Revision identity is SHA-256 of the RFC 8785 canonical manifest. ZIP checksums
-  are separate. Retrying a revision returns its original immutable package record.
-- `GET /api/v1/chapters/:id/package` streams the current default. Downloads support
+  Legacy file `sha256` fields remain in manifests for format compatibility;
+  uploads do not compare them with file payloads. Revision identity is SHA-256
+  of the RFC 8785 canonical manifest. The stored ZIP checksum remains available
+  for legacy ETags. Retrying a revision returns its original immutable package record.
+- `GET /api/v1/chapters/:id/package` streams a legacy ZIP default. Raw-file defaults
+  return 406 and must use the original-file route. ZIP downloads support
   one byte range, suffix ranges, ETag and If-Range. A mismatching If-Range returns
-  the entire package. Verify ZIP bytes before installing content on the client.
+  the entire package. Check the received size and package inventory before
+  installing content on the client.
 - Registered devices and console administrators use `DELETE /api/v1/chapters/:id`
   and `POST /api/v1/chapters/:id/restore` to manage shared availability.
   Only console administrators use `POST /api/v1/chapters/:id/revision` to set defaults.
   A newer app upload does not automatically replace the first default revision.
   A changed source file found by a storage scan becomes the served default;
   previous immutable revisions remain available.
-- `POST /api/v1/chapters/:id/purge` permanently removes a deleted chapter's ZIPs.
+- `POST /api/v1/chapters/:id/purge` permanently removes a deleted chapter's revisions.
   Tombstones survive purge and restart. Restoration after purge permits a fresh
-  upload but keeps the catalog entry deleted until a complete package is published.
+  upload but keeps the catalog entry deleted until a complete revision is published.
 - `GET /api/v1/changes?catalogAfter=0&waitSeconds=20` returns `{catalogCursor}`.
   It waits up to 20 seconds for catalog changes. Disabling anonymous reading also
   protects this endpoint. Fetch catalog pages to consume a hint; persist only
@@ -124,17 +168,24 @@ database tables are retained without being used; existing content remains availa
 
 ## Storage and limits
 
-Packages use the Norea readable directory rules:
-`contents/<plugin>/<work-name>-<work-id-prefix>/<chapter-number>-<chapter-name>/<revision>.zip`.
+Original files use the Norea readable directory rules:
+`contents/<plugin>/<work-name>-<work-id-prefix>/<chapter-number>-<chapter-name>/<revision>.files/`.
+Each revision directory contains the original body, media manifest, and media
+archive that were uploaded. Older revisions keep their `<revision>.zip` paths.
 An identity that collides with another chapter's sanitized directory is rejected.
-Each ZIP contains portable body/assets and its manifest. ZIPs stream through a
-staging directory and are validated before becoming visible in SQLite.
+Uploads stream through a staging directory and are validated before becoming
+visible in SQLite. The catalog metadata stays in SQLite; the uploaded media
+`manifest.json` is never replaced by catalog metadata.
 Interrupted uploads remain absent from the catalog. A deletion during an upload
 invalidates its publication even if the chapter is restored before upload finishes.
 
-Default limits are 512 MiB ZIP bytes, 2 GiB expanded bytes, and 10,000 content
-files plus `manifest.json`. Manifests are limited to 4 MiB. Tests can supply
-smaller limits through `buildApp`. JSON requests are limited to 1 MiB.
+Raw transfers accept at most three files, 64 KiB of metadata JSON, 16 MiB for
+`manifest.json`, 512 MiB for `media.zip`, and 2 GiB for the total original files.
+The media inventory is limited to 10,000 assets, with a 2 GiB total for their
+declared uncompressed sizes plus the original body and media manifest.
+Legacy ZIP limits remain 512 MiB ZIP bytes, 2 GiB expanded bytes, and 10,000 content
+files plus a package `manifest.json` of at most 4 MiB. Tests can supply smaller
+limits through `buildApp`. Ordinary JSON requests are limited to 1 MiB.
 
 Deleting a chapter moves its revisions to `trash/` and immediately blocks new
 downloads. Files older than 30 days are purged at server startup. Explicit purge
@@ -142,7 +193,7 @@ can remove them earlier. Existing device content and local reading state remain 
 Available revisions are never automatically evicted.
 
 For backup, stop the server and copy the entire data directory, including SQLite,
-its WAL files, packages, and trash. Restore the complete directory before restart.
+its WAL files, revision files, and trash. Restore the complete directory before restart.
 This offline procedure gives a consistent database/files snapshot. Live backup,
 whole-work administration, work cover transfer, obsolete-revision removal,
 automatic scheduled trash cleanup, storage quotas, and historical operator metrics are
@@ -161,10 +212,11 @@ pnpm test
 pnpm typecheck
 ```
 
-Tests use real SQLite databases and ZIP archives under `.tmp/`. They cover access
+Tests use real SQLite databases, chapter files, and ZIP archives under `.tmp/`. They cover access
 control, installation-secret persistence, device registration/blocking, immutable
 revisions, Range, corrupt packages, limits, tombstones, catalog long polling,
-shutdown/disconnect cleanup, and a disconnected HTTP upload.
+shutdown/disconnect cleanup, byte-identical multipart transfers, and disconnected
+HTTP uploads.
 
 ## Administration console
 
@@ -245,6 +297,11 @@ Work metadata and cover changes update the work index without rebuilding unchang
 chapter packages. The scan still lists and stats the tree; it does not guarantee
 constant-time discovery or detect byte edits that preserve every recorded stat field.
 
+Registered `.files` revision directories are recognized as unchanged server
+content. Scans do not reimport or repackage them. The existing loose-folder import
+path still builds legacy ZIP revisions from source snapshots; it is separate from
+the original-file upload route, and it leaves those source folders unchanged.
+
 `GET /api/v1/admin/storage` returns the fixed path and current scan settings.
 `PATCH /api/v1/admin/storage` accepts only `mode`, `intervalMinutes`, and `enabled`.
 `POST /api/v1/admin/storage/scan` starts a manual scan. Folder-root CRUD routes
@@ -253,7 +310,8 @@ have been removed.
 In Content, inspect revisions, select the default, move server chapters to trash,
 restore them, or permanently purge their server packages. These actions never
 modify original loose chapters or imported archives. Deletion moves only indexed
-server revision ZIPs to trash. Rescanning does not resurrect server tombstones.
+server revision ZIPs and `.files` directories to trash. Rescanning does not
+resurrect server tombstones.
 Devices can be blocked or unblocked independently. Personal reading records stay
 on each app and are never synchronized to the server.
 

@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import swagger from '@fastify/swagger';
+import multipart from '@fastify/multipart';
 import type { Readable } from 'node:stream';
 import { resolve } from 'node:path';
 import { openDatabase, problem, transaction } from './db.ts';
@@ -10,16 +11,18 @@ import { createChangeNotifications, readChangeCursors } from './changes.ts';
 import { initializeAdministration, registerAdministration, savedAnonymousRead } from './administration.ts';
 import { rebuildWorkIndex, registerWorks } from './works.ts';
 import { registerCatalog } from './catalog.ts';
+import { chapterFileStream, publishChapterFiles } from './chapter-files.ts';
 
 const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
 const manifestSchema = { type: 'object', required: ['packageVersion','identity','novel','chapter','bodyPath','files'], properties: {
+  layout: { type: 'string', enum: ['chapter-files'] },
   packageVersion: { const: 1, type: 'integer' }, identity: { type: 'object', required: ['pluginId','novelPath','chapterPath'], properties: { pluginId: string, novelPath: string, chapterPath: string } },
   novel: { type: 'object', required: ['name','isLocal'], properties: { name: string, author: { type: ['string','null'] }, summary: { type: ['string','null'] }, isLocal: { type: 'boolean' } } },
   chapter: { type: 'object', required: ['name','position','contentType','page'], properties: { name: string, position: { type: 'number' }, chapterNumber: { type: ['string','null'] }, contentType: { type: 'string', enum: ['html','text','markdown','pdf'] }, page: string } },
-  bodyPath: string, files: { type: 'array', items: { type: 'object', required: ['path','size','sha256'], properties: { path: string, size: { type: 'integer' }, sha256: string } } },
+  bodyPath: string, files: { type: 'array', items: { type: 'object', required: ['path','size'], anyOf: [{ type: 'object', required: ['sha256'] }, { type: 'object', required: ['modifiedAt'] }], properties: { path: string, size: { type: 'integer' }, sha256: string, modifiedAt: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER } } } },
 } };
-const catalogSchema = { type: 'object', required: ['id','revision','zipSha256','zipBytes','manifest','deleted','sequence'], properties: { id: string, revision: string, zipSha256: string, zipBytes: { type: 'integer' }, manifest: manifestSchema, deleted: { type: 'boolean' }, sequence: { type: 'integer' } } };
+const catalogSchema = { type: 'object', required: ['id','revision','manifest','deleted','sequence'], properties: { id: string, revision: string, zipSha256: string, zipBytes: { type: 'integer' }, fileBytes: { type: 'integer' }, manifest: manifestSchema, deleted: { type: 'boolean' }, sequence: { type: 'integer' } } };
 const cursorSchema = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 };
 
 export async function buildApp(options: { dataDir: string; anonymousRead?: boolean; limits?: Partial<Limits>; trashDays?: number }) {
@@ -34,6 +37,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const changes = createChangeNotifications(db);
   await app.register(swagger, { openapi: { info: { title: 'Norea Content Server', version: '1.0.0' }, components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } } } });
   app.addContentTypeParser('application/zip', (_request, payload, done) => done(null, payload));
+  await app.register(multipart, { limits: { fields: 1, fieldSize: 64 * 1024, files: 3, parts: 4, fileSize: limits.expandedBytes } });
   app.addHook('preClose', async () => { changes.close(); });
   app.addHook('onClose', async () => { db.close(); });
   const requireRead = (request: Parameters<typeof authenticate>[1]) => { if (!anonymousRead || request.headers.authorization !== undefined) authenticate(db, request); };
@@ -114,6 +118,17 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
     const entry = transaction(db, () => recordEntry(db, JSON.parse(revision.entry)));
     changes.notify();
     return entry;
+  });
+  app.post('/api/v1/chapter-files', { onRequest: async request => { authenticateDevice(db, request); }, schema: { security: [{ bearerAuth: [] }], consumes: ['multipart/form-data'], response: { 200: catalogSchema }, description: 'Upload original completed chapter files. Send metadata JSON first, then files named by their original paths. No compression or body rewriting.' } }, async request => {
+    if (!request.isMultipart()) throw problem(415, 'multipart/form-data is required');
+    const entry = await publishChapterFiles(db, dataDir, request.parts(), limits);
+    changes.notify();
+    return entry;
+  });
+  app.get<{ Params: { id: string }; Querystring: { revision: string; path: string } }>('/api/v1/chapters/:id/files', { schema: { params: idParams, querystring: { type: 'object', required: ['revision', 'path'], properties: { revision: { type: 'string', pattern: '^[0-9a-f]{64}$' }, path: { type: 'string', enum: ['content.html', 'content.pdf', 'manifest.json', 'media.zip'] } } } } }, async (request, reply) => {
+    requireRead(request);
+    const { file, open } = chapterFileStream(db, dataDir, request.params.id, request.query.revision, request.query.path);
+    return reply.header('Content-Length', file.size).header('ETag', `"${request.query.revision}:${file.path}"`).header('X-Content-Type-Options', 'nosniff').type('application/octet-stream').send(open());
   });
   const cutoff = Date.now() - (options.trashDays ?? 30) * 86400000;
   for (const row of db.prepare('SELECT id FROM chapters WHERE deleted_at<?').all(cutoff) as { id: string }[]) purgeChapter(db, dataDir, row.id);

@@ -119,18 +119,22 @@ test('console HTML has a strict local-only content policy and catalog supports e
     assert.deepEqual(result.json(), { items: [], total: 0 });
   } finally { await s.close(); }
 });
-test('startup removes abandoned importer snapshots but preserves unrelated staging files', async () => {
+test('startup removes abandoned importer and multipart snapshots but preserves unrelated staging files', async () => {
   const s = await setup();
   try {
     await s.app.close();
     const abandoned = join(s.dataDir, 'staging', 'folder-ABC123');
     const unrelated = join(s.dataDir, 'staging', 'keep-me');
+    const multipart = join(s.dataDir, 'staging', 'files-12345678-1234-4123-8123-123456789abc');
     await mkdir(abandoned, { recursive: true }); await mkdir(unrelated, { recursive: true });
+    await mkdir(multipart);
     await writeFile(join(abandoned, 'metadata.sqlite'), 'Private snapshot');
+    await writeFile(join(multipart, 'content.html'), 'Partial upload');
     await writeFile(join(unrelated, 'keep.txt'), 'Keep');
     const app = await buildApp({ dataDir: s.dataDir });
     try {
       await assert.rejects(readFile(join(abandoned, 'metadata.sqlite')), /ENOENT/);
+      await assert.rejects(readFile(join(multipart, 'content.html')), /ENOENT/);
       assert.equal(await readFile(join(unrelated, 'keep.txt'), 'utf8'), 'Keep');
     } finally { await app.close(); }
   } finally { await s.close(); }

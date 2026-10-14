@@ -42,20 +42,34 @@ A PackageManifest is:
 ```typescript
 interface PackageManifest {
   packageVersion: 1;
+  layout?: "chapter-files";
   identity: { pluginId: string; novelPath: string; chapterPath: string };
   novel: { name: string; author?: string | null; summary?: string | null; isLocal: boolean };
   chapter: { name: string; position: number; chapterNumber?: string | null; contentType: "html" | "text" | "markdown" | "pdf"; page: string };
   bodyPath: string;
-  files: { path: string; size: number; sha256: string }[];
+  files: ({ path: string; size: number } &
+    ({ modifiedAt: number; sha256?: never } | { sha256: string; modifiedAt?: never }))[];
 }
 ```
 
+New original-file transfers use `layout: "chapter-files"` and each descriptor is
+`{path,size,modifiedAt}`. `modifiedAt` is a nonnegative safe integer Unix timestamp
+in milliseconds. Send the metadata as the first multipart field, then the original
+body (`content.html` or `content.pdf`), optional `manifest.json`, and optional
+`media.zip`. The file field name and filename match the original path. Preserve
+all file bytes and media references. Media must be complete; validate archive
+central-directory names and sizes without extracting assets or checking CRCs.
+
+Legacy ZIP manifests omit `layout` and retain file `sha256` fields. Their package
 `manifest.json` is the envelope and is not listed in files. Other entries are the
-body (`content.html` or `content.pdf`), optional `media-manifest.json` (existing
-complete Norea media metadata), and expanded assets under `media/`. Export portable
-relative asset references and restore Norea's local media references on import.
-Hash the RFC 8785 canonical JSON manifest for revision identity. Files are sorted
-by path. Reject unsafe, duplicate, missing, unlisted, and corrupt entries.
+body, optional `media-manifest.json`, and expanded assets under `media/`. Legacy
+transfers restore local media references on import. File SHA-256 comparisons are
+removed from both transfer formats. Check declared sizes, complete receive, and
+inventory before publication or installation.
+
+Hash the RFC 8785 canonical JSON metadata manifest for revision identity. Files
+are sorted by path. Modification times distinguish same-size changes to original
+files. Reject unsafe, duplicate, missing, wrong-sized, and unlisted entries.
 
 Endpoints (all under `/api/v1`):
 
@@ -70,13 +84,19 @@ Endpoints (all under `/api/v1`):
 - `GET /chapters?after=<integer>&limit=<1..100>` -> `{items:CatalogEntry[],cursor,hasMore}`.
 - `POST /packages`: raw ZIP with device bearer key -> CatalogEntry.
 - `GET /chapters/:id/package`: current ZIP, ETag, Content-Length, Range.
+- `POST /chapter-files`: original files as multipart with device bearer key -> CatalogEntry.
+- `GET /chapters/:id/files?revision=...&path=...`: original bytes, Content-Length,
+  and an ETag containing the quoted revision, a colon, and original path.
 - `DELETE /chapters/:id`: device or console tombstone and trash.
 - `POST /chapters/:id/restore`: explicit device or console restoration.
 - `POST /chapters/:id/revision` `{revision}`: console-only default selection.
 - `POST /chapters/:id/purge`: console-only permanent removal of deleted ZIPs.
 - `GET /changes?catalogAfter=0&waitSeconds=20` -> `{catalogCursor}`.
 
-CatalogEntry is `{id,revision,zipSha256,zipBytes,manifest,deleted,sequence}`.
+CatalogEntry is `{id,revision,zipSha256?,zipBytes?,fileBytes?,manifest,deleted,sequence}`.
+Original-file records use `fileBytes`; legacy ZIP records retain `zipSha256` and
+`zipBytes`. Previously published original-file descriptors with `sha256` remain
+readable; new original-file uploads require `modifiedAt`.
 Catalog pages include tombstones to suppress stale reuploads. Account, old session,
 and personal-state routes are removed. Device keys are random 32-byte hex values;
 servers persist only their hashes. Local reading records never enter the protocol.
@@ -114,14 +134,15 @@ Interfaces exported by native.ts:
 - `uploadContentChapter(input: {serverUrl:string;token:string;chapterId:number;manifest:Omit<PackageManifest,"files"|"bodyPath">;storageDir:string}): Promise<CatalogEntry>`.
 - `downloadContentChapter(input: {serverUrl:string;token?:string;entry:CatalogEntry;storageDir:string;chapterId:number}): Promise<{contentBytes:number;mediaBytes:number}>`.
 
-`fingerprintContentChapter({storageDir})` hashes local artifacts before upload.
+`fingerprintContentChapter({storageDir})` records local file sizes and modification
+times before upload without hashing payloads.
 Types are defined in native.ts for app orchestration to import. The adapter
 must support Android SAF storage and Windows existing storage roots. Verify complete
 media before export, preserve current files on failed import, and stage temporary
 files in app cache. Network helpers are app-owned, never source-plugin traffic.
 
 - [x] Add failing validation/round-trip tests, then implement streaming packaging,
-  HTTP transfer, checksums and atomic install with local reference conversion.
+  HTTP transfer, size validation and atomic install with local reference conversion.
 - [x] Run focused native checks and supply the parent with the exact IPC contract.
 
 ## Task 3: app synchronization and settings

@@ -136,8 +136,8 @@ the intended personal and small-server use.
 Preserve the current readable storage layout: plugin ID, work name/path, then
 chapter number/name. Users must remain able to find and open a work or chapter
 directly in the filesystem. Do not replace these directories with hash-only names
-or migrate existing folders for synchronization. Content hashes verify revisions
-and transfers; they do not replace the readable directory hierarchy. Packages
+or migrate existing folders for synchronization. Canonical metadata digests identify
+revisions within the readable directory hierarchy. Packages
 carry original identity fields separately from sanitized filesystem paths.
 
 For local imports, the original file's SHA-256 digest detects identical imported
@@ -155,27 +155,35 @@ complete revision becomes the default for new downloads. Further revisions are
 retained, and only an administrator can select a different default. A default
 change does not automatically replace content already downloaded to a device.
 
-A canonical manifest of relative file names, sizes, and content hashes identifies
-a revision. Use RFC 8785 JSON canonicalization and SHA-256 for the content
-manifest. Exclude uploader identity, transfer timestamps, and other operational
-metadata from the content digest. The ZIP itself has a separate checksum for
-transfer verification: ZIP timestamps or entry ordering can change its bytes without
-changing the underlying content. Specify the exact manifest fields and file-list
-ordering in the versioned package schema before implementing interoperable clients.
+A canonical metadata manifest identifies a revision. Original-file manifests list
+each file's relative path, byte size, and source modification time as a nonnegative
+safe integer Unix timestamp in milliseconds. Use RFC 8785 JSON canonicalization
+and SHA-256 for this small manifest; do not hash original file payloads. Exclude
+uploader identity and transfer timestamps. A same-size edit with a changed source
+modification time creates a new revision. Payload changes that preserve both size
+and modification time cannot be distinguished. Legacy ZIP manifests retain file
+`sha256` fields for format compatibility, without comparing file payload hashes.
+Legacy ZIP records also retain their archive checksum for ETags.
 
-## Complete ZIP packages
+## Complete chapter transfers
 
 The transfer unit is one chapter with its body and required assets.
 This avoids repackaging a whole novel when a chapter is added or changed. Local
 imports should use the same readable chapter boundary where possible; a PDF
 represented as one chapter can remain one package.
 
-Each package carries a versioned `manifest.json`, sufficient work and chapter
-metadata for restoration, the stored content type, the body, and its required assets.
-Internal references use portable relative paths. Store work covers separately at
-work scope and cache them locally when needed. Include every asset required to
-read a chapter in that chapter's ZIP, even if another chapter uses the same asset.
-Avoid cross-package asset dependencies in the first version.
+New uploads send a `multipart/form-data` body with a versioned metadata manifest
+first, followed by the original `content.html` or `content.pdf`, optional media
+`manifest.json`, and optional `media.zip`. The metadata uses `layout: "chapter-files"`
+and preserves work and chapter identities. Preserve all file bytes and local media
+references without building an outer ZIP. The media manifest must report complete
+stored assets, and the media ZIP's central directory must match their names and
+sizes. This inventory check does not extract assets or verify ZIP CRCs. Store work
+covers separately at work scope and cache them locally when needed.
+
+Legacy ZIP uploads and downloads remain available. Their package `manifest.json`
+contains metadata and the file inventory. Assets use portable relative paths;
+clients restore local media references when installing these legacy packages.
 
 Initial configurable package limits are 512 MiB of ZIP data, 2 GiB of expanded
 data, and 10,000 files. These are provisional operating defaults, not measured
@@ -186,23 +194,24 @@ partial chapter.
 Publication follows this sequence:
 
 1. Finish local acquisition, including all required assets.
-2. Capture an immutable snapshot and calculate its manifest and hashes.
-3. Build the ZIP and enqueue a durable upload operation.
+2. Capture an immutable snapshot and its file sizes and modification times.
+3. Enqueue a durable upload operation for the original files.
 4. Upload to a server staging area that is absent from the public catalog.
-5. Validate identity, package version, declared files, sizes, and hashes.
-6. Publish the completed package and its catalog change atomically from readers'
+5. Validate identity, package version, declared files, sizes, and media inventory.
+6. Publish the completed revision and its catalog change atomically from readers'
    perspective.
 
 Readers must never discover a package that has only partially uploaded. A repeated
 upload of the same revision must be safe and must not create duplicate chapters.
 Interrupted or rejected uploads stay unpublished and can be retried or cleaned up.
-The first version restarts an interrupted upload of an individual ZIP. Downloads
+Restart an interrupted upload of one chapter. Legacy ZIP downloads
 support resuming from an offset only after confirming that the stored partial
 download belongs to the same immutable ZIP. If that cannot be confirmed, restart
 the download. Retrying the same revision remains idempotent.
 
 Downloading follows the same completion boundary: receive into temporary storage,
-verify, install the body and assets, then mark the chapter locally available.
+check sizes and inventory, install the body and assets, then mark the chapter locally
+available. Original-file ETags contain the immutable revision and original path.
 An interrupted replacement must leave the previous complete revision usable.
 Package validation must reject path traversal and enforce archive size limits
 before extraction. Receiving a package must not execute code from it.

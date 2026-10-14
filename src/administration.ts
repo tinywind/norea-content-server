@@ -53,7 +53,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     if ((await lstat(staging)).isSymbolicLink()) throw problem(400, 'Server staging must not be a symbolic link');
     if (relative(await realpath(dataDir), await realpath(staging)) !== 'staging') throw problem(400, 'Server staging must remain inside server storage');
     for (const entry of await readdir(staging, { withFileTypes: true })) {
-      if (entry.isDirectory() && !entry.isSymbolicLink() && /^folder-[A-Za-z0-9]{6}$/.test(entry.name)) {
+      if (entry.isDirectory() && !entry.isSymbolicLink() && /^(?:folder-[A-Za-z0-9]{6}|files-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/.test(entry.name)) {
         await rm(join(staging, entry.name), { recursive: true, force: true });
       }
     }
@@ -198,7 +198,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     api.get('/overview', async () => {
       const counts = db.prepare(`SELECT COALESCE(SUM(CASE WHEN deleted_at IS NULL THEN 1 ELSE 0 END),0) AS chapters,COUNT(DISTINCT CASE WHEN deleted_at IS NULL THEN work_id END) AS works,COALESCE(SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END),0) AS deletedChapters FROM chapters`).get() as object;
       const works = (db.prepare('SELECT COUNT(*) AS n FROM (SELECT id FROM works UNION SELECT work_id FROM chapters WHERE deleted_at IS NULL)').get() as { n: number }).n;
-      const packages = db.prepare("SELECT COUNT(*) AS revisions,COALESCE(SUM(json_extract(entry,'$.zipBytes')),0) AS zipBytes FROM revisions WHERE path IS NOT NULL").get() as object;
+      const packages = db.prepare("SELECT COUNT(*) AS revisions,COALESCE(SUM(json_extract(entry,'$.zipBytes')),0) AS zipBytes,COALESCE(SUM(COALESCE(json_extract(entry,'$.zipBytes'),json_extract(entry,'$.fileBytes'))),0) AS storedBytes FROM revisions WHERE path IS NOT NULL").get() as object;
       return { ...counts, works, ...packages, plugins: listPlugins(db).length, contentsPath: storageSettings().path, runningJobs: active.size };
     });
     api.get('/plugins', async () => ({ items: listPlugins(db) }));

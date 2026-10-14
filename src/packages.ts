@@ -12,13 +12,14 @@ import { problem, transaction } from './db.ts';
 
 export interface PackageManifest {
   packageVersion: 1;
+  layout?: 'chapter-files';
   identity: { pluginId: string; novelPath: string; chapterPath: string };
   novel: { name: string; author?: string | null; summary?: string | null; isLocal: boolean };
   chapter: { name: string; position: number; chapterNumber?: string | null; contentType: 'html' | 'text' | 'markdown' | 'pdf'; page: string };
   bodyPath: string;
-  files: { path: string; size: number; sha256: string }[];
+  files: ({ path: string; size: number } & ({ sha256: string; modifiedAt?: never } | { modifiedAt: number; sha256?: never }))[];
 }
-export interface CatalogEntry { id: string; revision: string; zipSha256: string; zipBytes: number; manifest: PackageManifest; deleted: boolean; sequence: number }
+export interface CatalogEntry { id: string; revision: string; zipSha256?: string; zipBytes?: number; fileBytes?: number; manifest: PackageManifest; deleted: boolean; sequence: number }
 export interface Limits { zipBytes: number; expandedBytes: number; files: number }
 export const defaultLimits: Limits = { zipBytes: 512 * 1024 ** 2, expandedBytes: 2 * 1024 ** 3, files: 10000 };
 export const digest = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
@@ -54,7 +55,8 @@ export function validateManifest(value: unknown): asserts value is PackageManife
   const m = value as PackageManifest;
   if (!m || typeof m !== 'object' || m.packageVersion !== 1 || !m.identity || !m.novel || !m.chapter || !Array.isArray(m.files)) throw problem(400, 'Unsupported or incomplete package manifest');
   const allowed = (object: object, names: string[]) => { if (Object.keys(object).some(key => !names.includes(key))) throw problem(400, 'Unknown package manifest field'); };
-  allowed(m, ['packageVersion','identity','novel','chapter','bodyPath','files']);
+  allowed(m, ['packageVersion','layout','identity','novel','chapter','bodyPath','files']);
+  if (m.layout !== undefined && m.layout !== 'chapter-files') throw problem(400, 'Unsupported chapter file layout');
   allowed(m.identity, ['pluginId','novelPath','chapterPath']);
   allowed(m.novel, ['name','author','summary','isLocal']);
   allowed(m.chapter, ['name','position','chapterNumber','contentType','page']);
@@ -69,8 +71,14 @@ export function validateManifest(value: unknown): asserts value is PackageManife
   if (typeof m.bodyPath !== 'string' || !safeArchivePath(m.bodyPath)) throw problem(400, 'Invalid body path');
   for (let index = 0; index < m.files.length; index++) {
     const file = m.files[index];
-    if (!file || typeof file.path !== 'string' || !safeArchivePath(file.path) || file.path === 'manifest.json' || !Number.isSafeInteger(file.size) || file.size < 0 || !/^[0-9a-f]{64}$/.test(file.sha256)) throw problem(400, 'Invalid file manifest');
-    allowed(file, ['path','size','sha256']);
+    if (!file || typeof file.path !== 'string' || !safeArchivePath(file.path) || (file.path === 'manifest.json' && m.layout !== 'chapter-files') || !Number.isSafeInteger(file.size) || file.size < 0) throw problem(400, 'Invalid file manifest');
+    if (m.layout === 'chapter-files') {
+      if (typeof file.modifiedAt !== 'number' || !Number.isSafeInteger(file.modifiedAt) || file.modifiedAt < 0) throw problem(400, 'Invalid file modification time');
+      allowed(file, ['path','size','modifiedAt']);
+    } else {
+      if (typeof file.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(file.sha256)) throw problem(400, 'Invalid legacy file checksum');
+      allowed(file, ['path','size','sha256']);
+    }
     if (index && m.files[index - 1].path >= file.path) throw problem(400, 'Manifest files must be sorted and unique');
   }
   if (!m.files.some(file => file.path === m.bodyPath)) throw problem(400, 'Body is absent from file manifest');
@@ -78,7 +86,7 @@ export function validateManifest(value: unknown): asserts value is PackageManife
 
 async function inspectZip(path: string, limits: Limits): Promise<PackageManifest> {
   const zip = await new Promise<yauzl.ZipFile>((accept, reject) => yauzl.open(path, { lazyEntries: true, autoClose: false, validateEntrySizes: true, strictFileNames: true }, (error, value) => error ? reject(problem(400, 'Invalid ZIP package')) : accept(value!)));
-  const found = new Map<string, { size: number; sha256: string }>();
+  const found = new Map<string, number>();
   const entries = new Map<string, yauzl.Entry>();
   const portableNames = new Set<string>();
   let manifest: PackageManifest | undefined;
@@ -97,16 +105,14 @@ async function inspectZip(path: string, limits: Limits): Promise<PackageManifest
           if (portableNames.size > limits.files + 1) throw problem(413, 'Package file limit exceeded');
           if (expanded + entry.uncompressedSize > limits.expandedBytes || (name === 'manifest.json' && entry.uncompressedSize > 4 * 1024 ** 2)) throw problem(413, 'Expanded package limit exceeded');
           const stream = await new Promise<Readable>((acceptStream, rejectStream) => zip.openReadStream(entry, (error, value) => error ? rejectStream(error) : acceptStream(value!)));
-          const hash = createHash('sha256');
           const chunks: Buffer[] = [];
           let size = 0;
           for await (const chunk of stream) {
             size += chunk.length; expanded += chunk.length;
             if (expanded > limits.expandedBytes || (name === 'manifest.json' && size > 4 * 1024 ** 2)) { stream.destroy(); throw problem(413, 'Expanded package limit exceeded'); }
-            hash.update(chunk);
             if (name === 'manifest.json') chunks.push(chunk);
           }
-          found.set(name, { size, sha256: hash.digest('hex') });
+          found.set(name, size);
           if (name === 'manifest.json') { const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8')); validateManifest(parsed); manifest = parsed; }
           zip.readEntry();
         })().catch(reject);
@@ -116,7 +122,7 @@ async function inspectZip(path: string, limits: Limits): Promise<PackageManifest
     if (!manifest || manifest.files.length + 1 !== found.size) throw problem(400, 'Missing manifest or undeclared archive files');
     for (const file of manifest.files) {
       const actual = found.get(file.path);
-      if (!actual || actual.size !== file.size || actual.sha256 !== file.sha256) throw problem(400, 'Missing or corrupt package file');
+      if (actual === undefined || actual !== file.size) throw problem(400, 'Missing or wrong-sized package file');
     }
     if (manifest.chapter.contentType === 'html') {
       const stream = await new Promise<Readable>((accept, reject) => zip.openReadStream(entries.get(manifest!.bodyPath)!, (error, stream) => error ? reject(error) : accept(stream!)));
@@ -193,9 +199,16 @@ export async function publishPackage(db: DatabaseSync, dataDir: string, input: R
     try { await pipeline(input.pipe(meter), createWriteStream(stage, { flags: 'wx' })); }
     finally { input.off('error', forwardError); input.unpipe(meter); input.resume(); }
     const manifest = await inspectZip(stage, limits);
+    if (manifest.layout !== undefined) throw problem(400, 'Original chapter files require the chapter-files upload endpoint');
     const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
     const revision = digest(canonicalize(manifest));
     const entry: CatalogEntry = { id, revision, zipSha256: hash.digest('hex'), zipBytes, manifest, deleted: false, sequence: 0 };
+    return publishRevision(db, dataDir, stage, entry, startedAt, imported);
+  } finally { await rm(stage, { force: true }); }
+}
+
+export function publishRevision(db: DatabaseSync, dataDir: string, stage: string, entry: CatalogEntry, startedAt: number, imported = false): CatalogEntry {
+    const { id, revision, manifest } = entry;
     return transaction(db, () => {
       const existing = db.prepare('SELECT entry,directory,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; directory: string; deleted_at: number | null } | undefined;
       const work = workId(manifest.identity);
@@ -213,7 +226,7 @@ export async function publishPackage(db: DatabaseSync, dataDir: string, input: R
       if (!storedWork || manifest.identity.novelPath.startsWith('norea-folder:')) throw problem(409, 'Register exact work metadata before uploading chapter packages');
       const directory = existing?.directory ?? join(storedWork.directory, ...(imported ? ['.packages'] : []), basename(chapterDirectory(manifest)));
       if (!existing && db.prepare('SELECT id FROM chapters WHERE lower(directory)=lower(?) AND id<>?').get(directory, id)) throw problem(409, 'Readable chapter directory is already used by another identity');
-      const file = join(directory, `${revision}.zip`);
+      const file = join(directory, revisionFileName(entry));
       if (imported) {
         for (let current = resolve(dataDir, file); ; current = dirname(current)) {
           if (existsSync(current) && lstatSync(current).isSymbolicLink()) throw problem(400, 'Symbolic package storage paths are unsupported');
@@ -227,10 +240,11 @@ export async function publishPackage(db: DatabaseSync, dataDir: string, input: R
         const published = imported || !current || current.deleted || !db.prepare('SELECT path FROM revisions WHERE chapter_id=? AND revision=? AND path IS NOT NULL').get(id, current.revision) ? recordEntry(db, entry) : { ...entry, sequence: current.sequence };
         db.prepare('INSERT INTO revisions(chapter_id,revision,entry,path) VALUES(?,?,?,?) ON CONFLICT(chapter_id,revision) DO UPDATE SET entry=excluded.entry,path=excluded.path').run(id, revision, JSON.stringify(published), file);
         return published;
-      } catch (error) { rmSync(join(dataDir, file), { force: true }); throw error; }
+      } catch (error) { rmSync(join(dataDir, file), { recursive: manifest.layout === 'chapter-files', force: true }); throw error; }
     });
-  } finally { await rm(stage, { force: true }); }
 }
+
+function revisionFileName(entry: CatalogEntry): string { return `${entry.revision}.${entry.manifest.layout === 'chapter-files' ? 'files' : 'zip'}`; }
 
 export function chapterRow(db: DatabaseSync, id: string) {
   const row = db.prepare('SELECT entry,directory,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; directory: string; deleted_at: number | null } | undefined;
@@ -242,17 +256,17 @@ export function deleteChapter(db: DatabaseSync, dataDir: string, id: string): Ca
   const row = chapterRow(db, id);
   if (row.catalog.deleted) return row.catalog;
   const trash = join('trash', `${id}-${Date.now()}`);
-  const revisions = db.prepare('SELECT revision,path FROM revisions WHERE chapter_id=?').all(id) as { revision: string; path: string | null }[];
+  const revisions = db.prepare('SELECT revision,path,entry FROM revisions WHERE chapter_id=?').all(id) as { revision: string; path: string | null; entry: string }[];
   const moves: { from: string; to: string }[] = [];
   try {
     mkdirSync(join(dataDir, trash), { recursive: true });
     for (const revision of revisions) {
       if (!revision.path) continue;
-      const from = join(dataDir, revision.path); const to = join(dataDir, trash, `${revision.revision}.zip`);
+      const from = join(dataDir, revision.path); const to = join(dataDir, trash, revisionFileName(JSON.parse(revision.entry)));
       if (existsSync(from)) { renameSync(from, to); moves.push({ from, to }); }
     }
     return transaction(db, () => {
-      for (const revision of revisions) if (revision.path) db.prepare('UPDATE revisions SET path=? WHERE chapter_id=? AND revision=?').run(join(trash, `${revision.revision}.zip`), id, revision.revision);
+      for (const revision of revisions) if (revision.path) db.prepare('UPDATE revisions SET path=? WHERE chapter_id=? AND revision=?').run(join(trash, revisionFileName(JSON.parse(revision.entry))), id, revision.revision);
       db.prepare('UPDATE chapters SET deleted_at=?,generation=generation+1 WHERE id=?').run(Date.now(), id);
       const entry = recordEntry(db, { ...row.catalog, deleted: true });
       db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(id, entry.sequence);
@@ -266,16 +280,16 @@ export function restoreChapter(db: DatabaseSync, dataDir: string, id: string): C
   const workDeletion = db.prepare('SELECT deleted FROM work_tombstones WHERE work_id=?').get(workId(row.catalog.manifest.identity)) as { deleted: number } | undefined;
   if (workDeletion?.deleted) throw problem(409, 'Restore the work before restoring its chapters');
   if (!row.catalog.deleted) return row.catalog;
-  const revisions = db.prepare('SELECT revision,path FROM revisions WHERE chapter_id=? AND path IS NOT NULL').all(id) as { revision: string; path: string }[];
+  const revisions = db.prepare('SELECT revision,path,entry FROM revisions WHERE chapter_id=? AND path IS NOT NULL').all(id) as { revision: string; path: string; entry: string }[];
   const moves: { from: string; to: string }[] = [];
   try {
     mkdirSync(join(dataDir, row.directory), { recursive: true });
     for (const revision of revisions) {
-      const from = join(dataDir, revision.path); const to = join(dataDir, row.directory, `${revision.revision}.zip`);
+      const from = join(dataDir, revision.path); const to = join(dataDir, row.directory, revisionFileName(JSON.parse(revision.entry)));
       renameSync(from, to); moves.push({ from, to });
     }
     return transaction(db, () => {
-      for (const revision of revisions) db.prepare('UPDATE revisions SET path=? WHERE chapter_id=? AND revision=?').run(join(row.directory, `${revision.revision}.zip`), id, revision.revision);
+      for (const revision of revisions) db.prepare('UPDATE revisions SET path=? WHERE chapter_id=? AND revision=?').run(join(row.directory, revisionFileName(JSON.parse(revision.entry))), id, revision.revision);
       db.prepare('UPDATE chapters SET deleted_at=NULL WHERE id=?').run(id);
       return recordEntry(db, { ...row.catalog, deleted: !revisions.some(revision => revision.revision === row.catalog.revision) });
     });
@@ -289,7 +303,7 @@ export function purgeChapter(db: DatabaseSync, dataDir: string, id: string): voi
   for (const revision of revisions) {
     const file = resolve(dataDir, revision.path);
     if (!file.startsWith(resolve(dataDir, 'trash') + sep)) throw problem(500, 'Unexpected package storage path');
-    rmSync(file, { force: true });
+    rmSync(file, { recursive: true, force: true });
   }
   db.prepare('UPDATE revisions SET path=NULL WHERE chapter_id=?').run(id);
 }
@@ -297,7 +311,8 @@ export function purgeChapter(db: DatabaseSync, dataDir: string, id: string): voi
 export function packageStream(db: DatabaseSync, dataDir: string, id: string) {
   const { catalog } = chapterRow(db, id);
   if (catalog.deleted) throw problem(410, 'Chapter was deleted');
+  if (catalog.manifest.layout === 'chapter-files' || catalog.zipBytes === undefined || !catalog.zipSha256) throw problem(406, 'Download the original chapter files instead of a ZIP package');
   const revision = db.prepare('SELECT path FROM revisions WHERE chapter_id=? AND revision=? AND deleted=0').get(id, catalog.revision) as { path: string | null } | undefined;
   if (!revision?.path || !existsSync(join(dataDir, revision.path))) throw problem(410, 'Package is unavailable');
-  return { catalog, open: (start?: number, end?: number) => createReadStream(join(dataDir, revision.path!), { start, end }) };
+  return { catalog: { ...catalog, zipBytes: catalog.zipBytes, zipSha256: catalog.zipSha256 }, open: (start?: number, end?: number) => createReadStream(join(dataDir, revision.path!), { start, end }) };
 }

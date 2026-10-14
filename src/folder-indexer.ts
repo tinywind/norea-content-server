@@ -358,7 +358,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
           if (!entry.isDirectory() || entry.isSymbolicLink() || unfinished(entry.name)) continue;
           const path = join(directory, entry.name);
           const files = await readdir(path, { withFileTypes: true });
-          const onlyPublished = files.length > 0 && files.every(file => file.isFile() && publishedPath.get(relative(dataDir, join(path, file.name))));
+          const onlyPublished = files.length > 0 && files.every(file => (file.isFile() || file.isDirectory()) && publishedPath.get(relative(dataDir, join(path, file.name))));
           if (onlyPublished) {
             for (const file of files) {
               const row = publishedPath.get(relative(dataDir, join(path, file.name))) as { chapter_id: string; revision: string };
