@@ -79,7 +79,7 @@ synchronization can propagate unwanted changes and the server can lose data.
 | Browse the catalog and download content | Anonymous by default; device or console credential when anonymous reading is disabled |
 | Upload complete content | Registered, unblocked device |
 | Soft-delete or restore shared content | Registered device or console session |
-| Purge content, select revisions, or manage the server | Console session |
+| Purge chapters, delete whole work folders, or manage the server | Console session |
 | Read or change personal reading state | Local app only |
 
 First server initialization creates a random 256-bit secret in
@@ -147,20 +147,22 @@ file where available, then preserve it. Independent imports with different file
 bytes remain distinct. Automatic recognition of a revised local book is outside
 the first version.
 
-Represent a changed body or asset set as a new revision of the same chapter.
-Reading state continues to refer to the logical chapter, with the content revision
-recorded when necessary to interpret its position. Do not overwrite one complete
-revision with a different upload solely because it arrived later. The first
-complete revision becomes the default for new downloads. Further revisions are
-retained, and only an administrator can select a different default. A default
-change does not automatically replace content already downloaded to a device.
+Keep one complete copy per logical chapter. An upload for an already complete
+chapter returns the current entry and does not store another copy. The app checks
+availability before creating a transfer snapshot. Missing or wrong-sized files
+allow a completed upload to repair the stored copy. To replace complete content,
+delete the server copy and start a new upload. Device copies remain unchanged.
+The revision field is a transfer/cache token, not a selectable version history.
+Upgrades retain the complete current copy, falling back to the latest available
+copy, and remove historical files and rows.
 
 A canonical metadata manifest identifies a revision. Original-file manifests list
 each file's relative path, byte size, and source modification time as a nonnegative
 safe integer Unix timestamp in milliseconds. Use RFC 8785 JSON canonicalization
 and SHA-256 for this small manifest; do not hash original file payloads. Exclude
 uploader identity and transfer timestamps. A same-size edit with a changed source
-modification time creates a new revision. Payload changes that preserve both size
+modification time changes the transfer token after deletion and republication.
+Payload changes that preserve both size
 and modification time cannot be distinguished. Legacy ZIP manifests retain file
 `sha256` fields for format compatibility, without comparing file payload hashes.
 Legacy ZIP records also retain their archive checksum for ETags.
@@ -263,26 +265,27 @@ unchanged button must not silently escalate local removal into shared deletion.
 Server deletion should explain that other users will lose the ability to obtain
 that server copy. Deleting every device's copy is outside the initial scope.
 
-Registered devices and administrators can soft-delete shared content. Support
-deleting an individual chapter or a whole work. Existing device copies and personal reading records
-remain intact. Download permission never implies shared deletion permission.
+Registered devices and administrators can soft-delete chapters. Console sessions
+can permanently delete whole work folders, including loose source chapters,
+metadata and cover images. Work deletion removes its work/chapter index rows and
+records chapter and work tombstones. Existing device copies and reading records
+remain intact.
 
-Server deletion creates a persistent deletion record. Old queued uploads and
-devices returning after a long offline period must not resurrect the content.
-Republication requires an explicit restoration by an authorized device or console, or permission to
-re-upload against the current deletion state. Deletion must also invalidate any
-pending publication for the affected item.
+Server deletion creates a persistent deletion record. An upload started before
+deletion cannot publish afterward. Background app sync respects server deletions.
+A new chapter upload after deletion can replace the copy. Explicit local rescans
+can republish deleted chapters and works; work metadata uses `PUT /works/:id?restore=true`.
+The original work folder is not recovered by this operation; it uploads the
+device's current files.
 
 Deletion blocks new downloads immediately and retains the files in a trash area
 for 30 days by default. An administrator can permanently delete the files earlier.
 Retain the small deletion record indefinitely, including after the files are
 purged, so a stale device cannot resurrect the content.
 
-Do not automatically purge older revisions of otherwise available content in the
-first version. Administrators can inspect storage usage and explicitly remove
-obsolete revisions. Deleted revisions must remain protected against stale
-re-uploads. Storage exhaustion rejects new uploads instead of silently evicting
-existing content. File cleanup must respect an active backup snapshot.
+A replacement upload removes the prior trash copy. No chapter version history
+or version-selection endpoint is retained. Storage exhaustion rejects uploads
+without evicting current complete content. File cleanup must respect backups.
 
 ## Device-local reading state
 
@@ -353,8 +356,20 @@ schemas during implementation planning using the decisions in this document.
 
 ## Deployment and operations
 
-Run a single Fastify instance with SQLite metadata and ZIP files on persistent
-storage. Stream large transfers between disk and network rather than buffering
+Run a single Fastify instance with persistent state and content storage.
+In Docker, mount a named state volume at `/data` for SQLite, staging, trash, and
+the installation secret. Bind only the host `Norea/contents` directory at
+`/data/contents`. An existing host `admin-password.hash` can be mounted separately
+at `/data/admin-password.hash`. The host content directory must not receive
+SQLite databases, WAL files, or the server staging directory.
+
+Publishing or moving revisions across these mounts must handle different
+filesystems. Copy to a hidden temporary sibling at the destination, then rename
+the complete revision before updating the catalog. Copy failure preserves the
+source and removes the partial destination. Keep both mounts across container
+replacement and back them up together while the server is stopped.
+
+Stream large transfers between disk and network rather than buffering
 entire packages in memory. Do not add Redis, a separate queue service, or an S3
 dependency to the first version. Reconsider a client/server database such as
 PostgreSQL if deployment later requires multiple server instances or substantial
@@ -418,9 +433,8 @@ must remain usable when upgrading from the account-based prototype.
 12. An interrupted download resumes only against the same ZIP. An interrupted
     upload restarts safely. Package limits reject excess data without publishing
     incomplete content.
-13. An administrator can change a chapter's default revision without replacing
-    device copies. Changed content uses an explicitly approximate position when
-    its original locator cannot be restored.
+13. Duplicate or changed uploads preserve a complete server chapter. Deleting
+    and uploading a replacement leaves one stored copy and preserves device files.
 14. Server deletion enters the 30-day trash period. Permanent file removal retains
     deletion records, and explicit device or administrator restoration permits republication.
 15. First connection registers a device without username/password. Restarting
@@ -485,7 +499,7 @@ built TypeScript/CSS assets. It has no separate frontend service or runtime.
 Reloads retain the session until expiry or logout and restore the current
 `/admin/<view>` route. Browser Back/Forward follows view navigation.
 Its primary workflows are plugin repositories, storage scanning, content and
-revision management, scan results, registered devices, and access policy.
+chapter management, scan results, registered devices, and access policy.
 
 Multiple plugin repositories can be registered using a repository JSON URL or
 an absolute server-local JSON path. The supported manifest is the current Norea
@@ -550,15 +564,16 @@ not read, hashed, or repacked, including after a restart. Failed candidates have
 no success checkpoint and retry on subsequent scans. Metadata-only work changes
 do not rebuild unchanged chapters. New and changed candidates use full snapshot
 verification. Stat checks cannot detect edits that preserve every recorded field.
-A changed source chapter becomes the served default revision while retaining
-previous immutable revisions. App uploads keep their existing default-selection
-policy. Explicit deletion tombstones remain authoritative during rescans.
+A changed source chapter does not replace an already complete server copy.
+Explicit deletion tombstones remain authoritative during server folder scans.
 
 Console data includes per-source metadata/version, the single storage scan configuration,
 content identities and revisions, package sizes, persistent job status and
 per-candidate reasons. Device administration shows registration and access metadata;
-personal reading history remains local. Server deletion, restoration, default
-revision selection, and permanent purge use the existing administrator actions.
+personal reading history remains local. Chapter deletion, restoration, purge,
+and permanent whole-work deletion are explicit console actions. Each chapter row
+has Delete beside Inspect; work cards have Delete beside Metadata, and chapter
+pages have Delete work beside the title.
 Private filesystem paths and job results require administrator authentication.
 
 ## Filesystem Metadata v1

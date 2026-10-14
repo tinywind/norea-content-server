@@ -2,7 +2,7 @@
 
 An optional content server for Norea. One Node.js 24 process stores catalog and
 device metadata in SQLite and original chapter files on local disk. Existing ZIP
-revisions remain available. Reading state stays on each device. The API and
+packages remain readable. Reading state stays on each device. The API and
 package versions remain 1.
 
 The server is an optional shadow backup. App navigation, reading, local downloads,
@@ -144,13 +144,13 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   installing content on the client.
 - Registered devices and console administrators use `DELETE /api/v1/chapters/:id`
   and `POST /api/v1/chapters/:id/restore` to manage shared availability.
-  Only console administrators use `POST /api/v1/chapters/:id/revision` to set defaults.
-  A newer app upload does not automatically replace the first default revision.
-  A changed source file found by a storage scan becomes the served default;
-  previous immutable revisions remain available.
-- `POST /api/v1/chapters/:id/purge` permanently removes a deleted chapter's revisions.
-  Tombstones survive purge and restart. Restoration after purge permits a fresh
-  upload but keeps the catalog entry deleted until a complete revision is published.
+  There is no revision selection endpoint. A complete copy is retained until
+  deleted; a new upload after deletion replaces it.
+- `POST /api/v1/chapters/:id/purge` permanently removes a deleted chapter's copy.
+  Tombstones survive purge and restart. A new upload can republish the chapter.
+- `DELETE /api/v1/admin/works/:id` permanently removes the selected work folder,
+  chapters, cover and metadata. It requires a console session. Explicit device
+  rescans can republish metadata using `PUT /api/v1/works/:id?restore=true`.
 - `GET /api/v1/changes?catalogAfter=0&waitSeconds=20` returns `{catalogCursor}`.
   It waits up to 20 seconds for catalog changes. Disabling anonymous reading also
   protects this endpoint. Fetch catalog pages to consume a hint; persist only
@@ -187,13 +187,14 @@ Legacy ZIP limits remain 512 MiB ZIP bytes, 2 GiB expanded bytes, and 10,000 con
 files plus a package `manifest.json` of at most 4 MiB. Tests can supply smaller
 limits through `buildApp`. Ordinary JSON requests are limited to 1 MiB.
 
-Deleting a chapter moves its revisions to `trash/` and immediately blocks new
+Deleting a chapter moves its single copy to `trash/` and immediately blocks new
 downloads. Files older than 30 days are purged at server startup. Explicit purge
 can remove them earlier. Existing device content and local reading state remain intact.
-Available revisions are never automatically evicted.
+Complete current copies are never automatically evicted.
 
-For backup, stop the server and copy the entire data directory, including SQLite,
-its WAL files, revision files, and trash. Restore the complete directory before restart.
+For backup, stop the server and copy both the server state volume and the host
+content directory, including SQLite, its WAL files, revision files, and trash.
+Include a separately mounted password file. Restore all mounts before restart.
 This offline procedure gives a consistent database/files snapshot. Live backup,
 whole-work administration, work cover transfer, obsolete-revision removal,
 automatic scheduled trash cleanup, storage quotas, and historical operator metrics are
@@ -201,9 +202,40 @@ not implemented. Protect public deployments with proxy-level rate limits and TLS
 
 ## Docker
 
-`docker compose up --build -d` exposes the service at `127.0.0.1:8787` and keeps
-data in the `norea-data` volume. Read `/data/admin-password.hash` privately after
-first startup to sign in. Back up the volume while the service is stopped.
+`docker compose up --build -d` exposes the service at `127.0.0.1:8787`.
+The `norea-state` volume holds `/data`, including SQLite, staging, trash, and the
+installation secret. Only `/data/contents` is bound to a host content directory;
+it defaults to `./data/contents`. Set `NOREA_CONTENTS_PATH` to an existing
+`Norea/contents` directory before starting Compose. On Linux, grant UID 1000 write
+access to that host directory.
+
+For an existing Windows library and the published image:
+
+```powershell
+docker run -d --name norea-content-server --restart unless-stopped `
+  -p 8080:8787 `
+  --mount type=volume,source=norea-content-server-state,target=/data `
+  --mount "type=bind,source=C:\Users\tinywind\OneDrive\Documents\Norea\contents,target=/data/contents" `
+  tinywind0/norea-content-server:latest
+```
+
+Read `/data/admin-password.hash` privately after first startup to sign in.
+To retain an existing host password file, also mount that file at
+`/data/admin-password.hash`; the host file must already exist. Bind only
+`Norea/contents`, not the entire `Norea` directory, so database and staging writes
+stay out of the host content folder and cloud-sync clients.
+
+When replacing an older container, stop it first and copy `metadata.sqlite` and
+any remaining `metadata.sqlite-wal` and `metadata.sqlite-shm` files into the state
+volume. Preserve `trash/` and the installation secret there unless the secret is
+mounted separately. Keep a stopped-server backup until the new container can
+read the existing catalog. Preserve the content bind mount without moving or
+rewriting its files. Back up state and content together while the server is stopped.
+
+Content and state may reside on different filesystems. Publication and trash
+moves copy into a temporary sibling of the destination, then rename the complete
+file or directory. Failed copies remove that temporary destination and preserve
+the source. These hidden temporary names are excluded from content scans.
 
 ## Checks
 
@@ -307,11 +339,26 @@ the original-file upload route, and it leaves those source folders unchanged.
 `POST /api/v1/admin/storage/scan` starts a manual scan. Folder-root CRUD routes
 have been removed.
 
-In Content, inspect revisions, select the default, move server chapters to trash,
-restore them, or permanently purge their server packages. These actions never
-modify original loose chapters or imported archives. Deletion moves only indexed
-server revision ZIPs and `.files` directories to trash. Rescanning does not
-resurrect server tombstones.
+The server keeps one complete copy per chapter. An upload for a chapter that is
+already complete returns the existing entry without storing another version.
+The app checks the server before copying or sending local files. Missing or
+wrong-sized server files can be repaired by a completed upload. On upgrade,
+historical copies are removed while keeping the complete current copy, or the
+most recent available copy if the current one is missing.
+
+In Content, each chapter has **Delete** beside **Inspect**. Chapter deletion moves
+its indexed server copy to trash; local device copies and original scan inputs
+remain intact. A new upload after deletion replaces it and removes the trash
+copy. Scanning alone does not restore deleted chapters. In the app, select
+chapters and choose **Delete from server**, then use **Rescan local files and
+sync** to upload replacements. Background sync respects deletion records.
+
+Work cards have **Delete** beside **Metadata**. The chapter page also has
+**Delete work** beside the work title. After confirmation, work deletion removes
+the entire server work folder, including original loose chapters, metadata and
+cover images, and removes its DB index. This action is permanent. Deletion
+records prevent automatic reuploads; an explicit app rescan can republish the
+work. Copies and reading state on devices remain intact.
 Devices can be blocked or unblocked independently. Personal reading records stay
 on each app and are never synchronized to the server.
 
@@ -323,5 +370,6 @@ procedure still applies; the console does not provide live backup.
 Administration REST routes are under `/api/v1/admin/` and require an administrator
 bearer token, including filesystem paths and scan results. OpenAPI includes the
 management routes. The Docker image builds and serves the same console assets.
-Mount the single data directory writable: SQLite, staging, trash, and generated
-packages share that directory. Existing source files remain unchanged by scans.
+Keep the state volume and content bind mount writable. SQLite, staging, and trash
+stay in the state volume; chapter files and work metadata stay in the content
+bind mount. Existing source files remain unchanged by scans.

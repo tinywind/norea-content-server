@@ -37,7 +37,7 @@ const descriptions: Record<View, string> = {
   Overview: 'Content, storage, and ingestion at a glance.',
   Plugins: 'Register repositories and inspect the source identities they provide.',
   Storage: 'Inspect the content directory and scan for new or changed files.',
-  Content: 'Browse works and metadata, inspect chapters, and manage stored revisions.',
+  Content: 'Browse works and metadata, inspect chapters, and delete server copies.',
   Jobs: 'Follow scans and inspect the outcome of every discovered file.',
   Devices: 'Inspect registered devices and block or restore their access.',
   Settings: 'Control anonymous reading and inspect server configuration.',
@@ -236,7 +236,7 @@ async function overview(current: number) {
   const stats = el('div', 'stats');
   for (const [label, value, detail] of [
     ['Works', data.works.toLocaleString(), 'Distinct novels in the catalog'], ['Chapters', data.chapters.toLocaleString(), 'Available to connected readers'],
-    ['Content storage', bytes(data.storedBytes), `${data.revisions.toLocaleString()} stored revisions`], ['Running scans', data.runningJobs.toLocaleString(), 'Content directory'],
+    ['Content storage', bytes(data.storedBytes), `${data.revisions.toLocaleString()} stored chapters`], ['Running scans', data.runningJobs.toLocaleString(), 'Content directory'],
   ]) stats.append(el('div', 'stat', el('div', 'stat-label', label), el('div', 'stat-value', value), el('div', 'stat-detail', detail)));
   const inventory = panel('Server inventory');
   for (const [label, value] of [['Registered repositories', data.plugins], ['Chapters in trash', data.deletedChapters]]) inventory.body.append(el('div', 'health-line', el('span', '', label), el('strong', '', value)));
@@ -324,6 +324,11 @@ function inspectWork(work: Work) {
   const json = el('details', 'metadata-json', el('summary', '', 'Full JSON'), el('pre', 'mono', JSON.stringify(metadata, null, 2)));
   modal.body.append(details(values), json);
 }
+async function deleteWork(work: Work): Promise<boolean> {
+  if (!confirm(`Delete “${work.metadata.novel.name}” and its entire server folder, including all chapters, metadata and cover images? This cannot be undone. Copies on other devices remain.`)) return false;
+  await api(`/admin/works/${encodeURIComponent(work.id)}`, 'DELETE');
+  return true;
+}
 async function contentRoute(current: number) {
   const query = new URLSearchParams(location.search);
   if (query.has('work') || query.has('chapters')) {
@@ -358,7 +363,8 @@ async function content(current: number, state: WorkView) {
     for (const work of data.items) {
       const cover = el('div', 'work-cover', el('span', 'cover-placeholder', work.hasCover ? 'Loading cover…' : 'No cover'));
       const title = action(work.metadata.novel.name, () => openChapters(work), 'work-title');
-      const controls = el('div', 'actions', action('Chapters', () => openChapters(work), 'small'), action('Metadata', () => inspectWork(work), 'small'));
+      const controls = el('div', 'actions', action('Chapters', () => openChapters(work), 'small'), action('Metadata', () => inspectWork(work), 'small'),
+        action('Delete', async () => { if (await deleteWork(work)) await load(state.offset); }, 'small danger', errors));
       const info = el('div', 'work-info', el('h3', '', title), el('p', 'hint work-author', work.metadata.novel.author || 'Unknown author'),
         el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${(work.downloadedChapters ?? 0).toLocaleString()} chapters available`), controls);
       works.append(el('article', 'work', cover, info));
@@ -386,7 +392,7 @@ async function content(current: number, state: WorkView) {
 }
 async function chapters(current: number, work: Work | undefined, back: () => Promise<void>) {
   clearCovers();
-  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'Downloaded chapters and stored revisions for this work.' : 'All chapters associated with registered work metadata.'); section.body.className = '';
+  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'One complete server copy per chapter. Delete it before uploading a replacement.' : 'All chapters associated with registered work metadata.'); section.body.className = '';
   const query = new URLSearchParams(location.search);
   const search = input('search', 'search', query.get('chapterSearch') ?? '', false); search.className = 'search-input'; search.placeholder = 'Search novel or chapter'; search.setAttribute('aria-label', 'Search content');
   const deleted = select('deleted', ['Active content', 'Trash']); deleted.setAttribute('aria-label', 'Content state'); deleted.className = 'button';
@@ -402,7 +408,10 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
       results.replaceChildren(table(['Chapter', 'Source', 'Stored content', 'Actions'], data.items.map(entry => [
         el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
         el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.zipBytes ?? entry.fileBytes ?? 0), el('div', 'hint mono', entry.revision.slice(0, 12))),
-        action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'),
+        el('div', 'actions', action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'), entry.deleted ? null : action('Delete', async () => {
+          if (!confirm(`Delete “${entry.manifest.chapter.name}” from the server? Local device copies remain. You can upload a replacement after deletion.`)) return;
+          await api(`/chapters/${encodeURIComponent(entry.id)}`, 'DELETE'); await load(offset);
+        }, 'small danger', errors)),
       ]), deleted.value === 'Trash' ? 'Trash is empty.' : 'No matching chapters. Scan the content directory to add content.'), pagination(data.total, offset, 50, load));
     } catch (error) {
       if (current !== generation || request !== requestId) return;
@@ -410,6 +419,9 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
     } finally { if (request === requestId) results.removeAttribute('aria-busy'); }
   };
   const form = el('form', 'toolbar', search, deleted); const errors = el('div'); errors.setAttribute('role', 'alert');
+  if (work) section.node.querySelector('h2')?.append(' ', action('Delete work', async () => {
+    if (await deleteWork(work)) await back();
+  }, 'small danger', errors));
   form.append(submit(form, 'Search', () => load(), errors)); deleted.addEventListener('change', () => { void load().catch(error => showError(errors, error)); });
   results.append(el('div', 'loading', 'Loading chapters…'));
   section.body.append(form, errors, results); if (current !== generation) return;
@@ -418,14 +430,14 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
 async function inspectEntry(id: string, changed: () => Promise<void>) {
   const modal = dialog('Chapter details'); modal.body.append(el('div', 'loading', 'Loading chapter…'));
   try {
-    const { entry, revisions } = await api<{ entry: Entry; revisions: Entry[] }>(`/admin/chapters/${encodeURIComponent(id)}`); if (!modal.node.isConnected) return;
+    const { entry } = await api<{ entry: Entry }>(`/admin/chapters/${encodeURIComponent(id)}`); if (!modal.node.isConnected) return;
     const errors = el('div'); const endpoint = `/chapters/${encodeURIComponent(id)}`;
     const done = async () => { modal.node.close(); await changed(); };
     const actions = el('div', 'actions');
     if (entry.deleted) {
       actions.append(action('Restore chapter', async () => { await api(`${endpoint}/restore`, 'POST'); await done(); }, 'primary', errors),
-        action('Permanently purge', async () => { if (!confirm(`Permanently purge “${entry.manifest.chapter.name}” and its stored revisions from this server? This cannot be undone. Original source files remain untouched.`)) return; await api(`${endpoint}/purge`, 'POST'); await done(); }, 'danger', errors));
-    } else actions.append(action('Move to trash', async () => { if (!confirm(`Move “${entry.manifest.chapter.name}” to server trash? Original source files remain untouched.`)) return; await api(endpoint, 'DELETE'); await done(); }, 'danger', errors));
+        action('Permanently purge', async () => { if (!confirm(`Permanently purge “${entry.manifest.chapter.name}” from server trash? This cannot be undone.`)) return; await api(`${endpoint}/purge`, 'POST'); await done(); }, 'danger', errors));
+    } else actions.append(action('Delete from server', async () => { if (!confirm(`Delete “${entry.manifest.chapter.name}” from the server? Local device copies remain. You can upload a replacement after deletion.`)) return; await api(endpoint, 'DELETE'); await done(); }, 'danger', errors));
     const metadata: [string, Child][] = [['Status', badge(entry.deleted ? 'deleted' : 'active')], ['Position', entry.manifest.chapter.position], ['Content type', entry.manifest.chapter.contentType]];
     if (entry.manifest.novel.author) metadata.push(['Author', entry.manifest.novel.author]);
     if (entry.manifest.novel.summary) metadata.push(['Summary', entry.manifest.novel.summary]);
@@ -434,8 +446,7 @@ async function inspectEntry(id: string, changed: () => Promise<void>) {
     modal.body.replaceChildren(el('div', '', el('h3', '', entry.manifest.chapter.name), el('p', 'hint', entry.manifest.novel.name)),
       details(metadata),
       ...(entry.manifest.layout === 'chapter-files' ? [table(['Original file', 'Size'], entry.manifest.files.map(file => [el('span', 'mono', file.path), bytes(file.size)]), 'No stored files.')] : []),
-      el('div', 'notice', 'All actions affect this server only. Original source files remain untouched.'), actions, errors, el('h3', '', 'Stored revisions'),
-      table(['Revision', 'Size', 'Selection'], revisions.map(revision => [el('span', 'mono', revision.revision), bytes(revision.zipBytes ?? revision.fileBytes ?? 0), revision.revision === entry.revision ? badge('current') : entry.deleted || revision.deleted ? badge('unavailable') : action('Use revision', async () => { if (!confirm('Make this revision the current chapter content? Readers will receive the selected revision.')) return; await api(`${endpoint}/revision`, 'POST', { revision: revision.revision }); await done(); }, 'small', errors)]), 'No stored revisions.'));
+      el('div', 'notice', 'Only one complete copy is kept. Delete it before uploading a replacement. These actions affect this server only.'), actions, errors);
   } catch (error) { showError(modal.body, error); }
 }
 
