@@ -12,7 +12,7 @@ import type { NovelMetadataV1 } from '../src/works.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 function metadata(pluginId: string, name: string): NovelMetadataV1 {
-  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, cover: null, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null };
+  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null };
 }
 async function fixture(anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });

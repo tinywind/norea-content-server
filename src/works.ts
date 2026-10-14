@@ -11,36 +11,78 @@ import { digest, recordEntry, safeArchivePath, type CatalogEntry } from './packa
 export interface NovelMetadataV1 {
   schemaVersion: 1;
   identity: { pluginId: string; novelPath: string };
-  novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
-  cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
+  novel: {
+    name: string;
+    author: string | null;
+    artist: string | null;
+    summary: string | null;
+    status: string | null;
+    genres: string | null;
+    rating: number | null;
+    isLocal: boolean;
+  };
+  cover: { fileName: string; contentType: string | null } | null;
 }
+
 export interface WorkEntry { id: string; sequence: number; metadata: NovelMetadataV1; hasCover: boolean; deleted?: boolean }
 interface WorkRow { id: string; directory: string; entry: string; fingerprint: string }
 export const metadataByteLimit = 16 * 1024 ** 2;
 export const coverByteLimit = 10 * 1024 ** 2;
 export const metadataWorkId = (value: NovelMetadataV1) => digest(JSON.stringify([value.identity.pluginId, value.identity.novelPath]));
-const validSegment = (value: unknown): value is string => typeof value === 'string' && value.isWellFormed() && value.length > 0 && value.length <= 240 && value !== '.' && value !== '..' && !/[\x00-\x1f<>:"/\\|?*]/.test(value) && !/[. ]$/.test(value) && !/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(value);
+function record(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw problem(400, 'work metadata: expected object');
+  return value as Record<string, unknown>;
+}
 
-export function validateNovelMetadata(value: unknown): asserts value is NovelMetadataV1 {
-  const object = (input: unknown, keys: string[]): Record<string, unknown> => {
-    if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== keys.length || keys.some(key => !Object.hasOwn(input, key))) throw problem(400, 'Invalid or unknown work metadata fields');
-    return input as Record<string, unknown>;
-  };
-  const text = (input: unknown, required = false) => typeof input === 'string' && input.isWellFormed() && (!required || (input.trim().length > 0 && input.length <= 4096));
-  const nullable = (input: unknown) => input === null || text(input);
-  const m = object(value, ['schemaVersion', 'identity', 'novel', 'cover']);
-  const identity = object(m.identity, ['pluginId', 'novelPath']);
-  const novel = object(m.novel, ['name', 'cover', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal']);
-  if (m.schemaVersion !== 1 || !text(identity.pluginId, true) || !text(identity.novelPath, true) || !text(novel.name, true) || typeof novel.isLocal !== 'boolean') throw problem(400, 'Invalid work identity or metadata');
-  for (const key of ['cover', 'author', 'artist', 'summary', 'status', 'genres']) if (!nullable(novel[key])) throw problem(400, 'Invalid novel metadata');
-  if (novel.rating !== null && (typeof novel.rating !== 'number' || !Number.isFinite(novel.rating) || novel.rating < 0 || novel.rating > 5)) throw problem(400, 'Invalid novel rating');
-  if (/^(?:https?:)?\/\//i.test(identity.novelPath as string)) throw problem(400, 'Work path must exclude the source base URL');
-  if ((identity.novelPath as string).startsWith('norea-folder:')) throw problem(400, 'Synthetic work identities are unsupported');
-  if (m.cover !== null) {
-    const cover = object(m.cover, ['fileName', 'contentType', 'sourceUrl']);
-    if (!validSegment(cover.fileName) || !/^cover\.(avif|bmp|gif|img|jpe?g|png|svg|webp)$/.test(cover.fileName) || !nullable(cover.contentType) || !text(cover.sourceUrl, true) || (typeof cover.contentType === 'string' && !/^image\/[a-zA-Z0-9.+-]+$/.test(cover.contentType))) throw problem(400, 'Invalid work cover');
+function text(value: unknown, nullable = false): void {
+  if (nullable && value === null) return;
+  if (typeof value !== 'string' || value.length > (nullable ? metadataByteLimit : 4096) || (!nullable && !value.trim()) ||
+    Array.from(value).some((character) => { const code = character.codePointAt(0)!; return code >= 0xd800 && code <= 0xdfff; })) {
+    throw problem(400, 'work metadata: invalid text');
   }
-  if (Buffer.byteLength(JSON.stringify(value)) > metadataByteLimit) throw problem(413, 'Work metadata exceeds byte limit');
+}
+
+export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
+  const value = record(raw);
+  if (value.schemaVersion !== undefined && value.schemaVersion !== 1) {
+    throw problem(400, 'work metadata: invalid version');
+  }
+  const identity = record(value.identity);
+  text(identity.pluginId); text(identity.novelPath);
+  if ((identity.novelPath as string).startsWith('norea-folder:')) throw problem(400, 'work metadata: source work identity required');
+  if (/^(?:https?:)?\/\//i.test(identity.novelPath as string)) throw problem(400, 'work metadata: work identity must exclude the base URL');
+  const novel = record(value.novel);
+  text(novel.name);
+  for (const key of ['author', 'artist', 'summary', 'status', 'genres']) text(novel[key] ?? null, true);
+  if (novel.rating != null && (typeof novel.rating !== 'number' || !Number.isFinite(novel.rating) || novel.rating < 0 || novel.rating > 5)) throw problem(400, 'work metadata: invalid rating');
+  if (novel.isLocal != null && typeof novel.isLocal !== 'boolean') throw problem(400, 'work metadata: invalid local flag');
+  let cover: NovelMetadataV1['cover'] = null;
+  if (value.cover != null) {
+    const input = record(value.cover);
+    text(input.fileName); text(input.contentType ?? null, true);
+    if (input.contentType != null && !/^image\/[a-zA-Z0-9.+-]+$/.test(input.contentType as string)) throw problem(400, 'work metadata: invalid cover content type');
+    if (!/^cover\.(avif|bmp|gif|img|jpe?g|png|svg|webp)$/.test(input.fileName as string)) throw problem(400, 'work metadata: unsafe cover filename');
+    cover = { fileName: input.fileName as string, contentType: input.contentType as string | undefined ?? coverContentType(input.fileName as string) };
+  }
+  if (new TextEncoder().encode(JSON.stringify(value)).byteLength > metadataByteLimit) throw problem(413, 'work metadata: document exceeds size limit');
+  const parsed = value as unknown as NovelMetadataV1;
+  return {
+    schemaVersion: 1,
+    identity: { pluginId: parsed.identity.pluginId, novelPath: parsed.identity.novelPath },
+    novel: {
+      name: parsed.novel.name, author: parsed.novel.author ?? null,
+      artist: parsed.novel.artist ?? null, summary: parsed.novel.summary ?? null, status: parsed.novel.status ?? null,
+      genres: parsed.novel.genres ?? null, rating: parsed.novel.rating ?? null, isLocal: parsed.novel.isLocal ?? false,
+    },
+    cover,
+  };
+}
+
+export function coverContentType(fileName: string): string | null {
+  const extension = fileName.split('.').at(-1);
+  if (extension === 'jpg' || extension === 'jpeg') return 'image/jpeg';
+  if (extension === 'svg') return 'image/svg+xml';
+  return extension && ['avif', 'bmp', 'gif', 'png', 'webp'].includes(extension) ? `image/${extension}` : null;
 }
 
 function noLinks(path: string): void {
@@ -62,7 +104,7 @@ export function readNovelMetadata(path: string): NovelMetadataV1 {
   let value: unknown;
   try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(readBytes(path, metadataByteLimit))); }
   catch (error) { throw problem(400, `Cannot read novel.json: ${(error as Error).message}`); }
-  validateNovelMetadata(value); return value;
+  return parseNovelMetadata(value);
 }
 function atomicWrite(path: string, bytes: string | Buffer): void {
   noLinks(path); mkdirSync(dirname(path), { recursive: true });
@@ -77,10 +119,21 @@ const rowFor = (db: DatabaseSync, id: string) => db.prepare('SELECT * FROM works
 function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer | undefined {
   if (!metadata.cover) return undefined;
   const path = join(directory, metadata.cover.fileName);
-  try { return readBytes(path, coverByteLimit); }
+  try { const bytes = readBytes(path, coverByteLimit); return bytes.length ? bytes : undefined; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
 }
+export const isCoverFile = (name: string) => /^cover\.(avif|bmp|gif|img|jpe?g|png|svg|webp)$/.test(name);
+function discoverCover(directory: string, preferred: NovelMetadataV1['cover']): NovelMetadataV1['cover'] {
+  noLinks(directory);
+  if (!existsSync(directory)) return preferred;
+  const candidates = readdirSync(directory, { withFileTypes: true })
+    .filter(file => isCoverFile(file.name) && file.isFile() && !file.isSymbolicLink() && lstatSync(join(directory, file.name)).size > 0)
+    .map(file => file.name).sort();
+  const fileName = candidates.includes(preferred?.fileName ?? '') ? preferred!.fileName : candidates[0];
+  return fileName ? { fileName, contentType: fileName === preferred?.fileName ? preferred.contentType : coverContentType(fileName) } : preferred;
+}
 export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1, restore = false): WorkEntry {
+  metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover) };
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(409, 'Work was deleted from the server');
   if (existing && existing.directory !== directory) throw problem(409, 'Duplicate work identity in different folders');
@@ -115,7 +168,7 @@ export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
   }
   transaction(db, () => {
     for (const row of db.prepare('SELECT sequence,entry FROM work_changes').all() as { sequence: number; entry: string }[]) {
-      try { validateNovelMetadata(JSON.parse(row.entry).metadata); }
+      try { parseNovelMetadata(JSON.parse(row.entry).metadata); }
       catch { db.prepare('DELETE FROM work_changes WHERE sequence=?').run(row.sequence); }
     }
     for (const row of db.prepare('SELECT id FROM works').all() as { id: string }[]) {
@@ -137,10 +190,10 @@ function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
   return directory;
 }
 export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false): WorkEntry {
-  validateNovelMetadata(value); const id = metadataWorkId(value);
+  const metadata = parseNovelMetadata(value); const id = metadataWorkId(metadata);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(410, 'Work was deleted from the server');
   if (expectedId !== undefined && expectedId !== id) throw problem(400, 'Work identity does not match requested ID');
-  const directory = workDirectory(db, value);
+  const directory = workDirectory(db, metadata);
   const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, id);
   if (collision) throw problem(409, 'Work directory is already assigned');
   const file = join(dataDir, directory, 'novel.json');
@@ -149,8 +202,8 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
     const bytes = readBytes(file, metadataByteLimit);
     try { current = JSON.parse(bytes.toString('utf8')); } catch { current = undefined; }
   }
-  if (current === undefined || canonicalize(current) !== canonicalize(value)) atomicWrite(file, JSON.stringify(value, null, 2) + '\n');
-  return cacheWork(db, dataDir, directory, value, restore);
+  if (current === undefined || canonicalize(current) !== canonicalize(metadata)) atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
+  return cacheWork(db, dataDir, directory, metadata, restore);
 }
 
 export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkEntry {
@@ -196,11 +249,13 @@ export function getWork(db: DatabaseSync, dataDir: string, id: string): WorkEntr
   return cacheWork(db, dataDir, row.directory, metadata);
 }
 export function saveWorkCover(db: DatabaseSync, dataDir: string, id: string, bytes: Buffer): WorkEntry {
-  const entry = getWork(db, dataDir, id); if (!entry.metadata.cover) throw problem(409, 'Work metadata has no cover descriptor');
+  const row = rowFor(db, id); if (!row) throw problem(404, 'Work not found');
+  const metadata = readNovelMetadata(join(dataDir, row.directory, 'novel.json'));
+  if (metadataWorkId(metadata) !== id) throw problem(409, 'Stored work identity changed');
+  if (!metadata.cover) throw problem(409, 'Work metadata has no cover descriptor');
   if (!bytes.length || bytes.length > coverByteLimit) throw problem(413, 'Cover must contain at most 10 MiB');
-  const directory = rowFor(db, id)!.directory;
-  atomicWrite(join(dataDir, directory, entry.metadata.cover.fileName), bytes);
-  return cacheWork(db, dataDir, directory, entry.metadata);
+  atomicWrite(join(dataDir, row.directory, metadata.cover.fileName), bytes);
+  return cacheWork(db, dataDir, row.directory, metadata);
 }
 
 export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; notify: () => void }): void {
@@ -225,7 +280,10 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     requireRead(request);
     const { after, limit } = request.query;
     const rows = db.prepare('SELECT entry FROM work_changes WHERE sequence>? ORDER BY sequence LIMIT ?').all(after, limit + 1) as { entry: string }[];
-    const items = rows.slice(0, limit).map(row => JSON.parse(row.entry) as WorkEntry);
+    const items = rows.slice(0, limit).map(row => {
+      const entry = JSON.parse(row.entry) as WorkEntry;
+      return { ...entry, metadata: parseNovelMetadata(entry.metadata) };
+    });
     return { items, cursor: items.at(-1)?.sequence ?? after, hasMore: rows.length > limit };
   });
   app.get<{ Params: { id: string } }>('/api/v1/works/:id', { schema: { params } }, async request => { requireRead(request); return getWork(db, dataDir, request.params.id); });

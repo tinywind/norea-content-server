@@ -13,8 +13,8 @@ import { consoleHeaders, deviceHeaders } from './access.ts';
 
 export function metadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/books/1?lang=ko' },
-    novel: { name: 'Book', cover: 'https://example.com/cover.png', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
-    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example.com/cover.png' } };
+    novel: { name: 'Book', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
+    cover: { fileName: 'cover.png', contentType: 'image/png' } };
 }
 const id = digest(JSON.stringify(['example', '/books/1?lang=ko']));
 async function fixture() {
@@ -24,6 +24,32 @@ async function fixture() {
   const headers = await deviceHeaders(app);
   return { app, dataDir, headers, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
+
+test('restores minimal work files and local covers without source URLs or exact optional fields', async () => {
+  await mkdir('.tmp', { recursive: true });
+  const dataDir = await mkdtemp(resolve('.tmp/minimal-work-'));
+  const directory = join(dataDir, 'contents/example/Book');
+  await mkdir(directory, { recursive: true });
+  const document = { identity: { pluginId: 'example', novelPath: '/books/1?lang=ko' },
+    novel: { name: 'Book', cover: 'https://removed.invalid/cover.jpg' }, extra: true };
+  await writeFile(join(directory, 'novel.json'), JSON.stringify(document));
+  const bytes = Buffer.from('stored cover');
+  await writeFile(join(directory, 'cover.jpg'), bytes);
+  const app = await buildApp({ dataDir, anonymousRead: true });
+  try {
+    const work = await app.inject(`/api/v1/works/${id}`);
+    assert.equal(work.statusCode, 200);
+    assert.equal(work.json().hasCover, true);
+    assert.deepEqual(work.json().metadata.cover, { fileName: 'cover.jpg', contentType: 'image/jpeg' });
+    assert.equal(work.json().metadata.novel.author, null);
+    assert.equal(JSON.stringify(work.json()).includes('https://'), false);
+    const admin = await consoleHeaders(app, dataDir);
+    const cover = await app.inject({ url: `/api/v1/admin/works/${id}/cover`, headers: admin });
+    assert.equal(cover.statusCode, 200);
+    assert.deepEqual(cover.rawPayload, bytes);
+    assert.equal(await readFile(join(directory, 'novel.json'), 'utf8'), JSON.stringify(document));
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
 
 test('admin work deletion removes the whole folder and DB rows while preserving device copies and durable tombstones', async () => {
   const f = await fixture();
@@ -161,8 +187,6 @@ test('rejects unsafe metadata and identity mismatches without replacing a valid 
   try {
     assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).statusCode, 200);
     const variants = [
-      { ...metadata(), chapters: [] },
-      { ...metadata(), updatedAt: 1 },
       { ...metadata(), novel: { ...metadata().novel, rating: 6 } },
       { ...metadata(), identity: { pluginId: 'example', novelPath: 'https://toki45.com/novel/123' } },
       { ...metadata(), identity: { pluginId: 'example', novelPath: '//toki45.com/novel/123' } },
@@ -172,8 +196,6 @@ test('rejects unsafe metadata and identity mismatches without replacing a valid 
       { ...metadata(), cover: { ...metadata().cover, fileName: 'cover.json' } },
       { ...metadata(), cover: { ...metadata().cover, fileName: 'cover.PNG' } },
       { ...metadata(), cover: { ...metadata().cover, fileName: 'cover.exe' } },
-      { ...metadata(), cover: { ...metadata().cover, sourceUrl: ' ' } },
-      { ...metadata(), readingProgress: 8 },
     ];
     for (const payload of variants) assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload })).statusCode, 400);
     assert.deepEqual((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata, metadata());
@@ -239,4 +261,45 @@ test('unchanged metadata preserves file timestamps and startup excludes obsolete
     assert.deepEqual((await app.inject('/api/v1/works')).json().items, []);
     assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), obsolete);
   } finally { await app.close(); await rm(f.dataDir, { recursive: true, force: true }); }
+});
+
+
+test('uploads only normalized metadata and ignores extra source URLs and personal fields', async () => {
+  const f = await fixture();
+  try {
+    const value = metadata();
+    const payload = { ...value, updatedAt: 99, chapters: [], readingProgress: 8,
+      novel: { ...value.novel, cover: 'https://unused.invalid/cover.jpg' },
+      cover: { ...value.cover, sourceUrl: 'https://unused.invalid/cover.jpg' } };
+    const uploaded = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload });
+    assert.equal(uploaded.statusCode, 200, uploaded.body);
+    assert.deepEqual(uploaded.json().metadata, value);
+    const db = openDatabase(f.dataDir);
+    const row = db.prepare('SELECT directory,entry FROM works WHERE id=?').get(id) as { directory: string; entry: string };
+    assert.equal(row.entry.includes('unused.invalid'), false);
+    assert.deepEqual(JSON.parse(await readFile(join(f.dataDir, row.directory, 'novel.json'), 'utf8')), value);
+    assert.equal((await readdir(join(f.dataDir, row.directory))).includes('cover.json'), false);
+    const response = await f.app.inject({ url: '/api/v1/works', headers: f.headers });
+    assert.deepEqual(response.json().items[0].metadata, value);
+    db.close();
+  } finally { await f.close(); }
+});
+
+
+test('cover uploads honor the declared target while reads can discover another local image', async () => {
+  const f = await fixture();
+  try {
+    const put = (value: ReturnType<typeof metadata>) => f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: value });
+    const cover = (bytes: string) => f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}/cover`, headers: { ...f.headers, 'content-type': 'image/png' }, payload: Buffer.from(bytes) });
+    await put(metadata()); await cover('original png');
+    const value = { ...metadata(), cover: { fileName: 'cover.webp', contentType: 'image/webp' } };
+    await put(value);
+    assert.equal((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata.cover.fileName, 'cover.png');
+    const uploaded = await cover('new webp');
+    assert.equal(uploaded.statusCode, 200, uploaded.body);
+    assert.equal(uploaded.json().metadata.cover.fileName, 'cover.webp');
+    const fetched = await f.app.inject({ url: `/api/v1/works/${id}/cover`, headers: f.headers });
+    assert.equal(fetched.rawPayload.toString(), 'new webp');
+    assert.equal(fetched.headers['content-type'], 'image/webp');
+  } finally { await f.close(); }
 });

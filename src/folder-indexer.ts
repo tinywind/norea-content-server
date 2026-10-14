@@ -4,7 +4,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { validateFiles, validateMedia } from './chapter-files.ts';
 import { completeChapter, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
-import { cacheWork, metadataWorkId, readNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { isCoverFile, cacheWork, metadataWorkId, readNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
 export interface FolderIndexItem {
   path: string;
@@ -122,19 +122,15 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     if (!entries.some(entry => entry.name === 'novel.json')) { await report({ path: directory, sourceId, status: 'skipped', reason: 'Valid novel.json is required; work identity cannot be inferred' }); return; }
     let value: NovelMetadataV1;
     try {
-      const workSignature = async (metadata: NovelMetadataV1) => {
-        let cover: string | null = null;
-        if (metadata.cover) {
-          try { cover = await signature(join(directory, metadata.cover.fileName)); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
-        }
-        return canonicalize([await signature(metadataPath), metadata.cover?.fileName ?? null, cover]);
+      const workSignature = async () => {
+        const covers = (await readdir(directory)).filter(isCoverFile).sort();
+        return canonicalize([await signature(metadataPath), await Promise.all(covers.map(async name => [name, await signature(join(directory, name))]))]);
       };
       const saved = checkpoint(metadataPath);
       const cached = options.db.prepare('SELECT entry FROM works WHERE directory=?').get(relative(dataDir, directory)) as { entry: string } | undefined;
       const stored = cached ? JSON.parse(cached.entry) as WorkEntry : undefined;
       if (stored && options.db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(stored.id)) fail('Work was deleted from the server');
-      if (saved && stored && saved.signature === await workSignature(stored.metadata)) {
+      if (saved && stored && saved.signature === await workSignature()) {
         value = stored.metadata;
         await report({ ...JSON.parse(saved.entry) as FolderIndexItem, status: 'unchanged' });
       } else {
@@ -144,7 +140,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
           const original = await signature(metadataPath);
           value = readNovelMetadata(metadataPath);
           if (segment(value.identity.pluginId) !== sourceId) fail('Work metadata source does not match its folder');
-          before = await workSignature(value);
+          before = await workSignature();
           if (original === await signature(metadataPath)) break;
           if (attempt === 1) fail('Work metadata changed during indexing');
         }
@@ -154,7 +150,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         const work = cacheWork(options.db, dataDir, relative(dataDir, directory), value);
         if (!previous || JSON.parse(previous.entry).sequence !== work.sequence) options.onWorkChange?.();
         const item: FolderIndexItem = { path: metadataPath, sourceId: value.identity.pluginId, workId: id, status: previous && JSON.parse(previous.entry).sequence === work.sequence ? 'unchanged' : 'registered' };
-        if (before === await workSignature(value)) remember(metadataPath, before, item);
+        if (before === await workSignature()) remember(metadataPath, before, item);
         await report(item);
       }
     } catch (error) {
@@ -163,7 +159,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     }
     const folders = [];
     for (const entry of entries) {
-      if (entry.name === 'novel.json' || entry.name === value.cover?.fileName || entry.name === '.nomedia') continue;
+      if (entry.name === 'novel.json' || isCoverFile(entry.name) || entry.name === '.nomedia') continue;
       if (!entry.isDirectory() || entry.isSymbolicLink() || unfinished(entry.name)) {
         await report({ path: join(directory, entry.name), sourceId, status: 'skipped', reason: 'Chapter entry is not a directory, is symbolic, or is unfinished' }); continue;
       }

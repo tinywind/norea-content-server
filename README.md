@@ -259,15 +259,18 @@ this path and controls its scan schedule. Scans traverse source directories rega
 installation, or enabled status.
 They never check the original site or whether it still publishes the work.
 Each work folder must contain valid `novel.json` with its original plugin ID,
-base-URL-relative work path, title, and metadata. Missing or invalid metadata
+base-URL-relative work path and title. Other metadata is optional. Missing or invalid metadata
 skips the whole work. The importer never recovers work identity from a folder
 name, `cover.json`, an old app database, or source-site requests. Synthetic
 `norea-folder:` work identities are rejected.
 
-`novel.json` contains only `schemaVersion`, `identity`, `novel`, and `cover`.
-It has no chapter list or update timestamp. Work metadata includes the original
-status text and a nullable rating from 0 to 5. Cover files named by its descriptor
-are indexed separately. Metadata-only works can be registered without chapters.
+`novel.json` writers emit `schemaVersion`, `identity`, `novel`, and `cover`.
+Readers require only `identity.pluginId`, `identity.novelPath`, and `novel.name`.
+Unknown fields are ignored and omitted on write and transfer. An absent schema
+version defaults to 1. No chapter list, update timestamp, or source cover URL is
+written or transferred. The server does not manage `cover.json`. Work metadata includes the original
+status text and a nullable rating from 0 to 5. The scanner discovers actual work-local `cover.*` image files, including when
+the optional cover descriptor is absent. The console serves these local files. Metadata-only works can be registered without chapters.
 See [Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1).
 
 Chapter folders follow `<number>-<title>`. Additional hyphens belong to the title.

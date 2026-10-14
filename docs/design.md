@@ -524,7 +524,7 @@ skipped, or failed candidate. Unsupported old formats and incomplete assets are
 skipped without conversion or repair. Every work requires valid original identity
 and title metadata in its source-folder `novel.json`.
 
-The walker excludes work-level cover images, `cover.json`, and `.nomedia` markers
+The walker excludes work-level cover images and `.nomedia` markers
 from chapter counts and skip reports. Cover synchronization is not part of the
 chapter package. Text-only bodies do not require a media manifest or archive.
 The app's `manifest.json` is a media inventory, not chapter identity metadata.
@@ -583,7 +583,6 @@ Each work directory stores this metadata-only document:
   "identity": { "pluginId": "example", "novelPath": "/novel/123456" },
   "novel": {
     "name": "Example work",
-    "cover": "https://example.com/cover.jpg",
     "author": null,
     "artist": null,
     "summary": null,
@@ -594,14 +593,16 @@ Each work directory stores this metadata-only document:
   },
   "cover": {
     "fileName": "cover.jpg",
-    "contentType": "image/jpeg",
-    "sourceUrl": "https://example.com/cover.jpg"
+    "contentType": "image/jpeg"
   }
 }
 ```
 
-All fields are required. Text metadata and rating may be null; rating is finite
-and between 0 and 5. The entire cover descriptor may be null. Status preserves
+Readers require only `identity.pluginId`, `identity.novelPath`, and `novel.name`.
+An absent `schemaVersion` means 1. Missing text, rating, and cover fields default
+to null; `isLocal` defaults to false. Unknown fields are ignored and omitted when
+writing or transferring metadata. Present supported fields must have valid types.
+Rating is finite and between 0 and 5. The entire cover descriptor may be null. Status preserves
 the source text. `identity.novelPath` excludes the source base URL and retains
 identity query parameters, such as `/webtoon/list?titleId=123`. Absolute HTTP(S),
 protocol-relative, and synthetic `norea-folder:` work paths are rejected.
@@ -615,7 +616,11 @@ lookup is limited to a unique chapter in the exact canonical work.
 Files are authoritative. The server indexes valid owned work files at startup
 and removes obsolete inferred entries from its metadata and chapter indexes.
 Their files remain on disk. Source imports require valid `novel.json` and never
-rewrite original content files. Cover descriptors select local image files.
+rewrite original content files. The scanner discovers local `cover.*` image
+files even without a cover descriptor. An existing declared image takes priority;
+otherwise filename order selects a cover. The console serves these files through
+the authenticated local cover endpoint. Neither source cover URLs nor `cover.json`
+are generated, transferred, or managed by the server.
 Identical metadata preserves the file timestamp; sync sequence numbers stay in
 the server database. Upload clients register work metadata before chapter packages.
 

@@ -41,8 +41,8 @@ async function fixture() {
 
 function workMetadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/real/book?lang=ko' },
-    novel: { name: 'Portable Book', cover: 'https://example/cover.png', author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false },
-    cover: { fileName: 'cover.png', contentType: 'image/png', sourceUrl: 'https://example/cover.png' } };
+    novel: { name: 'Portable Book', author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false },
+    cover: { fileName: 'cover.png', contentType: 'image/png' } };
 }
 
 async function snapshot(root: string): Promise<Record<string, string>> {
@@ -287,7 +287,7 @@ test('missing or invalid work metadata never infers identities from folders or o
   try {
     await writeFile(join(f.directory, '..', 'cover.json'), JSON.stringify({ version: 1, sourceId: 'example', novelPath: '/book', fileName: 'cover.png' }));
     await writeFile(join(f.dataDir, 'norea.sqlite'), 'Old database is not read');
-    for (const value of [null, '{broken', { ...workMetadata(), identity: { pluginId: 'example', novelPath: 'norea-folder:Book' } }, { ...workMetadata(), chapters: [] }]) {
+    for (const value of [null, '{broken', { ...workMetadata(), identity: { pluginId: 'example', novelPath: 'norea-folder:Book' } }, { identity: { pluginId: "example" }, novel: { name: "No identity" } }]) {
       const file = join(f.directory, '..', 'novel.json');
       if (value === null) await rm(file); else await writeFile(file, typeof value === 'string' ? value : JSON.stringify(value));
       assert.equal((await f.run()).registered, 0);
@@ -429,5 +429,32 @@ test('current chapter directory lookups use an index for large filesystem invent
     const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT entry FROM chapters WHERE directory=?').all('contents/example/work/1-First') as { detail: string }[];
     assert.ok(plan.some(row => /USING INDEX sqlite_autoindex_chapters_/.test(row.detail)), JSON.stringify(plan));
     assert.ok(plan.every(row => !/SCAN chapters/.test(row.detail)));
+  } finally { await f.close(); }
+});
+
+
+test('incremental scans discover an added cover without a metadata descriptor and rebuild minimal works', async () => {
+  const f = await fixture();
+  try {
+    const directory = join(f.directory, '..');
+    const value = { identity: workMetadata().identity, novel: { name: 'Minimal work' }, custom: true };
+    const original = JSON.stringify(value);
+    await writeFile(join(directory, 'novel.json'), original);
+    assert.equal((await f.run()).failed, 0);
+    const read = () => JSON.parse((f.db.prepare('SELECT entry FROM works').get() as { entry: string }).entry);
+    assert.equal(read().hasCover, false);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    const first = read().sequence;
+    await writeFile(join(directory, 'cover.webp'), 'local image');
+    await f.run();
+    assert.equal(read().hasCover, true);
+    assert.deepEqual(read().metadata.cover, { fileName: 'cover.webp', contentType: 'image/webp' });
+    assert.ok(read().sequence > first);
+    const second = read().sequence;
+    const unchanged = await f.run();
+    assert.equal(unchanged.registered, 0);
+    assert.equal(read().sequence, second);
+    assert.equal(await readFile(join(directory, 'novel.json'), 'utf8'), original);
+    assert.equal((await readdir(directory)).includes('cover.json'), false);
   } finally { await f.close(); }
 });
