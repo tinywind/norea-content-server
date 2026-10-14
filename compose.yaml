@@ -4,9 +4,12 @@ services:
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
-      - norea-data:/data
+      - norea-state:/data
+      - type: bind
+        source: ${NOREA_CONTENTS_PATH:-./data/contents}
+        target: /data/contents
     environment:
       NOREA_ANONYMOUS_READ: "true"
     restart: unless-stopped
 volumes:
-  norea-data:
+  norea-state:

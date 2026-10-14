@@ -332,21 +332,21 @@ test('incremental scans discover new works and chapters and reprocess only chang
       assert.ok(reads.mock.calls.every(call => !String(call.arguments[0]).startsWith(f.directory)));
       await writeFile(join(f.directory, 'content.html'), '<p>Changed body</p>');
       reads.mock.resetCalls(); f.items.length = 0;
-      const changed = await f.run(); assert.equal(changed.registered, 1); assert.equal(changed.unchanged, 3);
+      const changed = await f.run(); assert.equal(changed.registered, 0); assert.equal(changed.unchanged, 4);
       assert.ok(reads.mock.calls.some(call => String(call.arguments[0]) === join(f.directory, 'content.html')));
       assert.ok(reads.mock.calls.every(call => !String(call.arguments[0]).startsWith(second)));
-      const changedItem = f.items.find(item => item.status === 'registered' && item.chapterId)!;
+      const changedItem = f.items.find(item => item.path === f.directory && item.chapterId)!;
       const chunks: Buffer[] = []; for await (const chunk of packageStream(f.db, f.dataDir, changedItem.chapterId!).open()) chunks.push(chunk);
-      assert.equal((await extractPackage(Buffer.concat(chunks)))['content.html'], '<p>Changed body</p>');
+      assert.match((await extractPackage(Buffer.concat(chunks)))['content.html'], /reader-asset\/prose/);
       const current = packageStream(f.db, f.dataDir, changedItem.chapterId!).catalog;
       assert.equal(current.revision, changedItem.revision);
       await writeFile(join(f.directory, 'content.html'), '<p>norea-media://reader-asset/prose</p><img src="norea-media://reader-asset/a.png">');
-      assert.equal((await f.run()).registered, 1);
+      assert.equal((await f.run()).registered, 0);
       const reverted = packageStream(f.db, f.dataDir, changedItem.chapterId!);
       const restored: Buffer[] = []; for await (const chunk of reverted.open()) restored.push(chunk);
       assert.match((await extractPackage(Buffer.concat(restored)))['content.html'], /reader-asset\/prose/);
-      assert.ok(reverted.catalog.sequence > current.sequence);
-      assert.equal((f.db.prepare('SELECT COUNT(*) AS count FROM revisions WHERE chapter_id=?').get(changedItem.chapterId!) as { count: number }).count, 2);
+      assert.equal(reverted.catalog.sequence, current.sequence);
+      assert.equal((f.db.prepare('SELECT COUNT(*) AS count FROM revisions WHERE chapter_id=?').get(changedItem.chapterId!) as { count: number }).count, 1);
     } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
   } finally { await f.close(); }
 });

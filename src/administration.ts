@@ -226,7 +226,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
       const rows = db.prepare(`SELECT entry FROM chapters ${where} ORDER BY json_extract(entry,'$.manifest.novel.name'),work_id,json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string }[];
       return { items: rows.map(row => JSON.parse(row.entry) as CatalogEntry), total: (db.prepare(`SELECT COUNT(*) AS count FROM chapters ${where}`).get(...args) as { count: number }).count };
     });
-    api.get<{ Params: { id: string } }>('/chapters/:id', { schema: { params: identifier } }, async request => ({ entry: chapterRow(db, request.params.id).catalog, revisions: (db.prepare('SELECT entry FROM revisions WHERE chapter_id=? ORDER BY rowid DESC').all(request.params.id) as { entry: string }[]).map(row => JSON.parse(row.entry)) }));
+    api.get<{ Params: { id: string } }>('/chapters/:id', { schema: { params: identifier } }, async request => ({ entry: chapterRow(db, request.params.id).catalog }));
     const devices = () => (db.prepare('SELECT id,device_name AS deviceName,created_at AS createdAt,last_seen_at AS lastSeenAt,blocked FROM devices ORDER BY created_at,id').all() as { id: string; deviceName: string; createdAt: number; lastSeenAt: number; blocked: number }[]).map(device => ({ ...device, blocked: Boolean(device.blocked) }));
     api.get('/devices', async () => ({ items: devices() }));
     api.patch<{ Params: { id: string }; Body: { blocked: boolean } }>('/devices/:id', { schema: { params: identifier, body: { type: 'object', additionalProperties: false, required: ['blocked'], properties: { blocked: { type: 'boolean' } } } } }, async request => {

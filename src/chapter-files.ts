@@ -9,7 +9,7 @@ import type { Multipart } from '@fastify/multipart';
 import { canonicalize } from 'json-canonicalize';
 import yauzl from 'yauzl';
 import { problem } from './db.ts';
-import { chapterRow, digest, publishRevision, safeArchivePath, validateManifest, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { chapterRow, completeChapter, digest, publishRevision, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 
 function validateFiles(value: unknown, limits: Limits): asserts value is PackageManifest {
   validateManifest(value);
@@ -64,10 +64,11 @@ async function validateMedia(stage: string, manifest: PackageManifest, limits: L
 }
 
 export async function publishChapterFiles(db: DatabaseSync, dataDir: string, parts: AsyncIterableIterator<Multipart>, limits: Limits): Promise<CatalogEntry> {
-  const startedAt = (db.prepare('SELECT coalesce(max(sequence),0) AS sequence FROM catalog_changes').get() as { sequence: number }).sequence;
+  const startedAt = uploadCursor(db);
   const stage = join(dataDir, 'staging', `files-${randomUUID()}`);
   await mkdir(stage, { recursive: true });
   let manifest: PackageManifest | undefined;
+  let existing: CatalogEntry | undefined;
   const received = new Set<string>();
   try {
     for await (const part of parts) {
@@ -77,8 +78,10 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
         try { parsed = JSON.parse(part.value); } catch { throw problem(400, 'Invalid chapter metadata JSON'); }
         validateFiles(parsed, limits);
         manifest = parsed;
+        existing = completeChapter(db, dataDir, digest(JSON.stringify([parsed.identity.pluginId, parsed.identity.novelPath, parsed.identity.chapterPath])));
         continue;
       }
+      if (existing) { part.file.resume(); continue; }
       const declared = manifest?.files.find(file => file.path === part.fieldname);
       if (!declared || received.has(part.fieldname) || part.filename !== declared.path) {
         part.file.resume();
@@ -94,6 +97,12 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
       await pipeline(part.file, meter, createWriteStream(join(stage, declared.path), { flags: 'wx' }));
       if (part.file.truncated || bytes !== declared.size) throw problem(400, 'Chapter file size mismatch');
       received.add(declared.path);
+    }
+    if (existing) {
+      const deletion = db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(existing.id) as { sequence: number } | undefined;
+      const current = completeChapter(db, dataDir, existing.id);
+      if (!current || (deletion?.sequence ?? 0) > startedAt.catalog) throw problem(409, 'Chapter changed during upload; retry the request');
+      return current;
     }
     if (!manifest || received.size !== manifest.files.length) throw problem(400, 'Chapter files are incomplete');
     await validateMedia(stage, manifest, limits);

@@ -1,7 +1,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { problem } from './db.ts';
-import { digest } from './packages.ts';
+import { completeChapter, digest } from './packages.ts';
 import type { CatalogEntry } from './packages.ts';
 import type { NovelMetadataV1 } from './works.ts';
 
@@ -34,8 +34,8 @@ const pagination = (limit: number) => ({ offset: { ...count, maximum: Number.MAX
 const pageSchema = (item: object) => ({ type: 'object', required: ['items', 'total', 'hasMore'], properties: { items: { type: 'array', items: item }, total: count, hasMore: { type: 'boolean' } } });
 const security: Record<string, string[]>[] = [{ bearerAuth: [] }, {}];
 
-export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
-  const { db, requireRead, catalogSchema } = context;
+export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
+  const { db, dataDir, requireRead, catalogSchema } = context;
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/catalog/changes', { schema: {
     security,
     description: 'Read ordered chapter availability changes without package manifests. Apply repeated identities in order, including deletion and restoration entries. The cursor advances to the last returned sequence and remains unchanged on an empty page.',
@@ -95,10 +95,10 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
       FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
     return { items, total, hasMore: offset + items.length < total };
   });
-  app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string } }>('/api/v1/catalog/chapter', { schema: {
+  app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string; includeUnavailable?: boolean } }>('/api/v1/catalog/chapter', { schema: {
     security,
     description: 'Resolve a package by exact source identity, then optional chapter number within the same exact work. Missing or deleted chapters return 404; ambiguous folder matches return 409.',
-    querystring: { type: 'object', additionalProperties: false, required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: identityText, novelPath: identityText, chapterPath: identityText, chapterNumber: { type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' } } },
+    querystring: { type: 'object', additionalProperties: false, required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: identityText, novelPath: identityText, chapterPath: identityText, includeUnavailable: { type: 'boolean', default: false }, chapterNumber: { type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' } } },
     response: { 200: catalogSchema },
   } }, async request => {
     requireRead(request);
@@ -107,13 +107,19 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const row = db.prepare('SELECT entry,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; deleted_at: number | null } | undefined;
     if (row) {
       if (row.deleted_at !== null) throw problem(404, 'Chapter not found');
-      return JSON.parse(row.entry) as CatalogEntry;
+      if (request.query.includeUnavailable) return JSON.parse(row.entry) as CatalogEntry;
+      const entry = completeChapter(db, dataDir, id);
+      if (!entry) throw problem(404, 'Chapter files are unavailable');
+      return entry;
     }
     if (!chapterNumber) throw problem(404, 'Chapter not found');
     const work = digest(JSON.stringify([pluginId, novelPath]));
     const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL").all(work, chapterNumber) as { entry: string }[];
     if (!matches.length) throw problem(404, 'Chapter not found');
     if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
-    return JSON.parse(matches[0].entry) as CatalogEntry;
+    if (request.query.includeUnavailable) return JSON.parse(matches[0].entry) as CatalogEntry;
+    const entry = completeChapter(db, dataDir, (JSON.parse(matches[0].entry) as CatalogEntry).id);
+    if (!entry) throw problem(404, 'Chapter files are unavailable');
+    return entry;
   });
 }

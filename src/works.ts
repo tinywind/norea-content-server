@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { canonicalize } from 'json-canonicalize';
 import { authenticate, authenticateDevice } from './auth.ts';
 import { problem, transaction } from './db.ts';
-import { digest, safeArchivePath } from './packages.ts';
+import { digest, recordEntry, safeArchivePath, type CatalogEntry } from './packages.ts';
 
 export interface NovelMetadataV1 {
   schemaVersion: 1;
@@ -14,7 +14,7 @@ export interface NovelMetadataV1 {
   novel: { name: string; cover: string | null; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
   cover: { fileName: string; contentType: string | null; sourceUrl: string } | null;
 }
-export interface WorkEntry { id: string; sequence: number; metadata: NovelMetadataV1; hasCover: boolean }
+export interface WorkEntry { id: string; sequence: number; metadata: NovelMetadataV1; hasCover: boolean; deleted?: boolean }
 interface WorkRow { id: string; directory: string; entry: string; fingerprint: string }
 export const metadataByteLimit = 16 * 1024 ** 2;
 export const coverByteLimit = 10 * 1024 ** 2;
@@ -80,8 +80,9 @@ function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer | unde
   try { return readBytes(path, coverByteLimit); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
 }
-export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1): WorkEntry {
+export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1, restore = false): WorkEntry {
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
+  if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(409, 'Work was deleted from the server');
   if (existing && existing.directory !== directory) throw problem(409, 'Duplicate work identity in different folders');
   const cover = coverBytes(join(dataDir, directory), metadata);
   const fingerprint = digest(canonicalize(metadata) + '\n' + (cover ? digest(cover) : ''));
@@ -92,6 +93,7 @@ export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, 
     entry.sequence = Number(sequence); const json = JSON.stringify(entry);
     db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(json, sequence);
     db.prepare('INSERT INTO works(id,directory,entry,fingerprint) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET entry=excluded.entry,fingerprint=excluded.fingerprint').run(id, directory, json, fingerprint);
+    if (restore) db.prepare('UPDATE work_tombstones SET deleted=0 WHERE work_id=?').run(id);
     return entry;
   });
 }
@@ -107,6 +109,7 @@ export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
       if (!existsSync(file)) continue;
       let metadata: NovelMetadataV1;
       try { metadata = readNovelMetadata(file); } catch { continue; }
+      if (db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(metadataWorkId(metadata))) continue;
       valid.add(cacheWork(db, dataDir, directory, metadata).id);
     }
   }
@@ -120,7 +123,7 @@ export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
       db.prepare('DELETE FROM work_changes WHERE work_id=?').run(row.id);
       db.prepare('DELETE FROM works WHERE id=?').run(row.id);
     }
-    db.exec('DELETE FROM catalog_changes WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works)); DELETE FROM revisions WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works)); DELETE FROM chapters WHERE work_id NOT IN (SELECT id FROM works)');
+    db.exec('DELETE FROM catalog_changes WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works) AND work_id NOT IN (SELECT work_id FROM work_tombstones)); DELETE FROM revisions WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id NOT IN (SELECT id FROM works)); DELETE FROM chapters WHERE work_id NOT IN (SELECT id FROM works)');
   });
 }
 function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
@@ -133,8 +136,9 @@ function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
   if (!safeArchivePath(directory.split('\\').join('/'))) throw problem(400, 'Invalid readable work directory');
   return directory;
 }
-export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string): WorkEntry {
+export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false): WorkEntry {
   validateNovelMetadata(value); const id = metadataWorkId(value);
+  if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(410, 'Work was deleted from the server');
   if (expectedId !== undefined && expectedId !== id) throw problem(400, 'Work identity does not match requested ID');
   const directory = workDirectory(db, value);
   const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, id);
@@ -146,7 +150,45 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
     try { current = JSON.parse(bytes.toString('utf8')); } catch { current = undefined; }
   }
   if (current === undefined || canonicalize(current) !== canonicalize(value)) atomicWrite(file, JSON.stringify(value, null, 2) + '\n');
-  return cacheWork(db, dataDir, directory, value);
+  return cacheWork(db, dataDir, directory, value, restore);
+}
+
+export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkEntry {
+  const row = rowFor(db, id);
+  if (!row) throw problem(404, 'Work not found');
+  const folder = resolve(dataDir, row.directory);
+  const inside = relative(resolve(dataDir, 'contents'), folder).split(sep);
+  if (inside.length !== 2 || inside.some(part => !part || part === '.' || part === '..') || !folder.startsWith(resolve(dataDir, 'contents') + sep)) throw problem(500, 'Unexpected work storage path');
+  noLinks(folder);
+  const retired = join(dirname(folder), `.norea-delete-${randomUUID()}`);
+  const moved = existsSync(folder);
+  if (moved) renameSync(folder, retired);
+  const external = db.prepare('SELECT r.path FROM revisions r JOIN chapters c ON c.id=r.chapter_id WHERE c.work_id=? AND r.path IS NOT NULL').all(id) as { path: string }[];
+  let entry: WorkEntry;
+  try {
+    entry = transaction(db, () => {
+      for (const chapter of db.prepare('SELECT entry FROM chapters WHERE work_id=?').all(id) as { entry: string }[]) {
+        const deleted = recordEntry(db, { ...JSON.parse(chapter.entry) as CatalogEntry, deleted: true });
+        db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(deleted.id, deleted.sequence);
+      }
+      db.prepare('DELETE FROM work_changes WHERE work_id=?').run(id);
+      const sequence = Number(db.prepare('INSERT INTO work_changes(work_id,entry) VALUES(?,?)').run(id, '{}').lastInsertRowid);
+      db.prepare('INSERT INTO work_tombstones VALUES(?,1,?) ON CONFLICT(work_id) DO UPDATE SET deleted=1,sequence=excluded.sequence').run(id, sequence);
+      const deleted = { ...JSON.parse(row.entry) as WorkEntry, deleted: true, hasCover: false, sequence };
+      db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(JSON.stringify(deleted), sequence);
+      db.prepare('DELETE FROM revisions WHERE chapter_id IN (SELECT id FROM chapters WHERE work_id=?)').run(id);
+      db.prepare('DELETE FROM chapters WHERE work_id=?').run(id);
+      db.prepare('DELETE FROM works WHERE id=?').run(id);
+      db.prepare("DELETE FROM scan_checkpoints WHERE path=? OR substr(path,1,?)=?").run(folder, folder.length + 1, folder + sep);
+      return deleted;
+    });
+  } catch (error) { if (moved) renameSync(retired, folder); throw error; }
+  if (moved) rmSync(retired, { recursive: true, force: true });
+  for (const copy of external) {
+    const path = resolve(dataDir, copy.path);
+    if (path.startsWith(resolve(dataDir, 'trash') + sep)) rmSync(path, { recursive: true, force: true });
+  }
+  return entry;
 }
 export function getWork(db: DatabaseSync, dataDir: string, id: string): WorkEntry {
   const row = rowFor(db, id); if (!row) throw problem(404, 'Work not found');
@@ -164,11 +206,21 @@ export function saveWorkCover(db: DatabaseSync, dataDir: string, id: string, byt
 
 export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; notify: () => void }): void {
   const { db, dataDir, requireRead, notify } = context;
+  const uploadCursors = new WeakMap<FastifyRequest, number>();
   const params = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
   app.addContentTypeParser(/^image\/[a-zA-Z0-9.+-]+$/, { parseAs: 'buffer', bodyLimit: coverByteLimit }, (_request, body, done) => done(null, body));
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: coverByteLimit }, (_request, body, done) => done(null, body));
-  app.put<{ Params: { id: string } }>('/api/v1/works/:id', { bodyLimit: metadataByteLimit, onRequest: async request => { authenticateDevice(db, request); }, schema: { params, security: [{ bearerAuth: [] }] } }, async request => {
-    const entry = saveWork(db, dataDir, request.body, request.params.id); notify(); return entry;
+  app.delete<{ Params: { id: string } }>('/api/v1/admin/works/:id', { schema: { params, security: [{ bearerAuth: [] }] } }, async request => {
+    authenticate(db, request, true);
+    const entry = deleteWork(db, dataDir, request.params.id); notify(); return entry;
+  });
+  app.put<{ Params: { id: string }; Querystring: { restore?: boolean } }>('/api/v1/works/:id', { bodyLimit: metadataByteLimit, onRequest: async request => {
+    authenticateDevice(db, request);
+    uploadCursors.set(request, (db.prepare('SELECT coalesce(max(sequence),0) AS n FROM work_changes').get() as { n: number }).n);
+  }, schema: { params, querystring: { type: 'object', properties: { restore: { type: 'boolean', default: false } } }, security: [{ bearerAuth: [] }] } }, async request => {
+    const deletion = db.prepare('SELECT sequence FROM work_tombstones WHERE work_id=?').get(request.params.id) as { sequence: number } | undefined;
+    if ((deletion?.sequence ?? 0) > uploadCursors.get(request)!) throw problem(410, 'Work was deleted during upload');
+    const entry = saveWork(db, dataDir, request.body, request.params.id, request.query.restore); notify(); return entry;
   });
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/works', { schema: { querystring: { type: 'object', properties: { after: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 } } } } }, async request => {
     requireRead(request);

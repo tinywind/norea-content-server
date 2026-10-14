@@ -3,9 +3,9 @@ import swagger from '@fastify/swagger';
 import multipart from '@fastify/multipart';
 import type { Readable } from 'node:stream';
 import { resolve } from 'node:path';
-import { openDatabase, problem, transaction } from './db.ts';
+import { openDatabase, problem } from './db.ts';
 import { authenticate, authenticateDevice, createConsoleSession, installationSecret, registerDevice, tokenDigest } from './auth.ts';
-import { chapterRow, defaultLimits, deleteChapter, packageStream, publishPackage, purgeChapter, recordEntry, restoreChapter } from './packages.ts';
+import { defaultLimits, deleteChapter, discardChapterHistory, packageStream, publishPackage, purgeChapter, restoreChapter } from './packages.ts';
 import type { CatalogEntry, Limits } from './packages.ts';
 import { createChangeNotifications, readChangeCursors } from './changes.ts';
 import { initializeAdministration, registerAdministration, savedAnonymousRead } from './administration.ts';
@@ -30,7 +30,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
   initializeAdministration(db);
-  try { rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
+  try { discardChapterHistory(db, dataDir); rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
   const app = Fastify({ bodyLimit: 1024 * 1024, requestTimeout: 120000, logger: false });
   let anonymousRead = savedAnonymousRead(db, options.anonymousRead ?? true);
@@ -42,7 +42,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   app.addHook('onClose', async () => { db.close(); });
   const requireRead = (request: Parameters<typeof authenticate>[1]) => { if (!anonymousRead || request.headers.authorization !== undefined) authenticate(db, request); };
   registerWorks(app, { db, dataDir, requireRead, notify: () => changes.notify() });
-  registerCatalog(app, { db, requireRead, catalogSchema });
+  registerCatalog(app, { db, dataDir, requireRead, catalogSchema });
   app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: false, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
@@ -109,16 +109,6 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   app.delete<{ Params: { id: string } }>('/api/v1/chapters/:id', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = deleteChapter(db, dataDir, request.params.id); changes.notify(); return entry; });
   app.post<{ Params: { id: string } }>('/api/v1/chapters/:id/restore', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = restoreChapter(db, dataDir, request.params.id); changes.notify(); return entry; });
   app.post<{ Params: { id: string } }>('/api/v1/chapters/:id/purge', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: { type: 'object', properties: { purged: { type: 'boolean' } } } } } }, async request => { authenticate(db, request, true); purgeChapter(db, dataDir, request.params.id); return { purged: true }; });
-  app.post<{ Params: { id: string }; Body: { revision: string } }>('/api/v1/chapters/:id/revision', { schema: { params: idParams, security: [{ bearerAuth: [] }], body: { type: 'object', required: ['revision'], properties: { revision: { type: 'string', pattern: '^[0-9a-f]{64}$' } } }, response: { 200: catalogSchema } } }, async request => {
-    authenticate(db, request, true);
-    const row = chapterRow(db, request.params.id);
-    if (row.catalog.deleted) throw problem(409, 'Restore the chapter before selecting a revision');
-    const revision = db.prepare('SELECT entry,path FROM revisions WHERE chapter_id=? AND revision=? AND deleted=0').get(request.params.id, request.body.revision) as { entry: string; path: string | null } | undefined;
-    if (!revision?.path) throw problem(404, 'Revision not found');
-    const entry = transaction(db, () => recordEntry(db, JSON.parse(revision.entry)));
-    changes.notify();
-    return entry;
-  });
   app.post('/api/v1/chapter-files', { onRequest: async request => { authenticateDevice(db, request); }, schema: { security: [{ bearerAuth: [] }], consumes: ['multipart/form-data'], response: { 200: catalogSchema }, description: 'Upload original completed chapter files. Send metadata JSON first, then files named by their original paths. No compression or body rewriting.' } }, async request => {
     if (!request.isMultipart()) throw problem(415, 'multipart/form-data is required');
     const entry = await publishChapterFiles(db, dataDir, request.parts(), limits);

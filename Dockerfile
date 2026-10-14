@@ -15,7 +15,7 @@ COPY --from=build /app/webdist ./webdist
 COPY --from=build /app/web ./web
 COPY package.json ./
 COPY src ./src
-RUN mkdir /data && chown node:node /data
+RUN mkdir -p /data/contents /data/staging && chown -R node:node /data
 USER node
 ENV NOREA_HOST=0.0.0.0 NOREA_PORT=8787 NOREA_DATA_DIR=/data
 EXPOSE 8787

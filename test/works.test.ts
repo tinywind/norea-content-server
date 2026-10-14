@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { request as httpRequest } from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { buildApp } from '../src/app.ts';
+import { openDatabase } from '../src/db.ts';
 import { digest } from '../src/packages.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
@@ -21,6 +24,67 @@ async function fixture() {
   const headers = await deviceHeaders(app);
   return { app, dataDir, headers, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
+
+test('admin work deletion removes the whole folder and DB rows while preserving device copies and durable tombstones', async () => {
+  const f = await fixture();
+  try {
+    await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
+    await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}/cover`, headers: { ...f.headers, 'content-type': 'image/png' }, payload: Buffer.from('cover') });
+    const form = new FormData();
+    form.append('metadata', JSON.stringify({ packageVersion: 1, layout: 'chapter-files', identity: { ...metadata().identity, chapterPath: '/chapter/1' }, novel: { name: 'Book', isLocal: false }, chapter: { name: 'First', position: 1, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: 4, modifiedAt: 1 }] }));
+    form.append('content.html', new Blob(['body']), 'content.html');
+    const request = new Request('http://localhost', { method: 'POST', body: form });
+    const upload = await f.app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...f.headers, 'content-type': request.headers.get('content-type')! }, payload: Buffer.from(await request.arrayBuffer()) });
+    assert.equal(upload.statusCode, 200, upload.body);
+    const db = openDatabase(f.dataDir);
+    const directory = (db.prepare('SELECT directory FROM works WHERE id=?').get(id) as { directory: string }).directory;
+    await writeFile(join(f.dataDir, directory, 'source-file.txt'), 'Part of the selected server folder');
+    const sibling = join(f.dataDir, directory, '..', 'other-work'); await mkdir(sibling); await writeFile(join(sibling, 'keep.txt'), 'Other work');
+    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/works/${id}`, headers: f.headers })).statusCode, 403);
+    const response = await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/works/${id}`, headers: await consoleHeaders(f.app, f.dataDir) });
+    assert.equal(response.statusCode, 200, response.body);
+    await assert.rejects(readdir(join(f.dataDir, directory)), /ENOENT/);
+    assert.equal(await readFile(join(sibling, 'keep.txt'), 'utf8'), 'Other work');
+    for (const table of ['works', 'chapters', 'revisions']) assert.equal((db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n, 0);
+    assert.equal((await f.app.inject({ url: '/api/v1/catalog/works', headers: f.headers })).json().total, 0);
+    const history = (await f.app.inject({ url: '/api/v1/works', headers: f.headers })).json().items;
+    assert.equal(history.length, 1);
+    assert.equal(history[0].deleted, true);
+    assert.equal((await f.app.inject({ url: '/api/v1/catalog/changes', headers: f.headers })).json().items.at(-1).deleted, true);
+    assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).statusCode, 410);
+    await f.app.close();
+    const restarted = await buildApp({ dataDir: f.dataDir });
+    assert.equal((await restarted.inject('/api/v1/works')).json().items.at(-1).deleted, true);
+    assert.equal((await restarted.inject('/api/v1/catalog/changes')).json().items.at(-1).deleted, true);
+    assert.equal((await restarted.inject({ method: 'PUT', url: `/api/v1/works/${id}?restore=true`, headers: f.headers, payload: metadata() })).statusCode, 200);
+    await restarted.close(); db.close();
+  } finally { await f.close(); }
+});
+
+test('metadata upload started before work deletion cannot restore it after its body finishes', async () => {
+  const f = await fixture();
+  const db = openDatabase(f.dataDir);
+  try {
+    await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    const address = await f.app.listen({ host: '127.0.0.1', port: 0 });
+    const body = Buffer.from(JSON.stringify(metadata()));
+    db.prepare('UPDATE devices SET last_seen_at=0').run();
+    let resolve!: (status: number) => void;
+    const finished = new Promise<number>(done => { resolve = done; });
+    const request = httpRequest(`${address}/api/v1/works/${id}?restore=true`, { method: 'PUT', headers: { ...f.headers, 'content-type': 'application/json', 'content-length': body.length } }, response => { response.resume(); resolve(response.statusCode!); });
+    request.write(body.subarray(0, 16));
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((db.prepare('SELECT last_seen_at AS n FROM devices').get() as { n: number }).n > 0) break;
+      await delay(5);
+    }
+    assert.ok((db.prepare('SELECT last_seen_at AS n FROM devices').get() as { n: number }).n > 0);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/works/${id}`, headers: admin })).statusCode, 200);
+    request.end(body.subarray(16));
+    assert.equal(await finished, 410);
+    assert.equal((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).statusCode, 404);
+  } finally { db.close(); await f.close(); }
+});
 
 test('stores a complete work without chapter packages and transfers authenticated cover bytes', async () => {
   const f = await fixture();

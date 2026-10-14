@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { cpSync, createReadStream, createWriteStream, existsSync, lstatSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { mkdir, rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { Readable, Transform, Writable } from 'node:stream';
@@ -183,7 +183,7 @@ export function recordEntry(db: DatabaseSync, entry: CatalogEntry): CatalogEntry
 }
 
 export async function publishPackage(db: DatabaseSync, dataDir: string, input: Readable, limits: Limits, imported = false): Promise<CatalogEntry> {
-  const startedAt = Number((db.prepare('SELECT coalesce(max(sequence),0) AS seq FROM catalog_changes').get() as { seq: number }).seq);
+  const startedAt = uploadCursor(db);
   const stageDir = join(dataDir, 'staging'); await mkdir(stageDir, { recursive: true });
   const stage = join(stageDir, `${randomUUID()}.zip`);
   let zipBytes = 0;
@@ -207,21 +207,80 @@ export async function publishPackage(db: DatabaseSync, dataDir: string, input: R
   } finally { await rm(stage, { force: true }); }
 }
 
-export function publishRevision(db: DatabaseSync, dataDir: string, stage: string, entry: CatalogEntry, startedAt: number, imported = false): CatalogEntry {
-    const { id, revision, manifest } = entry;
-    return transaction(db, () => {
+function moveStoredRevision(source: string, destination: string): void {
+  try { renameSync(source, destination); return; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error; }
+  // Content bind mounts can be on a different filesystem from server state.
+  const temporary = join(dirname(destination), `.norea-move-${randomUUID()}`);
+  try {
+    cpSync(source, temporary, { recursive: true, force: false, errorOnExist: true, preserveTimestamps: true });
+    renameSync(temporary, destination);
+  } finally { rmSync(temporary, { recursive: true, force: true }); }
+  const retired = join(dirname(source), `.norea-move-${randomUUID()}`);
+  try { renameSync(source, retired); }
+  catch (error) { rmSync(destination, { recursive: true, force: true }); throw error; }
+  // A locked cleanup file must not invalidate the completed copy or its DB path.
+  try { rmSync(retired, { recursive: true }); }
+  catch { console.warn('Deferred removal of a retired chapter storage copy'); }
+}
+
+function storedFilesExist(dataDir: string, path: string, entry: CatalogEntry): boolean {
+  const regularFile = (path: string, bytes: number | undefined) => {
+    try { const stat = lstatSync(path); return stat.isFile() && !stat.isSymbolicLink() && stat.size === bytes; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+  };
+  const target = join(dataDir, path);
+  if (entry.manifest.layout !== 'chapter-files') return regularFile(target, entry.zipBytes);
+  try { if (!lstatSync(target).isDirectory() || lstatSync(target).isSymbolicLink()) return false; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+  return entry.manifest.files.every(file => regularFile(join(target, file.path), file.size));
+}
+
+export function completeChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry | undefined {
+  const row = db.prepare("SELECT c.entry,r.path FROM chapters c JOIN revisions r ON r.chapter_id=c.id AND r.revision=json_extract(c.entry,'$.revision') WHERE c.id=? AND c.deleted_at IS NULL AND r.deleted=0").get(id) as { entry: string; path: string | null } | undefined;
+  if (!row?.path) return;
+  const entry = JSON.parse(row.entry) as CatalogEntry;
+  return storedFilesExist(dataDir, row.path, entry) ? entry : undefined;
+}
+
+export function discardChapterHistory(db: DatabaseSync, dataDir: string): void {
+  const chapters = db.prepare('SELECT chapter_id FROM revisions GROUP BY chapter_id HAVING count(*)>1').all() as { chapter_id: string }[];
+  for (const { chapter_id: id } of chapters) {
+    const current = chapterRow(db, id).catalog;
+    const copies = db.prepare('SELECT revision,entry,path FROM revisions WHERE chapter_id=? ORDER BY rowid DESC').all(id) as { revision: string; entry: string; path: string | null }[];
+    const preferred = copies.find(copy => copy.revision === current.revision);
+    const complete = (copy: typeof preferred) => copy?.path && storedFilesExist(dataDir, copy.path, JSON.parse(copy.entry));
+    const keep = (complete(preferred) ? preferred : copies.find(complete)) ?? preferred ?? copies[0];
+    for (const copy of copies) {
+      if (copy === keep || !copy.path || copy.path === keep.path) continue;
+      rmSync(join(dataDir, copy.path), { recursive: true, force: true });
+    }
+    transaction(db, () => {
+      if (keep.revision !== current.revision) recordEntry(db, { ...JSON.parse(keep.entry), deleted: current.deleted });
+      db.prepare('DELETE FROM revisions WHERE chapter_id=? AND revision<>?').run(id, keep.revision);
+    });
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS revisions_chapter ON revisions(chapter_id)');
+}
+
+export function uploadCursor(db: DatabaseSync): { catalog: number; works: number } {
+  return db.prepare('SELECT (SELECT coalesce(max(sequence),0) FROM catalog_changes) AS catalog,(SELECT coalesce(max(sequence),0) FROM work_changes) AS works').get() as { catalog: number; works: number };
+}
+
+export function publishRevision(db: DatabaseSync, dataDir: string, stage: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false): CatalogEntry {
+  const { id, revision, manifest } = entry;
+  const backups: { from: string; to: string }[] = [];
+  let publishedPath: string | undefined;
+  let committed = false;
+  try {
+    const result = transaction(db, () => {
       const existing = db.prepare('SELECT entry,directory,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; directory: string; deleted_at: number | null } | undefined;
       const work = workId(manifest.identity);
       const workDeletion = db.prepare('SELECT deleted,sequence FROM work_tombstones WHERE work_id=?').get(work) as { deleted: number; sequence: number } | undefined;
       const deletion = db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(id) as { sequence: number } | undefined;
-      if (existing?.deleted_at != null || workDeletion?.deleted || (deletion?.sequence ?? 0) > startedAt || (workDeletion?.sequence ?? 0) > startedAt) throw problem(409, 'Content was deleted; an administrator must restore it');
-      const current = existing ? JSON.parse(existing.entry) as CatalogEntry : undefined;
-      const previous = db.prepare('SELECT entry,path,deleted FROM revisions WHERE chapter_id=? AND revision=?').get(id, revision) as { entry: string; path: string | null; deleted: number } | undefined;
-      if (previous?.deleted) throw problem(409, 'Revision was permanently deleted');
-      if (previous?.path && existsSync(join(dataDir, previous.path))) {
-        const stored = JSON.parse(previous.entry) as CatalogEntry;
-        return imported && current?.revision !== revision ? recordEntry(db, stored) : stored;
-      }
+      if ((imported && existing?.deleted_at != null) || workDeletion?.deleted || (deletion?.sequence ?? 0) > startedAt.catalog || (workDeletion?.sequence ?? 0) > startedAt.works) throw problem(409, 'Content was deleted; start a new upload to replace it');
+      const current = completeChapter(db, dataDir, id);
+      if (current) return current;
       const storedWork = db.prepare('SELECT directory,entry FROM works WHERE id=?').get(work) as { directory: string; entry: string } | undefined;
       if (!storedWork || manifest.identity.novelPath.startsWith('norea-folder:')) throw problem(409, 'Register exact work metadata before uploading chapter packages');
       const directory = existing?.directory ?? join(storedWork.directory, ...(imported ? ['.packages'] : []), basename(chapterDirectory(manifest)));
@@ -234,14 +293,30 @@ export function publishRevision(db: DatabaseSync, dataDir: string, stage: string
         }
       }
       mkdirSync(join(dataDir, directory), { recursive: true });
-      renameSync(stage, join(dataDir, file));
-      try {
-        if (!existing) db.prepare('INSERT INTO chapters(id,work_id,entry,directory) VALUES(?,?,?,?)').run(id, work, JSON.stringify(entry), directory);
-        const published = imported || !current || current.deleted || !db.prepare('SELECT path FROM revisions WHERE chapter_id=? AND revision=? AND path IS NOT NULL').get(id, current.revision) ? recordEntry(db, entry) : { ...entry, sequence: current.sequence };
-        db.prepare('INSERT INTO revisions(chapter_id,revision,entry,path) VALUES(?,?,?,?) ON CONFLICT(chapter_id,revision) DO UPDATE SET entry=excluded.entry,path=excluded.path').run(id, revision, JSON.stringify(published), file);
-        return published;
-      } catch (error) { rmSync(join(dataDir, file), { recursive: manifest.layout === 'chapter-files', force: true }); throw error; }
+      for (const previous of db.prepare('SELECT path FROM revisions WHERE chapter_id=? AND path IS NOT NULL').all(id) as { path: string }[]) {
+        const from = join(dataDir, previous.path);
+        if (!existsSync(from)) continue;
+        const to = join(dirname(from), `.norea-replaced-${randomUUID()}`);
+        renameSync(from, to); backups.push({ from, to });
+      }
+      moveStoredRevision(stage, join(dataDir, file));
+      publishedPath = join(dataDir, file);
+      if (!existing) db.prepare('INSERT INTO chapters(id,work_id,entry,directory) VALUES(?,?,?,?)').run(id, work, JSON.stringify(entry), directory);
+      db.prepare('UPDATE chapters SET deleted_at=NULL WHERE id=?').run(id);
+      const published = recordEntry(db, entry);
+      db.prepare('DELETE FROM revisions WHERE chapter_id=?').run(id);
+      db.prepare('INSERT INTO revisions(chapter_id,revision,entry,path) VALUES(?,?,?,?)').run(id, revision, JSON.stringify(published), file);
+      return published;
     });
+    committed = true;
+    return result;
+  } finally {
+    if (committed) { for (const backup of backups) rmSync(backup.to, { recursive: true, force: true }); }
+    else {
+      if (publishedPath) rmSync(publishedPath, { recursive: true, force: true });
+      for (const backup of backups.reverse()) renameSync(backup.to, backup.from);
+    }
+  }
 }
 
 function revisionFileName(entry: CatalogEntry): string { return `${entry.revision}.${entry.manifest.layout === 'chapter-files' ? 'files' : 'zip'}`; }
@@ -263,7 +338,7 @@ export function deleteChapter(db: DatabaseSync, dataDir: string, id: string): Ca
     for (const revision of revisions) {
       if (!revision.path) continue;
       const from = join(dataDir, revision.path); const to = join(dataDir, trash, revisionFileName(JSON.parse(revision.entry)));
-      if (existsSync(from)) { renameSync(from, to); moves.push({ from, to }); }
+      if (existsSync(from)) { moveStoredRevision(from, to); moves.push({ from, to }); }
     }
     return transaction(db, () => {
       for (const revision of revisions) if (revision.path) db.prepare('UPDATE revisions SET path=? WHERE chapter_id=? AND revision=?').run(join(trash, revisionFileName(JSON.parse(revision.entry))), id, revision.revision);
@@ -272,7 +347,7 @@ export function deleteChapter(db: DatabaseSync, dataDir: string, id: string): Ca
       db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(id, entry.sequence);
       return entry;
     });
-  } catch (error) { for (const move of moves.reverse()) renameSync(move.to, move.from); throw error; }
+  } catch (error) { for (const move of moves.reverse()) moveStoredRevision(move.to, move.from); throw error; }
 }
 
 export function restoreChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry {
@@ -286,14 +361,14 @@ export function restoreChapter(db: DatabaseSync, dataDir: string, id: string): C
     mkdirSync(join(dataDir, row.directory), { recursive: true });
     for (const revision of revisions) {
       const from = join(dataDir, revision.path); const to = join(dataDir, row.directory, revisionFileName(JSON.parse(revision.entry)));
-      renameSync(from, to); moves.push({ from, to });
+      moveStoredRevision(from, to); moves.push({ from, to });
     }
     return transaction(db, () => {
       for (const revision of revisions) db.prepare('UPDATE revisions SET path=? WHERE chapter_id=? AND revision=?').run(join(row.directory, revisionFileName(JSON.parse(revision.entry))), id, revision.revision);
       db.prepare('UPDATE chapters SET deleted_at=NULL WHERE id=?').run(id);
       return recordEntry(db, { ...row.catalog, deleted: !revisions.some(revision => revision.revision === row.catalog.revision) });
     });
-  } catch (error) { for (const move of moves.reverse()) renameSync(move.to, move.from); throw error; }
+  } catch (error) { for (const move of moves.reverse()) moveStoredRevision(move.to, move.from); throw error; }
 }
 
 export function purgeChapter(db: DatabaseSync, dataDir: string, id: string): void {

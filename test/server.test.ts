@@ -184,7 +184,7 @@ test('invalid, incomplete, wrong-sized, unlisted, and unsafe package data never 
   } finally { await s.close(); }
 });
 
-test('device deletion prevents stale reupload and retains tombstones after purge', async () => {
+test('device deletion permits a new upload and retains deletion history after purge', async () => {
   const s = await setup();
   try {
     const member = await s.device(); const admin = await s.admin();
@@ -193,27 +193,26 @@ test('device deletion prevents stale reupload and retains tombstones after purge
     const entry = (await send()).json();
     assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: member })).statusCode, 200);
     assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/package`)).statusCode, 410);
-    assert.equal((await send()).statusCode, 409);
     assert.equal((await s.app.inject('/api/v1/chapters')).json().items.at(-1).deleted, true);
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/purge`, headers: member })).statusCode, 403);
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/purge`, headers: admin })).statusCode, 200);
-    assert.equal((await send()).statusCode, 409);
+    assert.equal((await send()).statusCode, 200);
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: member })).statusCode, 200);
     assert.equal((await send()).statusCode, 200);
   } finally { await s.close(); }
 });
 
-test('revisions retain first default until an administrator selects another', async () => {
+test('a complete legacy chapter ignores later versions without a revision selector', async () => {
   const s = await setup();
   try {
     const member = await s.device(); const admin = await s.admin();
     const upload = async (body: string) => (await s.app.inject({ method: 'POST', url: '/api/v1/packages', headers: { ...member, 'content-type': 'application/zip' }, payload: await archive(body) })).json();
     const first = await upload('first'); const second = await upload('second');
-    assert.notEqual(first.revision, second.revision);
+    assert.deepEqual(first, second);
     assert.equal((await s.app.inject('/api/v1/chapters')).json().items[0].revision, first.revision);
-    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/revision`, headers: member, payload: { revision: second.revision } })).statusCode, 403);
+    assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/revision`, headers: member, payload: { revision: second.revision } })).statusCode, 404);
     const select = await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/revision`, headers: admin, payload: { revision: second.revision } });
-    assert.equal(select.statusCode, 200, select.body);
+    assert.equal(select.statusCode, 404);
     assert.equal((await s.app.inject('/api/v1/chapters')).json().items.at(-1).revision, second.revision);
   } finally { await s.close(); }
 });
