@@ -354,7 +354,7 @@ test('outer chapter ZIPs and extracted media directories are unsupported', async
       if (input === 'media-directory') { await rm(join(f.directory, 'media.zip')); await mkdir(join(f.directory, 'media')); await writeFile(join(f.directory, 'media', 'a.png'), 'image'); }
       else { await rm(f.directory, { recursive: true }); await mkdir(f.directory); await writeFile(join(f.directory, input), input.endsWith('.zip') ? await zip({ 'content.html': '<p>Archived</p>' }) : '<p>Old body</p>'); }
       const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.skipped, 1);
-      assert.match(f.items.at(-1)!.reason!, /Unsupported chapter file/);
+      assert.match(f.items.at(-1)!.reason!, /Unsupported chapter file|exactly one supported body file/);
       assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
     } finally { await f.close(); }
   }

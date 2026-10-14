@@ -92,6 +92,68 @@ test('missing server files are repaired by the next completed upload', async () 
   } finally { await s.close(); }
 });
 
+test('current uploads, rescans, and repairs preserve unrelated files in a chapter folder', async () => {
+  const s = await setup();
+  try {
+    const work = s.db.prepare('SELECT directory FROM works').get() as { directory: string };
+    const directory = join(s.dataDir, work.directory, '1-First');
+    await mkdir(directory);
+    const unrelated = Buffer.from('Opaque file that must not be read or replaced');
+    await writeFile(join(directory, 'attachment.zip'), unrelated);
+    const files = { 'content.html': Buffer.from('<p>Current chapter</p>') };
+    const response = await upload(s, files);
+    assert.equal(response.statusCode, 200, response.body);
+    const entry = response.json();
+    assert.deepEqual(await readFile(join(directory, 'attachment.zip')), unrelated);
+    assert.deepEqual((await upload(s, files)).json(), entry);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=attachment.zip`)).statusCode, 400);
+    const summary = await scanFolder({ dataDir: s.dataDir, db: s.db, limits: defaultLimits });
+    assert.equal(summary.skipped, 0);
+    const current = JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry);
+    assert.deepEqual(current.manifest.files.map((file: { path: string }) => file.path), ['content.html']);
+    assert.deepEqual(await readFile(join(directory, 'attachment.zip')), unrelated);
+    assert.equal((await scanFolder({ dataDir: s.dataDir, db: s.db, limits: defaultLimits })).unchanged, 2);
+    await rm(join(directory, 'content.html'));
+    assert.equal((await upload(s, files)).statusCode, 200);
+    assert.deepEqual(await readFile(join(directory, 'attachment.zip')), unrelated);
+    await writeFile(join(directory, 'content.html'), 'Incomplete');
+    s.db.exec("CREATE TRIGGER reject_repair BEFORE INSERT ON catalog_changes BEGIN SELECT RAISE(ABORT, 'Repair failed'); END");
+    assert.equal((await upload(s, files)).statusCode, 500);
+    assert.equal(await readFile(join(directory, 'content.html'), 'utf8'), 'Incomplete');
+    assert.deepEqual(await readFile(join(directory, 'attachment.zip')), unrelated);
+  } finally { await s.close(); }
+});
+
+test('uploads never overwrite an unindexed current chapter file', async () => {
+  const s = await setup();
+  try {
+    const work = s.db.prepare('SELECT directory FROM works').get() as { directory: string };
+    const directory = join(s.dataDir, work.directory, '1-First');
+    await mkdir(directory);
+    await writeFile(join(directory, 'content.html'), 'Original body');
+    const response = await upload(s, { 'content.html': Buffer.from('Replacement') });
+    assert.equal(response.statusCode, 409);
+    assert.equal(await readFile(join(directory, 'content.html'), 'utf8'), 'Original body');
+    assert.equal(s.db.prepare('SELECT 1 FROM chapters').get(), undefined);
+  } finally { await s.close(); }
+});
+
+test('failed publication removes only newly added files from an occupied folder', async () => {
+  const s = await setup();
+  try {
+    const work = s.db.prepare('SELECT directory FROM works').get() as { directory: string };
+    const directory = join(s.dataDir, work.directory, '1-First');
+    await mkdir(directory);
+    await writeFile(join(directory, 'notes.txt'), 'Preserve this file');
+    s.db.exec("CREATE TRIGGER reject_publication BEFORE INSERT ON catalog_changes BEGIN SELECT RAISE(ABORT, 'Publication failed'); END");
+    const response = await upload(s, { 'content.html': Buffer.from('Current body') });
+    assert.equal(response.statusCode, 500);
+    assert.deepEqual(await readdir(directory), ['notes.txt']);
+    assert.equal(await readFile(join(directory, 'notes.txt'), 'utf8'), 'Preserve this file');
+    assert.equal(s.db.prepare('SELECT 1 FROM chapters').get(), undefined);
+  } finally { await s.close(); }
+});
+
 test('original chapter files round trip without rewriting or an outer archive', async () => {
   const s = await setup();
   try {

@@ -149,6 +149,9 @@ no upgrade migrations, ZIP package endpoints, or format conversion paths.
 An incompatible server database fails startup. Stop the server and use a fresh
 state volume, retaining the `contents` mount and installation password, then scan
 current chapter folders. Older formats remain untouched but are not registered.
+Unrelated regular files in a chapter folder are ignored and preserved. An upload
+can add current chapter files beside them, but cannot overwrite unindexed current
+files. Scan those files first. Only the declared current files are served.
 
 ## Storage and limits
 

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { constants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { problem, transaction } from './db.ts';
@@ -16,6 +16,8 @@ export interface PackageManifest {
 export interface CatalogEntry { id: string; revision: string; fileBytes: number; manifest: PackageManifest; deleted: boolean; sequence: number }
 export interface Limits { zipBytes: number; expandedBytes: number; files: number }
 export const defaultLimits: Limits = { zipBytes: 512 * 1024 ** 2, expandedBytes: 2 * 1024 ** 3, files: 10000 };
+export const chapterFileNames = ['content.html', 'content.pdf', 'manifest.json', 'media.zip'];
+export const isUnfinishedContentName = (name: string) => name.startsWith('.') || /(?:\.tmp|\.bak|\.part|\.partial|\.norea-sync-backup)$/i.test(name);
 export const digest = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 export const workId = (identity: PackageManifest['identity']) => digest(JSON.stringify([identity.pluginId, identity.novelPath]));
 function safeSegment(value: string | null | undefined, fallback: string): string {
@@ -105,7 +107,7 @@ function storedFilesExist(dataDir: string, path: string, entry: CatalogEntry): b
     const target = chapterStoragePath(dataDir, path);
     const directory = lstatSync(target);
     return directory.isDirectory() && !directory.isSymbolicLink()
-      && readdirSync(target).every(name => entry.manifest.files.some(file => file.path === name)) && entry.manifest.files.every(file => {
+      && readdirSync(target).every(name => !isUnfinishedContentName(name) && (!chapterFileNames.includes(name.toLowerCase()) || entry.manifest.files.some(file => file.path === name))) && entry.manifest.files.every(file => {
       const info = lstatSync(join(target, file.path));
       return info.isFile() && !info.isSymbolicLink() && info.size === file.size;
     });
@@ -138,6 +140,8 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
   const { id, manifest } = entry;
   let backup: { from: string; to: string } | undefined;
   let publishedPath: string | undefined;
+  const addedFiles: string[] = [];
+  const retainedFiles: { from: string; to: string }[] = [];
   let committed = false;
   try {
     const result = transaction(db, () => {
@@ -161,9 +165,25 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
           const from = chapterStoragePath(dataDir, storedPath); const to = join(dirname(from), '.norea-replaced-' + randomUUID());
           renameSync(from, to); backup = { from, to };
         }
-        if (existsSync(destination)) throw problem(409, 'Unindexed files already occupy the chapter directory; scan the content directory first');
-        mkdirSync(dirname(destination), { recursive: true });
-        moveChapterFiles(source, destination); publishedPath = destination;
+        if (existsSync(destination)) {
+          if (!lstatSync(destination).isDirectory() || readdirSync(destination, { withFileTypes: true }).some(file => !file.isFile() || isUnfinishedContentName(file.name) || chapterFileNames.includes(file.name.toLowerCase()))) throw problem(409, 'Unindexed chapter files already occupy the directory; scan the content directory first');
+          // Preserve unrelated files without interpreting or serving them.
+          for (const file of manifest.files) {
+            const path = join(destination, file.path);
+            copyFileSync(join(source, file.path), path, constants.COPYFILE_EXCL);
+            addedFiles.push(path);
+          }
+        } else {
+          mkdirSync(dirname(destination), { recursive: true });
+          moveChapterFiles(source, destination); publishedPath = destination;
+        }
+        if (backup) {
+          for (const file of readdirSync(backup.to, { withFileTypes: true })) {
+            if (!file.isFile() || chapterFileNames.includes(file.name.toLowerCase()) || isUnfinishedContentName(file.name)) continue;
+            const retained = { from: join(backup.to, file.name), to: join(destination, file.name) };
+            renameSync(retained.from, retained.to); retainedFiles.push(retained);
+          }
+        }
       }
       db.prepare('INSERT INTO chapters(id,work_id,entry,directory,path) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET entry=excluded.entry,path=excluded.path,deleted_at=NULL').run(id, work, JSON.stringify(entry), directory, directory);
       return recordEntry(db, entry);
@@ -173,6 +193,8 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
   } finally {
     if (committed) { if (backup) rmSync(backup.to, { recursive: true, force: true }); }
     else {
+      for (const file of retainedFiles) renameSync(file.to, file.from);
+      for (const path of addedFiles) rmSync(path, { force: true });
       if (publishedPath) rmSync(publishedPath, { recursive: true, force: true });
       if (backup) renameSync(backup.to, backup.from);
     }

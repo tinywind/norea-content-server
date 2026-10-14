@@ -3,7 +3,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { validateFiles, validateMedia } from './chapter-files.ts';
-import { completeChapter, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { chapterFileNames, completeChapter, digest, isUnfinishedContentName as unfinished, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 import { isCoverFile, cacheWork, metadataWorkId, readNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
 export interface FolderIndexItem {
@@ -25,7 +25,6 @@ export interface FolderIndexOptions {
   onWorkChange?: () => void;
 }
 type ChapterMetadata = Pick<PackageManifest, 'identity' | 'novel' | 'chapter'>;
-const unfinished = (name: string) => name.startsWith('.') || /(?:\.tmp|\.bak|\.part|\.partial|\.norea-sync-backup)$/i.test(name);
 const fail = (message: string): never => { throw new Error(message); };
 const segment = (value: string) => { const result = value.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96); return !result || result === '.' || result === '..' ? 'source' : result; };
 function aborted(signal?: AbortSignal): void { signal?.throwIfAborted(); }
@@ -45,10 +44,11 @@ async function signature(path: string): Promise<string> {
 }
 async function inventorySignature(directory: string, signal?: AbortSignal): Promise<string> {
   await noLinks(directory);
-  const entries = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name < b.name ? -1 : 1);
-  if (entries.some(entry => unfinished(entry.name))) fail('Unfinished chapter files are present');
-  if (entries.some(entry => entry.isSymbolicLink())) fail('Symbolic chapter files are unsupported');
-  if (entries.some(entry => !entry.isFile() || !['content.html', 'content.pdf', 'manifest.json', 'media.zip'].includes(entry.name))) fail('Unsupported chapter file; only current chapter files can be indexed');
+  const allEntries = await readdir(directory, { withFileTypes: true });
+  const entries = allEntries.filter(entry => chapterFileNames.includes(entry.name)).sort((a, b) => a.name < b.name ? -1 : 1);
+  if (allEntries.some(entry => unfinished(entry.name))) fail('Unfinished chapter files are present');
+  if (allEntries.some(entry => entry.isSymbolicLink())) fail('Symbolic chapter files are unsupported');
+  if (allEntries.some(entry => !entry.isFile())) fail('Unsupported chapter file; only current chapter files can be indexed');
   if (entries.filter(entry => ['content.html', 'content.pdf'].includes(entry.name)).length !== 1) fail('Chapter must contain exactly one supported body file');
   const parts: string[] = [];
   for (const entry of entries) { aborted(signal); parts.push(entry.name, await signature(join(directory, entry.name))); }
@@ -56,7 +56,7 @@ async function inventorySignature(directory: string, signal?: AbortSignal): Prom
 }
 async function chapterManifest(directory: string, metadata: ChapterMetadata, options: FolderIndexOptions): Promise<PackageManifest> {
   const files: PackageManifest['files'] = [];
-  for (const name of (await readdir(directory)).sort()) {
+  for (const name of (await readdir(directory)).filter(name => chapterFileNames.includes(name)).sort()) {
     aborted(options.signal);
     const info = await lstat(join(directory, name));
     files.push({ path: name, size: info.size, modifiedAt: Math.floor(info.mtimeMs) });
