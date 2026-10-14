@@ -5,7 +5,7 @@ type Child = Node | string | number | null | undefined;
 interface Device { id: string; deviceName: string; createdAt: number | string; lastSeenAt: number | string | null; blocked: boolean }
 interface Plugin { id: string; name: string; url: string; enabled: boolean; updatedAt: number | string; sources: { id: string; name: string; version: string; installMode?: string }[] }
 interface StorageSettings { path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
-interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; scanned: number; cancelled: boolean } }
+interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; removed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
 interface Entry { id: string; revision: string; fileBytes: number; deleted: boolean; sequence: number; manifest: { layout: 'chapter-files'; identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; modifiedAt: number }[] } }
 interface NovelMetadata {
@@ -266,11 +266,12 @@ async function plugins(current: number) {
 async function storage(current: number) {
   const data = await api<StorageSettings>('/admin/storage'); if (current !== generation) return;
   const directory = panel('Content directory', 'Configured when the server starts. Uploads and scans use the same directory.');
+  const scan = async (full: boolean) => {
+    const job = await api<Job>('/admin/storage/scan', 'POST', { full });
+    await navigate('Jobs'); updateQuery({ job: job.id }, true); await navigate('Jobs', false);
+  };
   directory.body.append(details([['Path', el('span', 'mono', data.path)], ['Last scan', date(data.lastScanAt)]]),
-    action('Scan now', async () => {
-      const job = await api<Job>('/admin/storage/scan', 'POST');
-      await navigate('Jobs'); updateQuery({ job: job.id }, true); await navigate('Jobs', false);
-    }, 'primary'));
+    el('div', 'form-actions', action('Scan now', () => scan(false), 'primary'), action('Full inspection', () => scan(true))));
   const schedule = panel('Scan schedule'); const form = el('form'); const errors = el('div');
   const enabled = input('enabled', 'checkbox', '', false); enabled.checked = data.enabled;
   const mode = select('mode', ['manual', 'periodic', 'changes'], data.mode);
@@ -282,7 +283,7 @@ async function storage(current: number) {
       await api('/admin/storage', 'PATCH', { mode: mode.value, intervalMinutes: Number(interval.value), enabled: enabled.checked }); notify('Scan schedule saved.');
     }, errors)), errors);
   schedule.body.append(form);
-  page.replaceChildren(directory.node, schedule.node, el('div', 'notice', 'The first scan indexes existing content. Later scans process new or changed files and reuse unchanged results. Each work needs valid novel.json metadata. Scans do not contact source sites or alter original chapter files.'));
+  page.replaceChildren(directory.node, schedule.node, el('div', 'notice', 'Scan now finds added or removed folders and refreshes work metadata and covers. Known complete chapters and unsupported folders reuse their previous results. Changes mode inspects files reported by the filesystem watcher. Use Full inspection after editing existing chapter files or repairing unsupported folders when no change event was received. Each work needs valid novel.json. Scans never alter original files or contact source sites.'));
 }
 
 async function loadCover(work: Work, target: HTMLElement, current: number) {
@@ -462,7 +463,8 @@ async function jobs(current: number) {
     const summary = data.job.summary;
     detailMeta.replaceChildren(el('div', 'cell-title', `${data.job.rootName} · ${data.job.status}`), el('div', 'mono', data.job.id),
       el('div', '', `Started ${date(data.job.startedAt)}${data.job.finishedAt ? ` · Finished ${date(data.job.finishedAt)}` : ''}`),
-      summary ? el('div', '', `${summary.scanned} scanned · ${summary.registered} registered · ${summary.unchanged} unchanged · ${summary.skipped} skipped · ${summary.failed} failed`) : '',
+      summary ? el('div', '', `${summary.scanned} scanned · ${summary.registered} registered · ${summary.unchanged} unchanged · ${summary.skipped} skipped · ${summary.failed} failed · ${summary.removed ?? 0} removed`) : '',
+      el('div', 'hint', 'Unchanged items and cached skips are counted above. Details list only new results and errors.'),
       data.job.error ? el('div', 'notice error', data.job.error) : '');
     detailResults.replaceChildren(table(['File', 'Outcome', 'Reason / identity'], data.items.map(item => [el('div', 'mono result-path', item.path), badge(item.status),
       el('div', '', item.reason || '—', item.sourceId ? el('div', 'hint mono', `Source: ${item.sourceId}`) : null, item.workId ? el('div', 'hint mono', `Work: ${item.workId}`) : null, item.chapterId ? el('div', 'hint mono', `Chapter: ${item.chapterId}`) : null, item.revision ? el('div', 'hint mono', `Revision: ${item.revision}`) : null)]), 'No file results recorded yet.'),
@@ -473,7 +475,7 @@ async function jobs(current: number) {
     const fingerprint = JSON.stringify(data); if (fingerprint !== listFingerprint) {
       listFingerprint = fingerprint;
       list.body.replaceChildren(table(['Folder', 'Status', 'Started', 'Results', 'Actions'], data.items.map(job => [el('div', 'cell-title', job.rootName), badge(job.status), date(job.startedAt),
-        job.summary ? `${job.summary.registered} registered / ${job.summary.unchanged} unchanged / ${job.summary.skipped} skipped / ${job.summary.failed} failed` : 'In progress',
+        job.summary ? `${job.summary.registered} registered / ${job.summary.unchanged} unchanged / ${job.summary.skipped} skipped / ${job.summary.failed} failed / ${job.summary.removed ?? 0} removed` : 'In progress',
         el('div', 'actions', action('Inspect', async () => { selected = job.id; offset = 0; updateQuery({ job: selected, offset }, true); resultFingerprint = ''; await results(); }, 'small'),
           job.status === 'running' ? action('Cancel', async () => { if (!confirm(`Cancel the scan for “${job.rootName}”? Content already registered will remain.`)) return; await api(`/admin/jobs/${encodeURIComponent(job.id)}/cancel`, 'POST'); await refresh(); }, 'small danger') : null),
       ]), 'No scans yet. Start a scan from Storage.'));
