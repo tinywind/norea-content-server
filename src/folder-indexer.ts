@@ -166,6 +166,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       folders.push(entry);
     }
     folders.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
+    const isLocal = value.identity.pluginId === 'local';
     const numbers = new Map<string, number>();
     for (const folder of folders) {
       const number = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/)?.[1];
@@ -176,15 +177,15 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       const path = join(directory, folder.name);
       const published = options.db.prepare('SELECT entry FROM chapters WHERE directory=?').get(relative(dataDir, path)) as { entry: string } | undefined;
       const entry = published ? JSON.parse(published.entry) as CatalogEntry : undefined;
-      if (entry && !entry.manifest.identity.chapterPath.startsWith('norea-folder:')) { await process(path, entry.manifest); continue; }
+      if (entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'))) { await process(path, entry.manifest); continue; }
       const parts = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/);
-      if (!parts || numbers.get(parts[1]) !== 1) {
+      if (!parts || (!isLocal && numbers.get(parts[1]) !== 1)) {
         options.db.prepare('UPDATE chapters SET path=NULL WHERE directory=? AND path=directory AND deleted_at IS NULL').run(relative(dataDir, path));
         await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must have a unique number followed by a hyphen and title' }); continue;
       }
       const files = await readdir(path);
       await process(path, {
-        identity: { ...value.identity, chapterPath: `norea-folder:${parts[1]}` },
+        identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${folder.name}` : `norea-folder:${parts[1]}` },
         novel: { name: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal },
         chapter: { name: parts[2], chapterNumber: parts[1], position: Number(parts[1]), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
       });

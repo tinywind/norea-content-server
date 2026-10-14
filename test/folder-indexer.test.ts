@@ -308,6 +308,29 @@ test('duplicate numbers and unfinished bodies remain unavailable within an exact
   } finally { await f.close(); }
 });
 
+test('recovers distinct local files with the same chapter number without rewriting either file', async () => {
+  const f = await fixture();
+  try {
+    const directory = join(f.dataDir, 'contents/local/local');
+    const metadata = workMetadata();
+    metadata.identity = { pluginId: 'local', novelPath: 'local' };
+    metadata.novel.isLocal = true;
+    await mkdir(directory, { recursive: true });
+    await writeFile(join(directory, 'novel.json'), JSON.stringify(metadata));
+    for (const name of ['1-First', '1-Second']) {
+      await mkdir(join(directory, name));
+      await writeFile(join(directory, name, 'content.html'), `<p>${name}</p>`);
+    }
+    const before = await snapshot(directory);
+    await f.run();
+    const entries = (f.db.prepare("SELECT entry FROM chapters WHERE json_extract(entry,'$.manifest.identity.pluginId')='local' ORDER BY directory").all() as { entry: string }[])
+      .map(row => JSON.parse(row.entry) as CatalogEntry);
+    assert.deepEqual(entries.map(entry => entry.manifest.identity.chapterPath), ['local-folder:1-First', 'local-folder:1-Second']);
+    assert.equal((await f.run()).registered, 0);
+    assert.deepEqual(await snapshot(directory), before);
+  } finally { await f.close(); }
+});
+
 test('remote media and ambiguous body formats are skipped without losing work metadata', async () => {
   const f = await fixture();
   try {
