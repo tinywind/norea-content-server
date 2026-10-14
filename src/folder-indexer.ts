@@ -82,7 +82,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     try {
       aborted(options.signal);
       const chapterMetadata = [metadata.identity, metadata.chapter];
-      const before = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
+      let before = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
       const saved = checkpoint(path);
       if (saved?.signature === before) {
         const item = JSON.parse(saved.entry) as FolderIndexItem;
@@ -91,8 +91,15 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
           await report({ ...item, status: 'unchanged' }); return;
         }
       }
-      const manifest = await chapterManifest(path, metadata, options);
-      if (before !== canonicalize([chapterMetadata, await inventorySignature(path, options.signal)])) fail('Source changed during indexing; retry after download completes');
+      let manifest: PackageManifest;
+      for (let attempt = 0; ; attempt++) {
+        aborted(options.signal);
+        manifest = await chapterManifest(path, metadata, options);
+        const after = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
+        if (before === after) break;
+        if (attempt === 1) fail('Source changed during indexing; retry after download completes');
+        before = after;
+      }
       aborted(options.signal);
       const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
       const previous = options.db.prepare("SELECT path,json_extract(entry,'$.revision') AS revision FROM chapters WHERE id=?").get(id) as { path: string | null; revision: string } | undefined;
@@ -131,11 +138,16 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         value = stored.metadata;
         await report({ ...JSON.parse(saved.entry) as FolderIndexItem, status: 'unchanged' });
       } else {
-        const original = await signature(metadataPath);
-        value = readNovelMetadata(metadataPath);
-        if (segment(value.identity.pluginId) !== sourceId) fail('Work metadata source does not match its folder');
-        const before = await workSignature(value);
-        if (original !== await signature(metadataPath)) fail('Work metadata changed during indexing');
+        let before: string;
+        for (let attempt = 0; ; attempt++) {
+          aborted(options.signal);
+          const original = await signature(metadataPath);
+          value = readNovelMetadata(metadataPath);
+          if (segment(value.identity.pluginId) !== sourceId) fail('Work metadata source does not match its folder');
+          before = await workSignature(value);
+          if (original === await signature(metadataPath)) break;
+          if (attempt === 1) fail('Work metadata changed during indexing');
+        }
         aborted(options.signal);
         const id = metadataWorkId(value);
         const previous = options.db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;

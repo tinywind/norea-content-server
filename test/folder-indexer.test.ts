@@ -174,21 +174,98 @@ test('cancels between items without creating staging files or changing source fi
   } finally { await f.close(); }
 });
 
-test('source changes during media validation are skipped and retried on the next scan', async t => {
+test('a one-time source stat change during media validation is indexed on the first scan', async t => {
+  const f = await fixture();
+  try {
+    const originalOpen = yauzl.open; const body = join(f.directory, 'content.html'); let changed = false;
+    t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => {
+      if (!changed) {
+        changed = true; const info = statSync(body); utimesSync(body, info.atime, new Date(info.mtimeMs + 1000));
+      }
+      return originalOpen(...args);
+    });
+    const result = await f.run(); assert.equal(result.registered, 2, JSON.stringify(f.items)); assert.equal(result.skipped, 0);
+    assert.equal(stored(f).manifest.files.find(file => file.path === 'content.html')!.modifiedAt, Math.floor(statSync(body).mtimeMs));
+    assert.ok(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory));
+    assert.equal((await f.run()).unchanged, 2);
+  } finally { await f.close(); }
+});
+
+test('source changes during both media validations are skipped and retried on the next scan', async t => {
   const f = await fixture();
   try {
     const originalOpen = yauzl.open;
     const body = join(f.directory, 'content.html');
-    t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => {
+    const archives = t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => {
       const info = statSync(body); utimesSync(body, info.atime, new Date(info.mtimeMs + 1000));
       return originalOpen(...args);
     });
     assert.equal((await f.run()).skipped, 1);
+    assert.equal(archives.mock.callCount(), 2);
     assert.match(f.items.at(-1)!.reason!, /changed during indexing/);
     assert.equal(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory), undefined);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
     t.mock.restoreAll();
     assert.equal((await f.run()).registered, 1);
   } finally { await f.close(); }
+});
+
+test('work metadata is indexed on the first scan after a one-time stat change during reading', async t => {
+  const f = await fixture();
+  try {
+    const path = join(f.directory, '..', 'novel.json'); const originalRead = fs.readFileSync; let changed = false;
+    t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      const bytes = originalRead(...args);
+      if (args[0] === path && !changed) {
+        changed = true; const info = statSync(path); utimesSync(path, info.atime, new Date(info.mtimeMs + 1000));
+      }
+      return bytes;
+    });
+    syncBuiltinESMExports();
+    const result = await f.run(); assert.equal(result.registered, 2, JSON.stringify(f.items)); assert.equal(result.skipped, 0);
+    assert.ok(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(path));
+    assert.equal((await f.run()).unchanged, 2);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+});
+
+test('work metadata retry publishes only the contents read after the change', async t => {
+  const f = await fixture();
+  try {
+    const path = join(f.directory, '..', 'novel.json'); const originalRead = fs.readFileSync; let changed = false;
+    const metadata = workMetadata(); metadata.novel.name = 'Changed while reading';
+    t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      const bytes = originalRead(...args);
+      if (args[0] === path && !changed) {
+        changed = true; const info = statSync(path); fs.writeFileSync(path, JSON.stringify(metadata)); utimesSync(path, info.atime, new Date(info.mtimeMs + 1000));
+      }
+      return bytes;
+    });
+    syncBuiltinESMExports();
+    assert.equal((await f.run()).registered, 2, JSON.stringify(f.items));
+    const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', metadata.identity.novelPath])));
+    assert.equal(work.metadata.novel.name, 'Changed while reading'); assert.equal(stored(f).manifest.novel.name, 'Changed while reading');
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_changes').get() as { n: number }).n, 1);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
+});
+
+test('work metadata that changes on both reads is skipped without publishing or checkpointing', async t => {
+  const f = await fixture();
+  try {
+    const path = join(f.directory, '..', 'novel.json'); const originalRead = fs.readFileSync; let reads = 0;
+    t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
+      const bytes = originalRead(...args);
+      if (args[0] === path) {
+        reads++; const info = statSync(path); utimesSync(path, info.atime, new Date(info.mtimeMs + 1000));
+      }
+      return bytes;
+    });
+    syncBuiltinESMExports();
+    const result = await f.run(); assert.equal(result.registered, 0); assert.equal(result.skipped, 1); assert.equal(reads, 2);
+    assert.match(f.items.at(-1)!.reason!, /Work metadata changed during indexing/);
+    for (const table of ['works', 'work_changes', 'chapters', 'scan_checkpoints']) assert.equal((f.db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n, 0);
+    t.mock.restoreAll(); syncBuiltinESMExports();
+    assert.equal((await f.run()).registered, 2);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
 });
 
 test('metadata-only works and covers import without source requests or chapter files', async t => {
