@@ -267,11 +267,16 @@ skips the whole work. The importer never recovers work identity from a folder
 name, `cover.json`, an old app database, or source-site requests. Synthetic
 `norea-folder:` work identities are rejected.
 
-`novel.json` writers emit `schemaVersion`, `identity`, `novel`, and `cover`.
+`novel.json` writers emit `schemaVersion`, `identity`, `novel`, `cover`, and `chapters`.
 Readers require only `identity.pluginId`, `identity.novelPath`, and `novel.name`.
 Unknown fields are ignored and omitted on write and transfer. An absent schema
-version defaults to 1. No chapter list, update timestamp, or source cover URL is
-written or transferred. The server does not manage `cover.json`. Work metadata includes the original
+version defaults to 1. `chapters` maps source chapter numbers to their exact titles
+and defaults to an empty map when absent. Source metadata fetches update the map;
+uploads preserve earlier catalog entries. The console lists the catalog with
+server file availability, and chapter deletion retains its title in the catalog.
+Apps can restore the full catalog from these files and identify downloaded chapters
+by checking their completed local bodies. No update timestamp or source cover URL
+is written or transferred. The server does not manage `cover.json`. Work metadata includes the original
 status text and a nullable rating from 0 to 5. The scanner discovers actual work-local `cover.*` image files, including when
 the optional cover descriptor is absent. The console serves these local files. Metadata-only works can be registered without chapters.
 See [Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1).

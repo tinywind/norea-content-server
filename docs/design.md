@@ -609,6 +609,10 @@ Each work directory stores this metadata-only document:
   "cover": {
     "fileName": "cover.jpg",
     "contentType": "image/jpeg"
+  },
+  "chapters": {
+    "1": "Opening",
+    "2": "The next chapter"
   }
 }
 ```
@@ -622,9 +626,14 @@ the source text. `identity.novelPath` excludes the source base URL and retains
 identity query parameters, such as `/webtoon/list?titleId=123`. Absolute HTTP(S),
 protocol-relative, and synthetic `norea-folder:` work paths are rejected.
 
-No chapter list or update timestamp is stored in `novel.json`. Chapter listings
-come from actual imported or uploaded packages; source pagination, reading state,
-and sync bookkeeping are excluded. The lightweight chapter catalog includes
+`chapters` stores canonical numeric source chapter keys and their exact titles.
+Fractional keys are preserved. The map defaults to empty when absent; malformed
+maps are rejected. Source metadata fetches populate the full catalog and merge
+incremental results. Work uploads preserve previously known catalog entries.
+Downloads, chapter deletion, and reading activity do not edit the catalog.
+No update timestamp, source pagination, reading state, or sync bookkeeping is
+stored in the work document. Restoring these files rebuilds the app catalog;
+completed local bodies determine downloaded flags. The lightweight chapter catalog includes
 number, page, and content type without package file inventories. Number fallback
 lookup is limited to a unique chapter in the exact canonical work.
 
@@ -646,6 +655,16 @@ The work ID hashes the exact plugin ID and novel path. Metadata and cover change
 advance the work cursor. Clients retain file fingerprints to preserve pending local
 edits and avoid unchanged uploads. Chapters transfer only their original files.
 
+`GET /api/v1/admin/works/:id/chapters?search=&offset=0&limit=50` lists the
+saved catalog with available server copies attached as `entry`. Missing and
+deleted bodies have a null entry. Each available entry contains only `id` and
+`fileBytes`; Inspect loads its full details on demand. Available packages absent from the saved map
+remain visible. The download catalog continues to return only available files,
+using the saved map for chapter titles. Scans also use these titles without
+renaming chapter folders or rewriting their contents.
+
 The console offers work-cover grids and lists, search, chapter counts, a metadata
 dialog, and chapter deletion and restoration actions. Cover requests carry console authentication
 in headers rather than URLs.
+Work summaries show catalog and available-file counts separately and omit the
+chapter map. The Metadata action fetches the complete work document on demand.

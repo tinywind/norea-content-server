@@ -1,9 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { problem } from './db.ts';
+import { authenticate } from './auth.ts';
 import { completeChapter, digest } from './packages.ts';
 import type { CatalogEntry } from './packages.ts';
-import type { NovelMetadataV1 } from './works.ts';
+import type { NovelMetadataV1, WorkEntry } from './works.ts';
 
 interface WorkSummary {
   id: string;
@@ -36,6 +37,45 @@ const security: Record<string, string[]>[] = [{ bearerAuth: [] }, {}];
 
 export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
   const { db, dataDir, requireRead, catalogSchema } = context;
+  app.get<{ Params: { id: string }; Querystring: { search: string; offset: number; limit: number } }>('/api/v1/admin/works/:id/chapters', { schema: {
+    security: [{ bearerAuth: [] }],
+    description: 'List the saved work chapter catalog with an available server copy when present. Missing or deleted bodies retain their catalog titles and have a null entry. Available files absent from the catalog remain visible.',
+    params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
+    querystring: { type: 'object', additionalProperties: false, properties: { search: { type: 'string', maxLength: 500, default: '' }, ...pagination(50) } },
+  } }, async (request, reply) => {
+    authenticate(db, request, true); reply.header('Cache-Control', 'no-store');
+    const row = db.prepare('SELECT entry FROM works WHERE id=?').get(request.params.id) as { entry: string } | undefined;
+    if (!row) throw problem(404, 'Work not found');
+    const work = JSON.parse(row.entry) as WorkEntry;
+    const entries = db.prepare(`SELECT id,json_extract(entry,'$.fileBytes') AS fileBytes,
+      json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.name') AS name,
+      json_extract(entry,'$.manifest.chapter.position') AS position
+      FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL`).all(request.params.id) as {
+        id: string; fileBytes: number; chapterNumber: string | null; name: string; position: number;
+      }[];
+    const byNumber = new Map<string, typeof entries>();
+    for (const entry of entries) {
+      const number = entry.chapterNumber;
+      if (number == null) continue;
+      const key = String(Number(number));
+      byNumber.set(key, [...(byNumber.get(key) ?? []), entry]);
+    }
+    const used = new Set<string>();
+    const items: { chapterNumber: string | null; name: string; position: number; entry: { id: string; fileBytes: number } | null }[] = [];
+    for (const [number, name] of Object.entries(work.metadata.chapters)) {
+      const matches = byNumber.get(number) ?? [];
+      for (const entry of matches) used.add(entry.id);
+      for (const entry of matches.length ? matches : [null]) items.push({ chapterNumber: number, name, position: Number(number), entry: entry ? { id: entry.id, fileBytes: entry.fileBytes } : null });
+    }
+    for (const entry of entries) {
+      if (used.has(entry.id)) continue;
+      items.push({ chapterNumber: entry.chapterNumber, name: entry.name, position: Number(entry.chapterNumber ?? entry.position), entry: { id: entry.id, fileBytes: entry.fileBytes } });
+    }
+    items.sort((a, b) => a.position - b.position || (a.entry?.id ?? '').localeCompare(b.entry?.id ?? ''));
+    const { search, offset, limit } = request.query;
+    const matching = search ? items.filter(item => `${item.chapterNumber ?? ''} ${item.name}`.toLowerCase().includes(search.toLowerCase())) : items;
+    return { items: matching.slice(offset, offset + limit), total: matching.length, hasMore: offset + limit < matching.length };
+  });
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/catalog/changes', { schema: {
     security,
     description: 'Read ordered chapter availability changes without package manifests. Apply repeated identities in order, including deletion and restoration entries. The cursor advances to the last returned sequence and remains unchanged on an empty page.',
@@ -87,13 +127,15 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
   } }, async request => {
     requireRead(request);
     const { id } = request.params; const { offset, limit } = request.query;
-    if (!db.prepare('SELECT 1 FROM works WHERE id=?').get(id) && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
+    const work = db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;
+    if (!work && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
+    const titles = work ? (JSON.parse(work.entry) as WorkEntry).metadata.chapters : {};
     const total = (db.prepare('SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL').get(id) as { n: number }).n;
     const items = db.prepare(`SELECT id,json_extract(entry,'$.manifest.identity.chapterPath') AS chapterPath,
       json_extract(entry,'$.manifest.chapter.position') AS position,json_extract(entry,'$.manifest.chapter.name') AS name,
       json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType
       FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
-    return { items, total, hasMore: offset + items.length < total };
+    return { items: items.map(item => ({ ...item, name: titles[String(Number(item.chapterNumber))] ?? item.name })), total, hasMore: offset + items.length < total };
   });
   app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string; includeUnavailable?: boolean } }>('/api/v1/catalog/chapter', { schema: {
     security,

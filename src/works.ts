@@ -22,6 +22,7 @@ export interface NovelMetadataV1 {
     isLocal: boolean;
   };
   cover: { fileName: string; contentType: string | null } | null;
+  chapters: Record<string, string>;
 }
 
 export interface WorkEntry { id: string; sequence: number; metadata: NovelMetadataV1; hasCover: boolean; deleted?: boolean }
@@ -56,6 +57,14 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
   for (const key of ['author', 'artist', 'summary', 'status', 'genres']) text(novel[key] ?? null, true);
   if (novel.rating != null && (typeof novel.rating !== 'number' || !Number.isFinite(novel.rating) || novel.rating < 0 || novel.rating > 5)) throw problem(400, 'work metadata: invalid rating');
   if (novel.isLocal != null && typeof novel.isLocal !== 'boolean') throw problem(400, 'work metadata: invalid local flag');
+  const chapters: NovelMetadataV1['chapters'] = {};
+  if (value.chapters !== undefined) {
+    for (const [number, name] of Object.entries(record(value.chapters))) {
+      if (!Number.isFinite(Number(number)) || String(Number(number)) !== number) throw problem(400, 'work metadata: invalid chapter number');
+      text(name);
+      chapters[number] = name as string;
+    }
+  }
   let cover: NovelMetadataV1['cover'] = null;
   if (value.cover != null) {
     const input = record(value.cover);
@@ -75,6 +84,7 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
       genres: parsed.novel.genres ?? null, rating: parsed.novel.rating ?? null, isLocal: parsed.novel.isLocal ?? false,
     },
     cover,
+    chapters,
   };
 }
 
@@ -202,6 +212,8 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
     const bytes = readBytes(file, metadataByteLimit);
     try { current = JSON.parse(bytes.toString('utf8')); } catch { current = undefined; }
   }
+  if (current !== undefined) metadata.chapters = { ...parseNovelMetadata(current).chapters, ...metadata.chapters };
+  parseNovelMetadata(metadata);
   if (current === undefined || canonicalize(current) !== canonicalize(metadata)) atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
   return cacheWork(db, dataDir, directory, metadata, restore);
 }
@@ -304,6 +316,10 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     const where = "WHERE (?='' OR instr(lower(json_extract(w.entry,'$.metadata.novel.name') || ' ' || json_extract(w.entry,'$.metadata.identity.pluginId')),lower(?))>0)";
     const args = [request.query.search, request.query.search];
     const rows = db.prepare(`SELECT w.entry,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS downloadedChapters FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string; downloadedChapters: number }[];
-    return { items: rows.map(row => { const entry = JSON.parse(row.entry) as WorkEntry; return { ...entry, chapterCount: row.downloadedChapters, downloadedChapters: row.downloadedChapters }; }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n };
+    return { items: rows.map(row => {
+      const entry = JSON.parse(row.entry) as WorkEntry;
+      const { chapters, ...metadata } = entry.metadata;
+      return { ...entry, metadata, chapterCount: Object.keys(chapters).length, downloadedChapters: row.downloadedChapters };
+    }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n };
   });
 }

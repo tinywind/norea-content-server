@@ -12,7 +12,7 @@ import type { NovelMetadataV1 } from '../src/works.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 function metadata(pluginId: string, name: string): NovelMetadataV1 {
-  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null };
+  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null, chapters: {} };
 }
 async function fixture(anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });
@@ -38,6 +38,32 @@ async function fixture(anonymousRead = true) {
   };
   return { app, dataDir, headers, putWork, putChapter, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
+
+test('backs up the complete chapter catalog and shows missing server files without making them downloadable', async () => {
+  const f = await fixture();
+  try {
+    const work = { ...metadata('source-a', 'Catalog work'), chapters: { '1': 'Opening: exact title?', '2': 'Missing body', '3': 'Latest chapter' } };
+    const stored = await f.putWork(work);
+    const uploaded = await f.putChapter(work, '/chapter/one', 1);
+    assert.deepEqual((await f.app.inject(`/api/v1/works/${stored.id}`)).json().metadata.chapters, work.chapters);
+    const headers = await consoleHeaders(f.app, f.dataDir);
+    const summaries = (await f.app.inject({ url: '/api/v1/admin/works', headers })).json();
+    assert.equal(summaries.items[0].chapterCount, 3);
+    assert.equal(summaries.items[0].downloadedChapters, 1);
+    assert.equal(Object.hasOwn(summaries.items[0].metadata, 'chapters'), false);
+    const list = async (query = '') => (await f.app.inject({ url: `/api/v1/admin/works/${stored.id}/chapters${query}`, headers })).json();
+    const page = await list('?limit=2');
+    assert.equal(page.total, 3); assert.equal(page.hasMore, true);
+    assert.deepEqual(page.items.map((item: { name: string; entry: unknown }) => [item.name, item.entry !== null]), [['Opening: exact title?', true], ['Missing body', false]]);
+    assert.deepEqual(Object.keys(page.items[0].entry).sort(), ['fileBytes', 'id']);
+    assert.equal((await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters`)).json().items[0].name, work.chapters['1']);
+    assert.equal((await list('?search=Missing')).total, 1);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${uploaded.id}`, headers: f.headers })).statusCode, 200);
+    assert.equal((await list()).items[0].entry, null);
+    assert.deepEqual((await f.app.inject(`/api/v1/works/${stored.id}`)).json().metadata.chapters, work.chapters);
+    assert.equal((await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters`)).json().total, 0);
+  } finally { await f.close(); }
+});
 
 test('browses current work summaries with bounded pages, literal search and source counts', async () => {
   const f = await fixture();

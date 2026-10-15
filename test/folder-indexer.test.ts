@@ -9,7 +9,7 @@ import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { openDatabase } from '../src/db.ts';
 import { chapterFileStream } from '../src/chapter-files.ts';
-import { completeChapter, defaultLimits, deleteChapter, digest, type CatalogEntry } from '../src/packages.ts';
+import { completeChapter, defaultLimits, deleteChapter, digest, workId, type CatalogEntry } from '../src/packages.ts';
 import { scanFolder, type FolderIndexItem } from '../src/folder-indexer.ts';
 import { getWork } from '../src/works.ts';
 
@@ -42,7 +42,7 @@ async function fixture() {
 function workMetadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/real/book?lang=ko' },
     novel: { name: 'Portable Book', author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false },
-    cover: { fileName: 'cover.png', contentType: 'image/png' } };
+    cover: { fileName: 'cover.png', contentType: 'image/png' }, chapters: {} };
 }
 
 async function snapshot(root: string): Promise<Record<string, string>> {
@@ -68,6 +68,8 @@ async function download(f: Awaited<ReturnType<typeof fixture>>, entry: CatalogEn
 test('indexes original chapter files in place without rewriting, copying or archiving their bytes', async t => {
   const f = await fixture();
   try {
+    const chapters = { '1': 'Opening: exact title?', '2': 'Not backed up' };
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify({ ...workMetadata(), chapters }));
     const before = await snapshot(join(f.dataDir, 'contents'));
     const reads = t.mock.method(fs, 'createReadStream', () => { throw new Error('Scanner must not read chapter payload streams'); });
     const writes = t.mock.method(fs, 'createWriteStream', () => { throw new Error('Scanner must not copy chapter files'); });
@@ -83,6 +85,8 @@ test('indexes original chapter files in place without rewriting, copying or arch
     assert.equal(entry.manifest.layout, 'chapter-files');
     assert.equal(entry.manifest.identity.chapterPath, 'norea-folder:1');
     assert.equal(entry.manifest.identity.novelPath, workMetadata().identity.novelPath);
+    assert.equal(entry.manifest.chapter.name, chapters['1']);
+    assert.deepEqual(getWork(f.db, f.dataDir, workId(entry.manifest.identity)).metadata.chapters, chapters);
     for (const file of entry.manifest.files) {
       assert.deepEqual(await download(f, entry, file.path), await readFile(join(f.directory, file.path)));
       assert.deepEqual(Object.keys(file).sort(), ['modifiedAt', 'path', 'size']);

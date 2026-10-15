@@ -14,7 +14,7 @@ import { consoleHeaders, deviceHeaders } from './access.ts';
 export function metadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/books/1?lang=ko' },
     novel: { name: 'Book', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
-    cover: { fileName: 'cover.png', contentType: 'image/png' } };
+    cover: { fileName: 'cover.png', contentType: 'image/png' }, chapters: {} };
 }
 const id = digest(JSON.stringify(['example', '/books/1?lang=ko']));
 async function fixture() {
@@ -231,7 +231,7 @@ test('rebuilds the work cache from authoritative files and retains its folder on
   try {
     assert.equal((await app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).statusCode, 200);
     const source = join(f.dataDir, 'contents', 'example'); const folders = await readdir(source); assert.equal(folders.length, 1);
-    const file = join(source, folders[0], 'novel.json'); const updated = { ...metadata(), novel: { ...metadata().novel, name: 'Renamed' } };
+    const file = join(source, folders[0], 'novel.json'); const updated = { ...metadata(), novel: { ...metadata().novel, name: 'Renamed' }, chapters: { '1': 'Opening', '2': 'Not backed up' } };
     await writeFile(file, JSON.stringify(updated));
     await app.close(); app = await buildApp({ dataDir: f.dataDir });
     assert.deepEqual((await app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata, updated);
@@ -268,7 +268,7 @@ test('uploads only normalized metadata and ignores extra source URLs and persona
   const f = await fixture();
   try {
     const value = metadata();
-    const payload = { ...value, updatedAt: 99, chapters: [], readingProgress: 8,
+    const payload = { ...value, updatedAt: 99, readingProgress: 8,
       novel: { ...value.novel, cover: 'https://unused.invalid/cover.jpg' },
       cover: { ...value.cover, sourceUrl: 'https://unused.invalid/cover.jpg' } };
     const uploaded = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload });
@@ -282,6 +282,29 @@ test('uploads only normalized metadata and ignores extra source URLs and persona
     const response = await f.app.inject({ url: '/api/v1/works', headers: f.headers });
     assert.deepEqual(response.json().items[0].metadata, value);
     db.close();
+  } finally { await f.close(); }
+});
+
+test('merges chapter catalogs without dropping stored titles or accepting malformed maps', async () => {
+  const f = await fixture();
+  try {
+    const put = (chapters: unknown) => f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: { ...metadata(), chapters } });
+    assert.equal((await put({ '1': 'Opening', '2': 'Second' })).statusCode, 200);
+    const updated = await put({ '2': 'Corrected title', '2.5': 'Interlude' });
+    assert.equal(updated.statusCode, 200, updated.body);
+    const chapters = { '1': 'Opening', '2': 'Corrected title', '2.5': 'Interlude' };
+    assert.deepEqual(updated.json().metadata.chapters, chapters);
+    const [folder] = await readdir(join(f.dataDir, 'contents/example'));
+    const file = join(f.dataDir, 'contents/example', folder, 'novel.json');
+    assert.deepEqual(JSON.parse(await readFile(file, 'utf8')).chapters, chapters);
+    const modifiedAt = fs.statSync(file).mtimeMs;
+    const unchanged = await put({});
+    assert.equal(unchanged.json().sequence, updated.json().sequence);
+    assert.equal(fs.statSync(file).mtimeMs, modifiedAt);
+    for (const invalid of [[], { '01': 'Ambiguous number' }, { 'NaN': 'Invalid number' }, { '1': 12 }]) {
+      assert.equal((await put(invalid)).statusCode, 400);
+    }
+    assert.deepEqual((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().metadata.chapters, chapters);
   } finally { await f.close(); }
 });
 

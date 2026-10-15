@@ -226,7 +226,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       await process(path, {
         identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${folder.name}` : `norea-folder:${parts![1]}` },
         novel: { name: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal },
-        chapter: { name: parts![2], chapterNumber: parts![1], position: Number(parts![1]), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
+        chapter: { name: value.chapters[String(Number(parts![1]))] ?? parts![2], chapterNumber: parts![1], position: Number(parts![1]), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
       }, key);
     }
   };
