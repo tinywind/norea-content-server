@@ -13,8 +13,10 @@ interface NovelMetadata {
   identity: { pluginId: string; novelPath: string };
   novel: { name: string; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
   cover: { fileName: string; contentType: string | null } | null;
+  chapters: Record<string, string>;
 }
-interface Work { id: string; sequence: number; metadata: NovelMetadata; hasCover: boolean; chapterCount?: number; downloadedChapters?: number }
+interface WorkChapter { chapterNumber: string | null; name: string; position: number; entry: Pick<Entry, 'id' | 'fileBytes'> | null }
+interface Work { id: string; sequence: number; metadata: Omit<NovelMetadata, 'chapters'> & { chapters?: NovelMetadata['chapters'] }; hasCover: boolean; chapterCount?: number; downloadedChapters?: number }
 interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
 interface Settings { anonymousRead: boolean; limits: { zipBytes: number; expandedBytes: number; files: number }; dataDir: string }
 interface Overview { works: number; chapters: number; storedChapters: number; storedBytes: number; deletedChapters: number; plugins: number; contentsPath: string; runningJobs: number }
@@ -309,7 +311,8 @@ async function loadCover(work: Work, target: HTMLElement, current: number) {
     if (!controller.signal.aborted && current === generation && target.isConnected) target.replaceChildren(el('span', 'cover-placeholder', 'Cover unavailable'));
   } finally { coverRequests.delete(controller); }
 }
-function inspectWork(work: Work) {
+async function inspectWork(work: Work) {
+  if (work.metadata.chapters === undefined) work = await api<Work>(`/works/${encodeURIComponent(work.id)}`);
   const { metadata } = work; const { novel, identity, cover } = metadata;
   const modal = dialog(`Metadata · ${novel.name}`); modal.node.classList.add('metadata-dialog');
   const values: [string, Child][] = [
@@ -319,6 +322,7 @@ function inspectWork(work: Work) {
     ['Plugin ID', el('span', 'mono', identity.pluginId)], ['Novel path', el('span', 'mono', identity.novelPath)],
     ['Cover file', cover?.fileName ?? '—'], ['Cover content type', cover?.contentType ?? '—'],
     ['Stored cover', work.hasCover ? 'Available' : 'Not available'],
+    ['Catalog chapters', Object.keys(metadata.chapters ?? {}).length],
     ['Schema version', metadata.schemaVersion], ['Work ID', el('span', 'mono', work.id)], ['Sequence', work.sequence],
   ];
   if (work.downloadedChapters !== undefined) values.push(['Downloaded chapters', work.downloadedChapters]);
@@ -343,7 +347,7 @@ async function contentRoute(current: number) {
 }
 async function content(current: number, state: WorkView) {
   clearCovers();
-  const section = panel('Works', 'Chapter counts include available imported or uploaded packages.'); section.body.className = '';
+  const section = panel('Works', 'Saved chapter catalogs and available server copies.'); section.body.className = '';
   const search = input('search', 'search', state.search, false); search.className = 'search-input'; search.placeholder = 'Search works'; search.setAttribute('aria-label', 'Search works');
   const errors = el('div'); errors.setAttribute('role', 'alert');
   const results = el('div'); let requestId = 0; let data: { items: Work[]; total: number } | undefined;
@@ -367,7 +371,7 @@ async function content(current: number, state: WorkView) {
       const controls = el('div', 'actions', action('Chapters', () => openChapters(work), 'small'), action('Metadata', () => inspectWork(work), 'small'),
         action('Delete', async () => { if (await deleteWork(work)) await load(state.offset); }, 'small danger', errors));
       const info = el('div', 'work-info', el('h3', '', title), el('p', 'hint work-author', work.metadata.novel.author || 'Unknown author'),
-        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${(work.downloadedChapters ?? 0).toLocaleString()} chapters available`), controls);
+        el('p', 'hint mono', work.metadata.identity.pluginId), el('p', 'work-count', `${(work.downloadedChapters ?? 0).toLocaleString()} chapters backed up · ${(work.chapterCount ?? 0).toLocaleString()} catalog chapters`), controls);
       works.append(el('article', 'work', cover, info));
       if (work.hasCover) covers.push({ work, node: cover });
     }
@@ -393,7 +397,7 @@ async function content(current: number, state: WorkView) {
 }
 async function chapters(current: number, work: Work | undefined, back: () => Promise<void>) {
   clearCovers();
-  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'One complete server copy per chapter. Delete it before uploading a replacement.' : 'All chapters associated with registered work metadata.'); section.body.className = '';
+  const section = panel(work ? work.metadata.novel.name : 'All chapters', work ? 'Saved chapter catalog with server file availability. Deleting a server copy keeps its catalog title.' : 'All chapters associated with registered work metadata.'); section.body.className = '';
   const query = new URLSearchParams(location.search);
   const search = input('search', 'search', query.get('chapterSearch') ?? '', false); search.className = 'search-input'; search.placeholder = 'Search novel or chapter'; search.setAttribute('aria-label', 'Search content');
   const deleted = select('deleted', ['Active content', 'Trash']); deleted.setAttribute('aria-label', 'Content state'); deleted.className = 'button';
@@ -402,10 +406,23 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
   const load = async (offset = 0) => {
     const request = ++requestId; errors.replaceChildren(); results.setAttribute('aria-busy', 'true');
     try {
+      if (work && deleted.value !== 'Trash') {
+        const data = await api<{ items: WorkChapter[]; total: number }>(`/admin/works/${encodeURIComponent(work.id)}/chapters?search=${encodeURIComponent(search.value.trim())}&offset=${offset}&limit=50`);
+        if (current !== generation || request !== requestId) return;
+        updateQuery({ chapterSearch: search.value.trim(), chapterOffset: offset, deleted: null });
+        results.replaceChildren(table(['Chapter', 'Server files', 'Actions'], data.items.map(chapter => [
+          el('div', '', el('div', 'cell-title', chapter.name), el('div', 'hint', `Chapter ${chapter.chapterNumber ?? chapter.position}`)),
+          chapter.entry ? el('div', '', 'Available', el('div', 'hint', bytes(chapter.entry.fileBytes))) : el('span', 'hint', 'Not backed up'),
+          chapter.entry ? el('div', 'actions', action('Inspect', () => inspectEntry(chapter.entry!.id, () => load(offset)), 'small'), action('Delete', async () => {
+            if (!confirm(`Delete “${chapter.name}” from the server? Its catalog title and local device copies remain.`)) return;
+            await api(`/chapters/${encodeURIComponent(chapter.entry!.id)}`, 'DELETE'); await load(offset);
+          }, 'small danger', errors)) : null,
+        ]), 'No matching chapters.'), pagination(data.total, offset, 50, load));
+        return;
+      }
       const data = await api<{ items: Entry[]; total: number }>(`/admin/chapters?search=${encodeURIComponent(search.value.trim())}&deleted=${deleted.value === 'Trash'}&offset=${offset}&limit=50${work ? `&workId=${encodeURIComponent(work.id)}` : ''}`);
       if (current !== generation || request !== requestId) return;
       updateQuery({ chapterSearch: search.value.trim(), chapterOffset: offset, deleted: deleted.value === 'Trash' ? 'true' : null });
-      if (work && deleted.value !== 'Trash') work.downloadedChapters = data.total;
       results.replaceChildren(table(['Chapter', 'Source', 'Stored content', 'Actions'], data.items.map(entry => [
         el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
         el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.fileBytes), el('div', 'hint mono', entry.revision.slice(0, 12))),
