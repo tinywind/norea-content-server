@@ -100,7 +100,9 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   Upload exactly one `content.html` or `content.pdf`, plus `manifest.json` and
   `media.zip` when present. `bodyPath` names that body file. PDF chapters use
   `content.pdf`; HTML, text, and Markdown chapters use `content.html`.
-  The media manifest must report a complete download with all assets stored.
+  Every media entry must be stored and match the archive's filenames. Byte limits
+  use the archive's uncompressed sizes. The download checkpoint's `complete`
+  property and cached per-image byte counts are not used for validation.
   `media.zip` requires `manifest.json`; a nonempty media inventory requires
   `media.zip`. Loose `media/` files are unsupported.
   Body bytes, media URLs, media-manifest formatting and timestamps, and media ZIP

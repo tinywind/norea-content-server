@@ -29,21 +29,20 @@ export function validateFiles(value: unknown, limits: Limits): asserts value is 
 export async function validateMedia(directory: string, manifest: PackageManifest, limits: Limits, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   if (!manifest.files.some(file => file.path === 'manifest.json')) return;
-  let media: { version?: number; complete?: boolean; media?: { files?: { fileName: string; path: string; bytes: number; status: string }[] } };
+  let media: { version?: number; media?: { files?: { fileName: string; path: string; status: string }[] } };
   try { media = JSON.parse(await readFile(join(directory, 'manifest.json'), { encoding: 'utf8', signal })); }
   catch { signal?.throwIfAborted(); throw problem(400, 'Invalid media manifest JSON'); }
-  if (media?.version !== 1 || media.complete !== true || !Array.isArray(media.media?.files)) throw problem(400, 'Chapter media download is incomplete');
+  if (media?.version !== 1 || !Array.isArray(media.media?.files)) throw problem(400, 'Invalid chapter media manifest');
   if (media.media.files.length > limits.files) throw problem(413, 'Media file count limit exceeded');
-  const expected = new Map<string, number>();
+  const expected = new Set<string>();
   const names = new Set<string>();
   let expanded = manifest.files.filter(file => file.path !== 'media.zip').reduce((sum, file) => sum + file.size, 0);
   for (const file of media.media.files) {
     signal?.throwIfAborted();
-    if (file?.status === 'remote') throw problem(400, 'Chapter media is not downloaded');
+    if (file?.status === 'remote') throw problem(400, `Media asset is not downloaded: ${file.fileName}`);
     const name = file?.fileName;
-    if (typeof name !== 'string' || !safeArchivePath(name) || !/^[A-Za-z0-9._-]+$/.test(name) || names.has(name.toLowerCase()) || file.path !== `media/${name}` || file.status !== 'stored' || !Number.isSafeInteger(file.bytes) || file.bytes < 0) throw problem(400, 'Invalid or incomplete media manifest');
-    names.add(name.toLowerCase()); expected.set(name, file.bytes); expanded += file.bytes;
-    if (expanded > limits.expandedBytes) throw problem(413, 'Expanded media limit exceeded');
+    if (typeof name !== 'string' || !safeArchivePath(name) || !/^[A-Za-z0-9._-]+$/.test(name) || names.has(name.toLowerCase()) || file.path !== `media/${name}` || file.status !== 'stored') throw problem(400, 'Invalid or incomplete media manifest');
+    names.add(name.toLowerCase()); expected.add(name);
   }
   if (!manifest.files.some(file => file.path === 'media.zip')) {
     if (expected.size) throw problem(400, 'Chapter media archive is missing');
@@ -58,9 +57,11 @@ export async function validateMedia(directory: string, manifest: PackageManifest
       zip.on('entry', (entry: yauzl.Entry) => {
         if (signal?.aborted) { reject(signal.reason); return; }
         const type = (entry.externalFileAttributes >>> 16) & 0xf000;
-        if (!expected.has(entry.fileName) || found.has(entry.fileName) || expected.get(entry.fileName) !== entry.uncompressedSize || (type !== 0 && type !== 0x8000) || (entry.generalPurposeBitFlag & 1)) {
+        if (!expected.has(entry.fileName) || found.has(entry.fileName) || (type !== 0 && type !== 0x8000) || (entry.generalPurposeBitFlag & 1)) {
           reject(problem(400, 'Media archive inventory does not match its manifest')); return;
         }
+        expanded += entry.uncompressedSize;
+        if (expanded > limits.expandedBytes) { reject(problem(413, 'Expanded media limit exceeded')); return; }
         found.add(entry.fileName); zip.readEntry();
       });
       zip.readEntry();

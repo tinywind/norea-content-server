@@ -197,6 +197,26 @@ test('original chapter files round trip without rewriting or an outer archive', 
   } finally { await s.close(); }
 });
 
+test('stored media round trips without trusting or rewriting its completion marker', async () => {
+  for (const complete of [undefined, false]) {
+    const s = await setup();
+    try {
+      const files = {
+        'content.html': Buffer.from('<img src="norea-media://reader-asset/a.png">'),
+        'manifest.json': Buffer.from(JSON.stringify({ version: 1, complete, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 4, status: 'stored' }] } })),
+        'media.zip': await archive({ 'a.png': Buffer.from('data') }),
+      };
+      const response = await upload(s, files);
+      assert.equal(response.statusCode, 200, response.body);
+      const entry = response.json();
+      for (const [path, original] of Object.entries(files)) {
+        const download = await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=${path}`);
+        assert.deepEqual(download.rawPayload, original);
+      }
+    } finally { await s.close(); }
+  }
+});
+
 test('PDF files retain their bytes and device read authorization', async () => {
   const s = await setup({ anonymousRead: false });
   try {
@@ -213,6 +233,26 @@ test('PDF files retain their bytes and device read authorization', async () => {
     await s.app.inject({ method: 'PATCH', url: `/api/v1/admin/devices/${device.id}`, headers: admin, payload: { blocked: true } });
     assert.equal((await s.app.inject({ url, headers: s.headers })).statusCode, 403);
   } finally { await s.close(); }
+});
+
+test('stored media uses archive sizes without rewriting cached byte counts', async () => {
+  for (const bytes of [0, 999]) {
+    const s = await setup();
+    try {
+      const files = {
+        'content.html': Buffer.from('<img src="norea-media://reader-asset/a.png">'),
+        'manifest.json': Buffer.from(JSON.stringify({ version: 1, complete: true, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes, status: 'stored' }] } })),
+        'media.zip': await archive({ 'a.png': Buffer.from('data') }),
+      };
+      const response = await upload(s, files);
+      assert.equal(response.statusCode, 200, response.body);
+      const entry = response.json();
+      for (const [path, original] of Object.entries(files)) {
+        const download = await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=${path}`);
+        assert.deepEqual(download.rawPayload, original);
+      }
+    } finally { await s.close(); }
+  }
 });
 
 test('raw uploads require a nonnegative safe integer modification time instead of a checksum', async () => {
@@ -475,7 +515,7 @@ test('unsafe paths, incorrect body types, incomplete media and undeclared parts 
       { files, metadata: { ...metadata, bodyPath: '../content.html', files: [{ ...metadata.files[0], path: '../content.html' }] } },
       { files, metadata: { ...metadata, files: [metadata.files[0], { path: 'media/a.png', size: 1, modifiedAt: 1700000000000 }] } },
       { files, metadata: { ...metadata, chapter: { ...metadata.chapter, contentType: 'pdf' } } },
-      { files: { ...files, 'manifest.json': Buffer.from('{"version":1,"complete":false,"media":{"files":[]}}') }, metadata: description({ ...files, 'manifest.json': Buffer.from('{"version":1,"complete":false,"media":{"files":[]}}') }) },
+      { files: { ...files, 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[{"fileName":"a.png","path":"","bytes":0,"status":"remote"}]}}') }, metadata: description({ ...files, 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[{"fileName":"a.png","path":"","bytes":0,"status":"remote"}]}}') }) },
       { files: { ...files, 'media.zip': Buffer.from('archive') }, metadata: description({ ...files, 'media.zip': Buffer.from('archive') }) },
       { files: { ...files, 'extra.txt': Buffer.from('extra') }, metadata },
     ];
@@ -526,7 +566,7 @@ test('raw artifact byte, metadata and file limits fail before publication', { ti
   } finally { await s.close(); }
 });
 
-test('media central directories must exactly match complete stored manifest entries', async () => {
+test('media central directories must exactly match stored manifest filenames', async () => {
   const s = await setup();
   try {
     const media = { version: 1, complete: true, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 4, status: 'stored' }] } };
@@ -534,7 +574,6 @@ test('media central directories must exactly match complete stored manifest entr
       Buffer.from('invalid archive'),
       await archive({}),
       await archive({ 'b.png': Buffer.from('data') }),
-      await archive({ 'a.png': Buffer.from('longer') }),
       await archive({ 'a.png': Buffer.from('data'), 'extra.png': Buffer.from('extra') }),
       await archive([['a.png', Buffer.from('data')], ['a.png', Buffer.from('data')]]),
       await archive({ 'a.png': Buffer.from('data') }, { compress: false, mode: 0o120777 }),
@@ -544,7 +583,7 @@ test('media central directories must exactly match complete stored manifest entr
       assert.equal(response.statusCode, 400, response.body);
     }
     const zip = await archive({ 'a.png': Buffer.from('data') });
-    for (const changed of [{ fileName: '../a.png' }, { path: 'outside/a.png' }, { bytes: -1 }, { status: 'remote' }]) {
+    for (const changed of [{ fileName: '../a.png' }, { path: 'outside/a.png' }, { status: 'remote' }]) {
       const invalid = { ...media, media: { files: [{ ...media.media.files[0], ...changed }] } };
       const response = await upload(s, { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(invalid)), 'media.zip': zip });
       assert.equal(response.statusCode, 400, response.body);
@@ -559,7 +598,7 @@ test('media central directories must exactly match complete stored manifest entr
 test('media uncompressed byte limits are checked without extracting the archive', async () => {
   const s = await setup({ limits: { expandedBytes: 1024 } });
   try {
-    const media = { version: 1, complete: true, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 4096, status: 'stored' }] } };
+    const media = { version: 1, complete: true, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 0, status: 'stored' }] } };
     const files = { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(media)), 'media.zip': await archive({ 'a.png': Buffer.alloc(4096) }, { compress: true, mode: 0o100644 }) };
     assert.ok(Object.values(files).reduce((sum, bytes) => sum + bytes.length, 0) < 1024);
     const response = await upload(s, files);

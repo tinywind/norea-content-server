@@ -177,10 +177,12 @@ New uploads send a `multipart/form-data` body with a versioned metadata manifest
 first, followed by the original `content.html` or `content.pdf`, optional media
 `manifest.json`, and optional `media.zip`. The metadata uses `layout: "chapter-files"`
 and preserves work and chapter identities. Preserve all file bytes and local media
-references without building an outer ZIP. The media manifest must report complete
-stored assets, and the media ZIP's central directory must match their names and
-sizes. This inventory check does not extract assets or verify ZIP CRCs. Store work
-covers separately at work scope and cache them locally when needed.
+references without building an outer ZIP. Every media entry must be stored, and
+the media ZIP's central directory must match their names. Byte limits use the
+archive's uncompressed sizes. The download checkpoint's `complete` property and
+cached per-image byte counts are not used for validation. This inventory check
+does not extract assets or verify ZIP CRCs. Store work covers separately at work
+scope and cache them locally when needed.
 
 Only this original-file format is supported. No outer ZIP encoder, decoder,
 media-path conversion, or older manifest reader is retained.
