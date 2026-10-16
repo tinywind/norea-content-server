@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { constants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
+import { canonicalize } from 'json-canonicalize';
 import { problem, transaction } from './db.ts';
 
 export interface PackageManifest {
@@ -132,12 +133,47 @@ export function completeChapter(db: DatabaseSync, dataDir: string, id: string): 
   return storedFilesExist(dataDir, row.path, entry) ? entry : undefined;
 }
 
+function normalizedChapterNumber(value: string | null | undefined): string | undefined {
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(value ?? '');
+  if (!match) return;
+  const integer = match[1].replace(/^0+(?=\d)/, '');
+  const fraction = match[2]?.replace(/0+$/, '');
+  return fraction ? `${integer}.${fraction}` : integer;
+}
+
+function folderChapterNumber(path: string): string | undefined {
+  return path.startsWith('norea-folder:') ? normalizedChapterNumber(path.slice('norea-folder:'.length)) : undefined;
+}
+
+export function findChapterUploadIdentity(db: DatabaseSync, manifest: PackageManifest): CatalogEntry | undefined {
+  const recovered = folderChapterNumber(manifest.identity.chapterPath);
+  const declared = normalizedChapterNumber(manifest.chapter.chapterNumber);
+  if (recovered !== undefined && manifest.chapter.chapterNumber != null && recovered !== declared) throw problem(400, 'Folder chapter identity does not match its chapter number');
+  const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
+  const exact = db.prepare('SELECT entry FROM chapters WHERE id=?').get(id) as { entry: string } | undefined;
+  if (exact) return JSON.parse(exact.entry) as CatalogEntry;
+  // Only recovered folder identities can adopt an existing source identity.
+  // A real source path must never claim an unbound folder identity by number.
+  if (manifest.identity.pluginId === 'local' || manifest.novel.isLocal || recovered === undefined) return;
+  const number = recovered;
+  const rows = db.prepare(`SELECT entry FROM chapters WHERE work_id=? AND (
+    CAST(json_extract(entry,'$.manifest.chapter.chapterNumber') AS REAL)=CAST(? AS REAL)
+    OR json_extract(entry,'$.manifest.identity.chapterPath')=?)`).all(workId(manifest.identity), number, `norea-folder:${number}`) as { entry: string }[];
+  const matches = rows.map(row => JSON.parse(row.entry) as CatalogEntry).filter(entry => {
+    const knownFolder = folderChapterNumber(entry.manifest.identity.chapterPath);
+    const knownNumber = normalizedChapterNumber(entry.manifest.chapter.chapterNumber);
+    return (knownFolder ?? knownNumber) === number && (knownFolder === undefined || knownNumber === undefined || knownFolder === knownNumber);
+  });
+  if (matches.length > 1) throw problem(409, 'Multiple chapters match the recovered folder identity');
+  return matches[0];
+}
+
 export function uploadCursor(db: DatabaseSync): { catalog: number; works: number } {
   return db.prepare('SELECT (SELECT coalesce(max(sequence),0) FROM catalog_changes) AS catalog,(SELECT coalesce(max(sequence),0) FROM work_changes) AS works').get() as { catalog: number; works: number };
 }
 
 export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false): CatalogEntry {
-  const { id, manifest } = entry;
+  let { id, manifest } = entry;
   let backup: { from: string; to: string } | undefined;
   let publishedPath: string | undefined;
   const addedFiles: string[] = [];
@@ -145,6 +181,13 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
   let committed = false;
   try {
     const result = transaction(db, () => {
+      const known = imported ? undefined : findChapterUploadIdentity(db, manifest);
+      if (known && known.id !== id) {
+        manifest = { ...manifest, identity: known.manifest.identity,
+          chapter: { ...manifest.chapter, chapterNumber: known.manifest.chapter.chapterNumber ?? folderChapterNumber(known.manifest.identity.chapterPath) } };
+        id = known.id;
+        entry = { ...entry, id, manifest, revision: digest(canonicalize(manifest)) };
+      }
       const existing = db.prepare('SELECT entry,directory,path,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; directory: string; path: string | null; deleted_at: number | null } | undefined;
       const work = workId(manifest.identity);
       const workDeletion = db.prepare('SELECT deleted,sequence FROM work_tombstones WHERE work_id=?').get(work) as { deleted: number; sequence: number } | undefined;
@@ -209,7 +252,7 @@ export function chapterRow(db: DatabaseSync, id: string) {
 
 export function deleteChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry {
   const row = chapterRow(db, id);
-  if (row.catalog.deleted) return row.catalog;
+  if (row.deleted_at !== null) return row.catalog;
   const trash = join('trash', id + '-' + randomUUID());
   const from = chapterStoragePath(dataDir, row.path ?? row.directory);
   const moved = existsSync(from);

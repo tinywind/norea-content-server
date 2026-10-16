@@ -334,9 +334,10 @@ persisting a detail row for each reused result.
 Uploaded and scanned chapters share the same directory layout and validation.
 Scans refresh changed file inventories and keep original chapter identities for
 known directories when inspected. Missing folders become unavailable in the
-index after successful enumeration. Neither missing folders nor validation
-failures create explicit deletion tombstones, so restoring valid files permits
-rediscovery. Failed directory enumeration does not remove cached availability.
+index after successful enumeration. Observed folder removals record a deletion
+cursor to reject uploads that started before the removal, while restoring valid
+files still permits rediscovery. Validation failures do not create deletion
+tombstones. Failed directory enumeration does not remove cached availability.
 
 `GET /api/v1/admin/storage` returns the fixed path and current scan settings.
 `PATCH /api/v1/admin/storage` accepts only `mode`, `intervalMinutes`, and `enabled`.
@@ -348,12 +349,25 @@ already complete returns the existing entry without storing another version.
 The app checks the server before copying or sending local files. Missing or
 wrong-sized server files can be repaired by a completed upload.
 
+An app chapter identified as `norea-folder:<number>` can recover a uniquely
+matching chapter in the same source work, retaining the server's original
+identity, ID, and directory. Complete server files remain unchanged. Ambiguous
+chapter numbers are rejected, and a real source path never adopts another
+identity solely because its chapter number matches.
+
 In Content, each chapter has **Delete** beside **Inspect**. Chapter deletion moves
 the indexed chapter directory to trash; local device copies remain intact.
-A new upload after deletion replaces it and removes the trash
-copy. Scanning alone does not restore deleted chapters. In the app, select
-chapters and choose **Delete from server**, then use **Rescan local files and
-sync** to upload replacements. Background sync respects deletion records.
+A new upload after deletion replaces it and removes the trash copy. Scanning
+alone does not restore deleted chapters. In the app, select chapters and choose
+**Delete from server**, then use **Sync now** or wait for the configured sync mode
+to upload replacements from completed local files. No local edit or explicit app
+rescan is required. Other complete server chapters remain unchanged.
+
+Deleting a chapter through the API or console publishes its deletion immediately.
+When a chapter folder is removed directly from the filesystem, the server must
+first observe that removal through Changes scanning, a periodic scan, or **Scan
+now** before the app receives the deletion event. API and console deletions do
+not need this extra scan.
 
 Work cards have **Delete** beside **Metadata**. The chapter page also has
 **Delete work** beside the work title. After confirmation, work deletion removes

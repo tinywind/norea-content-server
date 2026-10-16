@@ -132,8 +132,16 @@ test('external chapter and work removal updates the index without preventing red
     await f.run(); await fsp.rm(f.chapter, { recursive: true });
     const removed = await f.run(); assert.equal(removed.removed, 1);
     assert.equal(f.db.prepare('SELECT path FROM chapters').get()!.path, null);
-    assert.equal(f.db.prepare('SELECT count(*) AS n FROM chapter_tombstones').get()!.n, 0);
+    assert.equal(f.db.prepare('SELECT deleted_at FROM chapters').get()!.deleted_at, null);
+    const deletion = JSON.parse(f.db.prepare('SELECT entry FROM chapters').get()!.entry as string);
+    assert.equal(deletion.deleted, true);
+    assert.equal(f.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(deletion.id)!.sequence, deletion.sequence);
+    assert.equal((await f.run()).removed, 0);
+    assert.equal(f.db.prepare('SELECT max(sequence) AS sequence FROM catalog_changes').get()!.sequence, deletion.sequence);
     await f.addChapter(f.work, '1-First'); assert.equal((await f.run()).registered, 1);
+    const restored = JSON.parse(f.db.prepare('SELECT entry FROM chapters').get()!.entry as string);
+    assert.equal(restored.id, deletion.id); assert.equal(restored.deleted, false);
+    assert.equal(f.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(deletion.id)!.sequence, deletion.sequence);
     await fsp.rm(f.work, { recursive: true });
     assert.ok((await f.run()).removed > 0);
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM works').get()!.n, 0);

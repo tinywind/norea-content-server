@@ -98,9 +98,13 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
   const seen = new Set<string>();
   const remember = (path: string, key: string, item: FolderIndexItem) => options.db.prepare('INSERT INTO scan_checkpoints(path,signature,entry) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,entry=excluded.entry').run(path, key, JSON.stringify(item));
   const unavailable = (row: IndexedChapter, removed = false) => transaction(options.db, () => {
-    const result = options.db.prepare('UPDATE chapters SET path=NULL WHERE id=? AND path=directory AND deleted_at IS NULL AND entry=?').run(row.id, row.entry);
+    const pathCondition = removed ? "(path=directory OR path IS NULL) AND json_extract(entry,'$.deleted')=0" : 'path=directory';
+    const result = options.db.prepare(`UPDATE chapters SET path=NULL WHERE id=? AND ${pathCondition} AND deleted_at IS NULL AND entry=?`).run(row.id, row.entry);
     if (!result.changes) return false;
-    if (removed) recordEntry(options.db, { ...JSON.parse(row.entry) as CatalogEntry, deleted: true });
+    if (removed) {
+      const entry = recordEntry(options.db, { ...JSON.parse(row.entry) as CatalogEntry, deleted: true });
+      options.db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(row.id, entry.sequence);
+    }
     options.onWorkChange?.(); return true;
   });
   const process = async (path: string, metadata: ChapterMetadata, rejectionKey: string) => {
@@ -252,7 +256,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     };
     for (const row of chapters.values()) {
       aborted(options.signal);
-      if (row.path !== row.directory || row.deleted_at !== null || !selected(join(dataDir, row.directory)) || !await missing(join(dataDir, row.directory))) continue;
+      if (row.deleted_at !== null || JSON.parse(row.entry).deleted || (row.path !== row.directory && row.path !== null) || !selected(join(dataDir, row.directory)) || !await missing(join(dataDir, row.directory))) continue;
       if (unavailable(row, true)) await report({ path: join(dataDir, row.directory), chapterId: row.id, status: 'removed', reason: 'Chapter folder no longer exists' });
     }
     for (const row of works) {

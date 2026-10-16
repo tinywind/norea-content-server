@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { join, relative } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ZipFile } from 'yazl';
@@ -72,6 +72,130 @@ test('a complete server copy ignores later uploads and can be replaced after del
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     assert.deepEqual((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${replacement.json().revision}&path=content.html`)).rawPayload, changed['content.html']);
     assert.equal((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${first.revision}&path=content.html`)).statusCode, 404);
+  } finally { await s.close(); }
+});
+
+for (const removal of ['filesystem', 'api']) test(`a folder alias restores a ${removal}-removed chapter using its canonical identity and directory`, async () => {
+  const s = await setup();
+  try {
+    const media = { version: 1, complete: true, media: { files: [{ fileName: 'a.png', path: 'media/a.png', status: 'stored' }] } };
+    const files = { 'content.html': Buffer.from('<p>Original</p>'), 'manifest.json': Buffer.from(JSON.stringify(media)), 'media.zip': await archive({ 'a.png': Buffer.from('original image') }) };
+    const firstResponse = await upload(s, files);
+    assert.equal(firstResponse.statusCode, 200, firstResponse.body);
+    const first = firstResponse.json();
+    const stored = (s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(first.id) as { directory: string }).directory;
+    const displaced = join(s.dataDir, 'displaced-chapter');
+    if (removal === 'filesystem') {
+      await rename(join(s.dataDir, stored), displaced);
+      const scan = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, changedPaths: [relative(join(s.dataDir, 'contents'), join(s.dataDir, stored))] });
+      assert.equal(scan.removed, 1);
+      assert.deepEqual({ ...s.db.prepare('SELECT path,deleted_at FROM chapters WHERE id=?').get(first.id) }, { path: null, deleted_at: null });
+    } else {
+      const removed = await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${first.id}`, headers: s.headers });
+      assert.equal(removed.statusCode, 200, removed.body);
+    }
+    const replacementFiles = { ...files, 'content.html': Buffer.from('<p>Replacement</p>'), 'media.zip': await archive({ 'a.png': Buffer.from('replacement image') }) };
+    const replacementManifest = description(replacementFiles);
+    replacementManifest.identity.chapterPath = 'norea-folder:1';
+    replacementManifest.chapter.name = 'Client-side title';
+    const response = await upload(s, replacementFiles, replacementManifest);
+    assert.equal(response.statusCode, 200, response.body);
+    const replacement = response.json();
+    assert.equal(replacement.id, first.id);
+    assert.deepEqual(replacement.manifest.identity, first.manifest.identity);
+    assert.equal(replacement.deleted, false);
+    const row = s.db.prepare('SELECT directory,path,deleted_at FROM chapters WHERE id=?').get(first.id);
+    assert.deepEqual({ ...row }, { directory: stored, path: stored, deleted_at: null });
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    for (const [path, bytes] of Object.entries(replacementFiles)) {
+      assert.deepEqual(await readFile(join(s.dataDir, stored, path)), bytes);
+      assert.deepEqual((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${replacement.revision}&path=${path}`)).rawPayload, bytes);
+    }
+    if (removal === 'filesystem') for (const [path, bytes] of Object.entries(files)) assert.deepEqual(await readFile(join(displaced, path)), bytes);
+    else assert.deepEqual(await readdir(join(s.dataDir, 'trash')), []);
+    const latest = JSON.parse((s.db.prepare('SELECT entry FROM catalog_changes ORDER BY sequence DESC LIMIT 1').get() as { entry: string }).entry);
+    assert.equal(latest.id, first.id);
+    assert.equal(latest.deleted, false);
+  } finally { await s.close(); }
+});
+
+test('a complete canonical chapter ignores changed uploads under its folder alias', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original'), 'manifest.json': Buffer.from('{"version":1,"media":{"files":[]}}') };
+    const first = (await upload(s, files)).json();
+    const changed = { 'content.html': Buffer.from('changed') };
+    const alias = description(changed); alias.identity.chapterPath = 'norea-folder:1';
+    const ignored = await upload(s, changed, alias);
+    assert.equal(ignored.statusCode, 200, ignored.body);
+    assert.deepEqual(ignored.json(), first);
+    for (const [path, bytes] of Object.entries(files)) assert.deepEqual((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${first.revision}&path=${path}`)).rawPayload, bytes);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+  } finally { await s.close(); }
+});
+
+for (const deleted of [false, true]) test(`a stored folder identity does not merge later distinct source paths (deleted: ${deleted})`, async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original') };
+    const alias = description(files); alias.identity.chapterPath = 'norea-folder:1';
+    const firstResponse = await upload(s, files, alias);
+    assert.equal(firstResponse.statusCode, 200, firstResponse.body);
+    const first = firstResponse.json();
+    if (deleted) assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${first.id}`, headers: s.headers })).statusCode, 200);
+    const ids = new Set([first.id]);
+    for (const [path, name] of [['/chapter/1', 'Source A'], ['/other/chapter/1', 'Source B']]) {
+      const sourceFiles = { 'content.html': Buffer.from(name) };
+      const source = description(sourceFiles); source.identity.chapterPath = path; source.chapter.name = name;
+      const response = await upload(s, sourceFiles, source);
+      assert.equal(response.statusCode, 200, response.body);
+      const entry = response.json();
+      assert.ok(!ids.has(entry.id)); ids.add(entry.id);
+      assert.equal(entry.manifest.identity.chapterPath, path);
+      assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).rawPayload, sourceFiles['content.html']);
+    }
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 3);
+    const row = s.db.prepare('SELECT path,entry FROM chapters WHERE id=?').get(first.id) as { path: string; entry: string };
+    assert.equal(JSON.parse(row.entry).deleted, deleted);
+    assert.equal(JSON.parse(row.entry).manifest.identity.chapterPath, 'norea-folder:1');
+    assert.deepEqual(await readFile(join(s.dataDir, row.path, 'content.html')), files['content.html']);
+  } finally { await s.close(); }
+});
+
+for (const deleted of [false, true]) test(`folder aliases do not guess between different source chapters with the same number (deleted: ${deleted})`, async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original') };
+    const first = (await upload(s, files)).json();
+    const other = description(files); other.identity.chapterPath = '/other/chapter/1'; other.chapter.name = 'Other source chapter';
+    const secondResponse = await upload(s, files, other);
+    assert.equal(secondResponse.statusCode, 200, secondResponse.body);
+    const second = secondResponse.json();
+    assert.notEqual(second.id, first.id);
+    if (deleted) for (const entry of [first, second]) await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
+    const alias = description(files); alias.identity.chapterPath = 'norea-folder:1';
+    const rejected = await upload(s, files, alias);
+    assert.equal(rejected.statusCode, 409, rejected.body);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 2);
+    for (const entry of [first, second]) {
+      const row = s.db.prepare('SELECT path,entry FROM chapters WHERE id=?').get(entry.id) as { path: string; entry: string };
+      assert.equal(JSON.parse(row.entry).deleted, deleted);
+      assert.deepEqual(await readFile(join(s.dataDir, row.path, 'content.html')), files['content.html']);
+    }
+  } finally { await s.close(); }
+});
+
+test('a recovered folder identity cannot claim a different chapter number', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original') };
+    const first = (await upload(s, files)).json();
+    const alias = description(files); alias.identity.chapterPath = 'norea-folder:1'; alias.chapter.chapterNumber = '2';
+    const rejected = await upload(s, files, alias);
+    assert.equal(rejected.statusCode, 400, rejected.body);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+    assert.deepEqual((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${first.revision}&path=content.html`)).rawPayload, files['content.html']);
   } finally { await s.close(); }
 });
 
@@ -353,6 +477,46 @@ test('an unavailable indexed directory can be repaired by upload and removed by 
   } finally { await s.close(); }
 });
 
+test('removing an already unavailable folder emits one deletion and permits alias recovery', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('original body') };
+    const first = (await upload(s, files)).json();
+    const stored = (s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(first.id) as { directory: string }).directory;
+    const directory = join(s.dataDir, stored);
+    await writeFile(join(directory, 'content.html.part'), 'unfinished');
+    assert.equal((await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, full: true })).skipped, 1);
+    const unavailable = s.db.prepare('SELECT path,entry,deleted_at FROM chapters WHERE id=?').get(first.id) as { path: string | null; entry: string; deleted_at: number | null };
+    assert.equal(unavailable.path, null);
+    assert.equal(unavailable.deleted_at, null);
+    assert.equal(JSON.parse(unavailable.entry).deleted, false);
+    assert.equal(s.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(first.id), undefined);
+    const displaced = join(s.dataDir, 'displaced-chapter');
+    await rename(directory, displaced);
+    const options = { db: s.db, dataDir: s.dataDir, limits: defaultLimits, changedPaths: [relative(join(s.dataDir, 'contents'), directory)] };
+    assert.equal((await scanFolder(options)).removed, 1);
+    const row = s.db.prepare('SELECT path,entry,deleted_at FROM chapters WHERE id=?').get(first.id) as { path: string | null; entry: string; deleted_at: number | null };
+    const deleted = JSON.parse(row.entry);
+    assert.equal(row.path, null);
+    assert.equal(row.deleted_at, null);
+    assert.equal(deleted.deleted, true);
+    assert.ok(deleted.sequence > first.sequence);
+    assert.equal((s.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(first.id) as { sequence: number }).sequence, deleted.sequence);
+    assert.equal((await scanFolder(options)).removed, 0);
+    assert.equal((s.db.prepare('SELECT max(sequence) AS sequence FROM catalog_changes').get() as { sequence: number }).sequence, deleted.sequence);
+    assert.equal((s.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(first.id) as { sequence: number }).sequence, deleted.sequence);
+    const alias = description(files); alias.identity.chapterPath = 'norea-folder:1';
+    const replacement = await upload(s, files, alias);
+    assert.equal(replacement.statusCode, 200, replacement.body);
+    assert.equal(replacement.json().id, first.id);
+    assert.deepEqual(replacement.json().manifest.identity, first.manifest.identity);
+    assert.deepEqual(await readFile(join(directory, 'content.html')), files['content.html']);
+    assert.deepEqual(await readFile(join(displaced, 'content.html')), files['content.html']);
+    assert.equal(await readFile(join(displaced, 'content.html.part'), 'utf8'), 'unfinished');
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+  } finally { await s.close(); }
+});
+
 test('restoring deleted files validates media again', async () => {
   const s = await setup();
   try {
@@ -477,11 +641,14 @@ test('a streaming multipart body that ends inside a file returns a client error'
   } finally { await s.close(); }
 });
 
-test('deletion and restoration during a streaming upload prevent publication', { timeout: 5000 }, async () => {
+for (const alias of [false, true]) test(`deletion and restoration during a streaming upload prevent publication (folder alias: ${alias})`, { timeout: 5000 }, async () => {
   const s = await setup();
   try {
     const first = (await upload(s, { 'content.html': Buffer.from('first') })).json();
-    const body = await multipart({ 'content.html': Buffer.alloc(128 * 1024, 65) });
+    const files = { 'content.html': Buffer.alloc(128 * 1024, 65) };
+    const metadata = description(files);
+    if (alias) metadata.identity.chapterPath = 'norea-folder:1';
+    const body = await multipart(files, metadata);
     const address = await s.app.listen({ host: '127.0.0.1', port: 0 });
     let finish!: (response: { status: number; body: string }) => void;
     let fail!: (error: Error) => void;
@@ -503,6 +670,69 @@ test('deletion and restoration during a streaming upload prevent publication', {
     assert.equal(result.status, 409, result.body);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+  } finally { await s.close(); }
+});
+
+for (const alias of [false, true]) for (const removal of ['filesystem', 'api-after-scan']) test(`a ${removal} deletion rejects an in-flight repair but permits a new upload (folder alias: ${alias})`, { timeout: 5000 }, async () => {
+  const s = await setup();
+  try {
+    const first = (await upload(s, { 'content.html': Buffer.from('original body') })).json();
+    const stored = (s.db.prepare('SELECT directory FROM chapters WHERE id=?').get(first.id) as { directory: string }).directory;
+    const directory = join(s.dataDir, stored);
+    const displaced = join(s.dataDir, 'displaced-chapter');
+    const removeAndScan = async () => {
+      await rename(directory, displaced);
+      const scan = await scanFolder({ db: s.db, dataDir: s.dataDir, limits: defaultLimits, changedPaths: [relative(join(s.dataDir, 'contents'), directory)] });
+      assert.equal(scan.removed, 1);
+      const row = s.db.prepare('SELECT entry,deleted_at FROM chapters WHERE id=?').get(first.id) as { entry: string; deleted_at: number | null };
+      const deleted = JSON.parse(row.entry);
+      assert.equal(deleted.deleted, true);
+      assert.equal(row.deleted_at, null);
+      assert.equal((s.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(first.id) as { sequence: number }).sequence, deleted.sequence);
+    };
+    if (removal === 'api-after-scan') await removeAndScan();
+    else await writeFile(join(directory, 'content.html'), 'incomplete');
+    const cursor = (s.db.prepare('SELECT max(sequence) AS sequence FROM catalog_changes').get() as { sequence: number }).sequence;
+    const files = { 'content.html': Buffer.alloc(128 * 1024, 65) };
+    const metadata = description(files);
+    if (alias) metadata.identity.chapterPath = 'norea-folder:1';
+    const body = await multipart(files, metadata);
+    const address = await s.app.listen({ host: '127.0.0.1', port: 0 });
+    let finish!: (response: { status: number; body: string }) => void;
+    let fail!: (error: Error) => void;
+    const response = new Promise<{ status: number; body: string }>((resolve, reject) => { finish = resolve; fail = reject; });
+    const request = httpRequest(`${address}/api/v1/chapter-files`, { method: 'POST', headers: { ...s.headers, 'content-type': body.type } }, incoming => {
+      void (async () => {
+        const chunks: Buffer[] = []; for await (const chunk of incoming) chunks.push(chunk);
+        finish({ status: incoming.statusCode!, body: Buffer.concat(chunks).toString() });
+      })().catch(fail);
+    });
+    request.on('error', fail);
+    const split = Math.floor(body.payload.length / 2);
+    request.write(body.payload.subarray(0, split));
+    await waitFor(async () => {
+      const stages = await readdir(join(s.dataDir, 'staging'));
+      return stages.length === 1 && (await readdir(join(s.dataDir, 'staging', stages[0]))).includes('content.html');
+    });
+    if (removal === 'filesystem') await removeAndScan();
+    else {
+      const deleted = await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${first.id}`, headers: s.headers });
+      assert.equal(deleted.statusCode, 200, deleted.body);
+      assert.notEqual((s.db.prepare('SELECT deleted_at FROM chapters WHERE id=?').get(first.id) as { deleted_at: number | null }).deleted_at, null);
+    }
+    assert.ok((s.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(first.id) as { sequence: number }).sequence > cursor);
+    request.end(body.payload.subarray(split));
+    const result = await response;
+    assert.equal(result.status, 409, result.body);
+    await assert.rejects(readdir(directory), { code: 'ENOENT' });
+    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    const retry = await upload(s, files, metadata);
+    assert.equal(retry.statusCode, 200, retry.body);
+    assert.equal(retry.json().id, first.id);
+    assert.deepEqual(retry.json().manifest.identity, first.manifest.identity);
+    assert.deepEqual(await readFile(join(directory, 'content.html')), files['content.html']);
+    assert.equal(await readFile(join(displaced, 'content.html'), 'utf8'), removal === 'filesystem' ? 'incomplete' : 'original body');
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
   } finally { await s.close(); }
 });
 

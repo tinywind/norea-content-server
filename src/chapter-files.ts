@@ -9,7 +9,7 @@ import type { Multipart } from '@fastify/multipart';
 import { canonicalize } from 'json-canonicalize';
 import yauzl from 'yauzl';
 import { problem } from './db.ts';
-import { chapterRow, chapterStoragePath, completeChapter, digest, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { chapterRow, chapterStoragePath, completeChapter, digest, findChapterUploadIdentity, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 
 export function validateFiles(value: unknown, limits: Limits): asserts value is PackageManifest {
   validateManifest(value);
@@ -84,7 +84,8 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
         try { parsed = JSON.parse(part.value); } catch { throw problem(400, 'Invalid chapter metadata JSON'); }
         validateFiles(parsed, limits);
         manifest = parsed;
-        existing = completeChapter(db, dataDir, digest(JSON.stringify([parsed.identity.pluginId, parsed.identity.novelPath, parsed.identity.chapterPath])));
+        const known = findChapterUploadIdentity(db, parsed);
+        existing = known ? completeChapter(db, dataDir, known.id) : undefined;
         continue;
       }
       if (existing) { part.file.resume(); continue; }
