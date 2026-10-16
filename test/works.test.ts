@@ -51,7 +51,7 @@ test('restores minimal work files and local covers without source URLs or exact 
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
-test('admin work deletion removes the whole folder and DB rows while preserving device copies and durable tombstones', async () => {
+for (const access of ['console', 'device']) test(`${access} work deletion removes the whole folder and DB rows while preserving device copies and durable tombstones`, async () => {
   const f = await fixture();
   try {
     await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
@@ -67,7 +67,8 @@ test('admin work deletion removes the whole folder and DB rows while preserving 
     await writeFile(join(f.dataDir, directory, 'source-file.txt'), 'Part of the selected server folder');
     const sibling = join(f.dataDir, directory, '..', 'other-work'); await mkdir(sibling); await writeFile(join(sibling, 'keep.txt'), 'Other work');
     assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/works/${id}`, headers: f.headers })).statusCode, 403);
-    const response = await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/works/${id}`, headers: await consoleHeaders(f.app, f.dataDir) });
+    const response = await f.app.inject({ method: 'DELETE', url: `/api/v1/${access === 'console' ? 'admin/' : ''}works/${id}`,
+      headers: access === 'console' ? await consoleHeaders(f.app, f.dataDir) : f.headers });
     assert.equal(response.statusCode, 200, response.body);
     await assert.rejects(readdir(join(f.dataDir, directory)), /ENOENT/);
     assert.equal(await readFile(join(sibling, 'keep.txt'), 'utf8'), 'Other work');
@@ -87,7 +88,27 @@ test('admin work deletion removes the whole folder and DB rows while preserving 
   } finally { await f.close(); }
 });
 
-test('metadata upload started before work deletion cannot restore it after its body finishes', async () => {
+test('device work deletion requires a registered unblocked device and preserves files on rejected requests', async () => {
+  const f = await fixture();
+  const db = openDatabase(f.dataDir);
+  try {
+    await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() });
+    const directory = (db.prepare('SELECT directory FROM works WHERE id=?').get(id) as { directory: string }).directory;
+    const original = await readFile(join(f.dataDir, directory, 'novel.json'), 'utf8');
+    const url = `/api/v1/works/${id}`;
+    assert.equal((await f.app.inject({ method: 'DELETE', url })).statusCode, 401);
+    assert.equal((await f.app.inject({ method: 'DELETE', url, headers: { authorization: `Bearer ${'0'.repeat(64)}` } })).statusCode, 401);
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    assert.equal((await f.app.inject({ method: 'DELETE', url, headers: admin })).statusCode, 403);
+    db.prepare('UPDATE devices SET blocked=1').run();
+    assert.equal((await f.app.inject({ method: 'DELETE', url, headers: f.headers })).statusCode, 403);
+    assert.equal(await readFile(join(f.dataDir, directory, 'novel.json'), 'utf8'), original);
+    assert.equal((db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 1);
+    assert.equal((db.prepare('SELECT count(*) AS n FROM work_tombstones').get() as { n: number }).n, 0);
+  } finally { db.close(); await f.close(); }
+});
+
+for (const access of ['console', 'device']) test(`metadata upload started before ${access} work deletion cannot restore it after its body finishes`, async () => {
   const f = await fixture();
   const db = openDatabase(f.dataDir);
   try {
@@ -105,11 +126,45 @@ test('metadata upload started before work deletion cannot restore it after its b
       await delay(5);
     }
     assert.ok((db.prepare('SELECT last_seen_at AS n FROM devices').get() as { n: number }).n > 0);
-    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/works/${id}`, headers: admin })).statusCode, 200);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/${access === 'console' ? 'admin/' : ''}works/${id}`,
+      headers: access === 'console' ? admin : f.headers })).statusCode, 200);
     request.end(body.subarray(16));
     assert.equal(await finished, 410);
     assert.equal((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).statusCode, 404);
   } finally { db.close(); await f.close(); }
+});
+
+for (const access of ['console', 'device']) test(`cover upload started before ${access} work deletion cannot overwrite a restored cover`, { timeout: 5000 }, async () => {
+  const f = await fixture();
+  const db = openDatabase(f.dataDir);
+  let request: ReturnType<typeof httpRequest> | undefined;
+  try {
+    assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: metadata() })).statusCode, 200);
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    const address = await f.app.listen({ host: '127.0.0.1', port: 0 });
+    const body = Buffer.alloc(128 * 1024, 65);
+    db.prepare('UPDATE devices SET last_seen_at=0').run();
+    let finish!: (result: number | Error) => void;
+    const finished = new Promise<number | Error>(done => { finish = done; });
+    request = httpRequest(`${address}/api/v1/works/${id}/cover`, { method: 'PUT', headers: { ...f.headers, 'content-type': 'image/png', 'content-length': body.length } }, response => { response.resume(); finish(response.statusCode!); });
+    request.on('error', finish);
+    request.write(body.subarray(0, 16));
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if ((db.prepare('SELECT last_seen_at AS n FROM devices').get() as { n: number }).n > 0) break;
+      await delay(5);
+    }
+    assert.ok((db.prepare('SELECT last_seen_at AS n FROM devices').get() as { n: number }).n > 0);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/${access === 'console' ? 'admin/' : ''}works/${id}`,
+      headers: access === 'console' ? admin : f.headers })).statusCode, 200);
+    assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}?restore=true`, headers: f.headers, payload: metadata() })).statusCode, 200);
+    const restoredCover = Buffer.from('New cover uploaded after explicit restoration');
+    const restored = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}/cover`, headers: { ...f.headers, 'content-type': 'image/png' }, payload: restoredCover });
+    assert.equal(restored.statusCode, 200, restored.body);
+    request.end(body.subarray(16));
+    assert.equal(await finished, 410);
+    assert.deepEqual((await f.app.inject({ url: `/api/v1/works/${id}/cover`, headers: f.headers })).rawPayload, restoredCover);
+    assert.equal((await f.app.inject({ url: `/api/v1/works/${id}`, headers: f.headers })).json().sequence, restored.json().sequence);
+  } finally { request?.destroy(); db.close(); await f.close(); }
 });
 
 test('stores a complete work without chapter packages and transfers authenticated cover bytes', async () => {

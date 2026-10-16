@@ -133,6 +133,10 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `DELETE /api/v1/admin/works/:id` permanently removes the selected work folder,
   chapters, cover and metadata. It requires a console session. Explicit device
   rescans can republish metadata using `PUT /api/v1/works/:id?restore=true`.
+- `DELETE /api/v1/works/:id` provides the same whole-work deletion for registered,
+  unblocked devices. The app exposes it in server browsing and the selected
+  work's server data page. It preserves device copies and personal reading state;
+  deletion records block automatic reuploads until an explicit restore.
 - `GET /api/v1/changes?catalogAfter=0&workAfter=0&waitSeconds=20` returns
   `{catalogCursor,workCursor}`. Both cursors are required. It waits up to 20 seconds
   for catalog or work metadata changes. Disabling anonymous reading also
@@ -375,6 +379,8 @@ the entire server work folder, including original loose chapters, metadata and
 cover images, and removes its DB index. This action is permanent. Deletion
 records prevent automatic reuploads; an explicit app rescan can republish the
 work. Copies and reading state on devices remain intact.
+The app offers **Delete work from server** in Browse -> Content server and in
+each work's server data page, using the same whole-work deletion policy.
 Devices can be blocked or unblocked independently. Personal reading records stay
 on each app and are never synchronized to the server.
 

@@ -280,6 +280,10 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     authenticate(db, request, true);
     const entry = deleteWork(db, dataDir, request.params.id); notify(); return entry;
   });
+  app.delete<{ Params: { id: string } }>('/api/v1/works/:id', { schema: { params, security: [{ bearerAuth: [] }] } }, async request => {
+    authenticateDevice(db, request);
+    const entry = deleteWork(db, dataDir, request.params.id); notify(); return entry;
+  });
   app.put<{ Params: { id: string }; Querystring: { restore?: boolean } }>('/api/v1/works/:id', { bodyLimit: metadataByteLimit, onRequest: async request => {
     authenticateDevice(db, request);
     uploadCursors.set(request, (db.prepare('SELECT coalesce(max(sequence),0) AS n FROM work_changes').get() as { n: number }).n);
@@ -299,8 +303,13 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     return { items, cursor: items.at(-1)?.sequence ?? after, hasMore: rows.length > limit };
   });
   app.get<{ Params: { id: string } }>('/api/v1/works/:id', { schema: { params } }, async request => { requireRead(request); return getWork(db, dataDir, request.params.id); });
-  app.put<{ Params: { id: string }; Body: Buffer }>('/api/v1/works/:id/cover', { bodyLimit: coverByteLimit, onRequest: async request => { authenticateDevice(db, request); }, schema: { params, security: [{ bearerAuth: [] }] } }, async request => {
+  app.put<{ Params: { id: string }; Body: Buffer }>('/api/v1/works/:id/cover', { bodyLimit: coverByteLimit, onRequest: async request => {
+    authenticateDevice(db, request);
+    uploadCursors.set(request, (db.prepare('SELECT coalesce(max(sequence),0) AS n FROM work_changes').get() as { n: number }).n);
+  }, schema: { params, security: [{ bearerAuth: [] }] } }, async request => {
     if (!Buffer.isBuffer(request.body)) throw problem(415, 'Raw image bytes are required');
+    const deletion = db.prepare('SELECT sequence FROM work_tombstones WHERE work_id=?').get(request.params.id) as { sequence: number } | undefined;
+    if ((deletion?.sequence ?? 0) > uploadCursors.get(request)!) throw problem(410, 'Work was deleted during upload');
     const entry = saveWorkCover(db, dataDir, request.params.id, request.body); notify(); return entry;
   });
   for (const prefix of ['/api/v1/works', '/api/v1/admin/works']) {
