@@ -56,8 +56,9 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   `{blocked:true}` or `{blocked:false}` with `PATCH /api/v1/admin/devices/:id`.
 - `GET /api/v1/catalog/changes?after=0&limit=100` returns lightweight availability
   changes as `{items,cursor,hasMore}`. Each item contains only
-  `{identity:{pluginId,novelId,novelPath,chapterPath},deleted,sequence}`. Apply repeated
-  identities in sequence order, including deletions and restorations. The cursor
+  `{identity:{pluginId,novelId,novelPath,chapterPath},complete,deleted,sequence}`. Apply repeated
+  identities in sequence order, including deletions and restorations. Only entries
+  with `complete: true` and `deleted: false` are downloadable. The cursor
   is the last returned sequence, or `after` when the page is empty. Limits range
   from 1 to 100. Package file inventories are excluded; use the exact chapter
   lookup when a download needs the full manifest.
@@ -77,8 +78,10 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   an empty page. Both paginated endpoints accept limits from 1 to 100. Concurrent
   writes can shift offset pages; these pages are for browsing, not change tracking.
 - `GET /api/v1/catalog/chapter?pluginId=...&novelPath=...&chapterPath=...` resolves
-  one available chapter by its exact, URL-encoded identity. Missing or deleted
-  entries return 404. Use its ID and revision with the chapter-file download route
+  one complete chapter by its exact, URL-encoded identity. Missing, incomplete,
+  or deleted entries return 404. `includeUnavailable=true` exposes the saved
+  record and its `complete` flag for nondeleted unavailable copies. Use its ID
+  and revision with the chapter-file download route
   with `manifest.layout` set to `chapter-files`.
   Optional numeric `chapterNumber` matches a unique chapter within the exact
   same plugin ID and novel path. Exact identities take priority;
@@ -90,7 +93,7 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   `GET /api/v1/works/:id` for full work metadata and
   `GET /api/v1/works/:id/cover` for the selected cover.
 - `POST /api/v1/chapter-files` accepts an authenticated `multipart/form-data`
-  upload of the original files in a completed app chapter directory. Register the
+  upload of the original files in an app chapter directory. Register the
   exact work with `PUT /api/v1/works/:id` first; missing work metadata returns 409.
   The first part is a plain text field named `metadata`, containing the version-1
   package manifest with `layout: "chapter-files"`. Its sorted `files` list declares
@@ -100,23 +103,31 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   Upload exactly one `content.html` or `content.pdf`, plus `manifest.json` and
   `media.zip` when present. `bodyPath` names that body file. PDF chapters use
   `content.pdf`; HTML, text, and Markdown chapters use `content.html`.
-  Every media entry must be stored and match the archive's filenames. Byte limits
-  use the archive's uncompressed sizes. The download checkpoint's `complete`
-  property and cached per-image byte counts are not used for validation.
-  `media.zip` requires `manifest.json`; a nonempty media inventory requires
-  `media.zip`. Loose `media/` files are unsupported.
+  The server sets `complete` by checking that every asset declared in
+  `manifest.json` exists as a regular file in `media.zip`. It ignores the
+  manifest's `complete`, per-asset `status`, and cached byte counts. Missing
+  archives or assets are accepted with `complete: false`; body-only chapters
+  are complete. Byte limits use the archive's uncompressed sizes.
+  `media.zip` requires `manifest.json`. Loose `media/` files are unsupported.
   Body bytes, media URLs, media-manifest formatting and timestamps, and media ZIP
   bytes are preserved. The server creates no outer ZIP and does not extract or
-  recompress the media archive. Its central directory must match the media
-  manifest's names and sizes, without extra, duplicate, symbolic, or encrypted
-  entries. This inventory check does not decode assets or verify their ZIP CRCs.
+  recompress the media archive. Safe extra ZIP entries are allowed; malformed
+  archives, unsafe paths, duplicate names, symbolic entries, and encrypted entries
+  are rejected. This inventory check does not decode assets or verify ZIP CRCs.
   Every file must match its declared size before the revision becomes visible.
-  Missing, duplicate, wrong-sized, oversized, and interrupted uploads are rejected
-  and their staged files are removed. File payloads are not hashed. Revision
-  identity is SHA-256 of the canonical metadata manifest, including each file's
-  modification time. A retry returns the same immutable record. Payload changes
-  that preserve sizes and modification times cannot be distinguished.
-  Every catalog record includes `fileBytes`, the sum of original file sizes.
+  Missing declared parts, duplicates, wrong sizes, oversized files, and interrupted uploads are rejected
+  and their staged files are removed. File payloads are not hashed. The initial
+  revision hashes canonical metadata; replacements receive a fresh transfer token
+  even when file sizes and modification times match.
+  The optional query parameter `conflictPolicy` accepts `prefer-complete`
+  (default), `keep-server`, or `replace-server`. `prefer-complete` replaces an
+  incomplete copy only with a complete upload; ties retain the server copy.
+  `keep-server` retains any available server copy. `replace-server` publishes the
+  uploaded copy even when incomplete. All uploads are validated before this
+  decision. A deletion during upload or a newer copy that would be overwritten
+  returns 409; retry with a new request. Missing or wrong-sized server files can
+  be repaired under any policy. Every catalog record includes the inspected
+  `complete` flag and `fileBytes`, the sum of original file sizes.
 - `GET /api/v1/chapters/:id/files?revision=<revision>&path=<original-path>` streams
   one original file from the current copy. A stale revision returns 404.
   Its ETag is the quoted revision,
@@ -126,8 +137,8 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   Check each file's size and receive the complete chapter before installing it.
 - Registered devices and console administrators use `DELETE /api/v1/chapters/:id`
   and `POST /api/v1/chapters/:id/restore` to manage shared availability.
-  There is no revision selection endpoint. A complete copy is retained until
-  deleted; a new upload after deletion replaces it.
+  There is no revision selection endpoint. Upload conflict policy controls
+  replacement; a new upload after deletion can also replace the copy.
 - `POST /api/v1/chapters/:id/purge` permanently removes a deleted chapter's copy.
   Tombstones survive purge and restart. A new upload can republish the chapter.
 - `DELETE /api/v1/admin/works/:id` permanently removes the selected work folder,
@@ -304,13 +315,15 @@ The scanner discovers actual `content.html` or `content.pdf` files and restores
 titles from the `novel.json` chapter map, falling back to the number.
 Already indexed directories retain their exact chapter identity. New folders use
 `norea-folder:<number>` as a chapter identity within that exact work.
-Noncanonical numbers, conflicting body formats, unfinished files, and incomplete
-media are skipped with reasons in Jobs.
+Noncanonical numbers, conflicting body formats, unfinished files, and malformed
+media are skipped with reasons in Jobs. Valid incomplete chapters stay indexed
+with `complete: false`.
 
 Text-only chapters need no media manifest or archive. A chapter's `manifest.json`
-describes media assets and contains no source identities. Remote assets remain
-incomplete even when the manifest says `complete`; all referenced media must be
-stored locally. Work covers and `.nomedia` markers are not chapter candidates.
+describes media assets and contains no source identities. Every declared asset
+must exist as a regular ZIP entry for the chapter to be complete, regardless of
+its stored or remote status. Work covers and `.nomedia` markers are not chapter
+candidates.
 
 The scanner reads existing work metadata, covers, and chapter files in place.
 It validates new or changed chapters and registers their existing directories.
@@ -336,6 +349,7 @@ index without opening or statting their contents, including chapters uploaded by
 the app. Work metadata and covers are checked separately on every scan.
 SQLite also remembers unsupported chapter layouts, so they are not inspected
 again on every pass. Incomplete copies and transient failures are retried.
+Full inspection checks media inventories even when file signatures match.
 The first pass still inspects every previously unclassified chapter folder.
 
 Changes mode retains the affected paths and inspects those chapters or works.
@@ -362,14 +376,15 @@ tombstones. Failed directory enumeration does not remove cached availability.
 `POST /api/v1/admin/storage/scan` starts incremental discovery. Send
 `{"full":true}` for a full inspection. Folder-root CRUD routes have been removed.
 
-The server keeps one complete copy per chapter. An upload for a chapter that is
-already complete returns the existing entry without storing another version.
-The app checks the server before copying or sending local files. Missing or
-wrong-sized server files can be repaired by a completed upload.
+The server keeps one current copy per chapter and records its completeness.
+The upload conflict policy determines whether an available copy is retained or
+replaced. The default policy prefers complete content and keeps the server copy
+when both copies have the same completeness. Missing or wrong-sized server files
+can be repaired by a new upload.
 
 An app chapter identified as `norea-folder:<number>` can recover a uniquely
 matching chapter in the same source work, retaining the server's original
-identity, ID, and directory. Complete server files remain unchanged. Ambiguous
+identity, ID, and directory. The selected conflict policy still applies. Ambiguous
 chapter numbers are rejected, and a real source path never adopts another
 identity solely because its chapter number matches.
 

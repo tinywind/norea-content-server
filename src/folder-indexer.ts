@@ -61,7 +61,7 @@ async function inventorySignature(directory: string, signal?: AbortSignal): Prom
   for (const entry of entries) { aborted(signal); parts.push(entry.name, await signature(join(directory, entry.name))); }
   return JSON.stringify(parts);
 }
-async function chapterManifest(directory: string, metadata: ChapterMetadata, options: FolderIndexOptions): Promise<PackageManifest> {
+async function chapterManifest(directory: string, metadata: ChapterMetadata, options: FolderIndexOptions): Promise<{ manifest: PackageManifest; complete: boolean }> {
   const files: PackageManifest['files'] = [];
   for (const name of (await readdir(directory)).filter(name => chapterFileNames.includes(name)).sort()) {
     aborted(options.signal);
@@ -70,8 +70,8 @@ async function chapterManifest(directory: string, metadata: ChapterMetadata, opt
   }
   const manifest: PackageManifest = { packageVersion: 1, layout: 'chapter-files', ...metadata, bodyPath: metadata.chapter.contentType === 'pdf' ? 'content.pdf' : 'content.html', files };
   validateFiles(manifest, options.limits);
-  await validateMedia(directory, manifest, options.limits, options.signal);
-  return manifest;
+  const complete = await validateMedia(directory, manifest, options.limits, options.signal);
+  return { manifest, complete };
 }
 
 export async function scanFolder(options: FolderIndexOptions): Promise<FolderIndexSummary> {
@@ -114,7 +114,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       const chapterMetadata = [metadata.identity, metadata.chapter];
       let before = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
       const saved = checkpoint(path);
-      if (saved?.signature === before) {
+      if (!options.full && saved?.signature === before) {
         const item = JSON.parse(saved.entry) as FolderIndexItem;
         const current = chapters.get(relative(dataDir, path));
         if (current?.path === current?.directory && current?.deleted_at === null && JSON.parse(current.entry).revision === item.revision) {
@@ -122,9 +122,10 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         }
       }
       let manifest: PackageManifest;
+      let complete: boolean;
       for (let attempt = 0; ; attempt++) {
         aborted(options.signal);
-        manifest = await chapterManifest(path, metadata, options);
+        ({ manifest, complete } = await chapterManifest(path, metadata, options));
         const after = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
         if (before === after) break;
         if (attempt === 1) fail('Source changed during indexing; retry after download completes');
@@ -133,7 +134,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       aborted(options.signal);
       const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
       const previous = options.db.prepare("SELECT path,json_extract(entry,'$.revision') AS revision FROM chapters WHERE id=?").get(id) as { path: string | null; revision: string } | undefined;
-      const entry: CatalogEntry = { id, revision: digest(canonicalize([manifest, before])), manifest, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
+      const entry: CatalogEntry = { id, revision: digest(canonicalize([manifest, before])), manifest, complete, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
       const current = publishChapter(options.db, dataDir, path, entry, startedAt, true);
       const item: FolderIndexItem = { path, sourceId, status: previous?.path && previous.revision === current.revision ? 'unchanged' : 'registered', chapterId: current.id, revision: current.revision };
       if (before === canonicalize([chapterMetadata, await inventorySignature(path, options.signal)])) remember(path, before, item);
@@ -216,7 +217,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must be a canonical nonnegative number' }); continue;
       }
       const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
-      if (entry && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
+      if (entry?.complete && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
         await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); continue;
       }
       if (exactIdentity) { await process(path, entry!.manifest, key); continue; }

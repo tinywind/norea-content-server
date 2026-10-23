@@ -21,9 +21,9 @@ const count = { type: 'integer', minimum: 0 };
 const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name', 'chapterNumber', 'page', 'contentType'], properties: {
   id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf'] },
 } };
-const chapterChangeSchema = { type: 'object', required: ['identity', 'deleted', 'sequence'], properties: {
+const chapterChangeSchema = { type: 'object', required: ['identity', 'complete', 'deleted', 'sequence'], properties: {
   identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelId: text, novelPath: text, chapterPath: text } },
-  deleted: { type: 'boolean' }, sequence: count,
+  complete: { type: 'boolean' }, deleted: { type: 'boolean' }, sequence: count,
 } };
 const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identity', 'novel', 'hasCover', 'chapterCount'], properties: {
   id: text, sequence: count,
@@ -47,11 +47,11 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const row = db.prepare('SELECT entry FROM works WHERE id=?').get(request.params.id) as { entry: string } | undefined;
     if (!row) throw problem(404, 'Work not found');
     const work = JSON.parse(row.entry) as WorkEntry;
-    const entries = db.prepare(`SELECT id,json_extract(entry,'$.fileBytes') AS fileBytes,
+    const entries = db.prepare(`SELECT id,json_extract(entry,'$.fileBytes') AS fileBytes,json_extract(entry,'$.complete') AS complete,
       json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.name') AS name,
       json_extract(entry,'$.manifest.chapter.position') AS position
       FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL`).all(request.params.id) as {
-        id: string; fileBytes: number; chapterNumber: string | null; name: string; position: number;
+        id: string; fileBytes: number; complete: number; chapterNumber: string | null; name: string; position: number;
       }[];
     const byNumber = new Map<string, typeof entries>();
     for (const entry of entries) {
@@ -61,15 +61,15 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
       byNumber.set(key, [...(byNumber.get(key) ?? []), entry]);
     }
     const used = new Set<string>();
-    const items: { chapterNumber: string | null; name: string; position: number; entry: { id: string; fileBytes: number } | null }[] = [];
+    const items: { chapterNumber: string | null; name: string; position: number; entry: { id: string; fileBytes: number; complete: boolean } | null }[] = [];
     for (const [number, name] of Object.entries(work.metadata.chapters)) {
       const matches = byNumber.get(number) ?? [];
       for (const entry of matches) used.add(entry.id);
-      for (const entry of matches.length ? matches : [null]) items.push({ chapterNumber: number, name, position: Number(number), entry: entry ? { id: entry.id, fileBytes: entry.fileBytes } : null });
+      for (const entry of matches.length ? matches : [null]) items.push({ chapterNumber: number, name, position: Number(number), entry: entry ? { id: entry.id, fileBytes: entry.fileBytes, complete: Boolean(entry.complete) } : null });
     }
     for (const entry of entries) {
       if (used.has(entry.id)) continue;
-      items.push({ chapterNumber: entry.chapterNumber, name: entry.name, position: Number(entry.chapterNumber ?? entry.position), entry: { id: entry.id, fileBytes: entry.fileBytes } });
+      items.push({ chapterNumber: entry.chapterNumber, name: entry.name, position: Number(entry.chapterNumber ?? entry.position), entry: { id: entry.id, fileBytes: entry.fileBytes, complete: Boolean(entry.complete) } });
     }
     items.sort((a, b) => a.position - b.position || (a.entry?.id ?? '').localeCompare(b.entry?.id ?? ''));
     const { search, offset, limit } = request.query;
@@ -85,8 +85,8 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     requireRead(request);
     const { after, limit } = request.query;
     const rows = db.prepare(`SELECT sequence,json_extract(entry,'$.manifest.identity') AS identity,
-      json_extract(entry,'$.deleted') AS deleted FROM catalog_changes WHERE sequence>? ORDER BY sequence LIMIT ?`).all(after, limit + 1) as { sequence: number; identity: string; deleted: number }[];
-    const items = rows.slice(0, limit).map(row => ({ identity: JSON.parse(row.identity), deleted: Boolean(row.deleted), sequence: row.sequence }));
+      json_extract(entry,'$.complete') AS complete,json_extract(entry,'$.deleted') AS deleted FROM catalog_changes WHERE sequence>? ORDER BY sequence LIMIT ?`).all(after, limit + 1) as { sequence: number; identity: string; complete: number; deleted: number }[];
+    const items = rows.slice(0, limit).map(row => ({ identity: JSON.parse(row.identity), complete: Boolean(row.complete), deleted: Boolean(row.deleted), sequence: row.sequence }));
     return { items, cursor: items.at(-1)?.sequence ?? after, hasMore: rows.length > limit };
   });
   app.get<{ Querystring: { q?: string; source?: string; offset: number; limit: number } }>('/api/v1/catalog/works', { schema: {
@@ -105,7 +105,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const rows = db.prepare(`SELECT w.id,json_extract(w.entry,'$.sequence') AS sequence,
       json_extract(w.entry,'$.metadata.identity') AS identity,json_extract(w.entry,'$.metadata.novel') AS novel,
       json_extract(w.entry,'$.hasCover') AS hasCover,
-      (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS chapterCount
+      (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL AND json_extract(c.entry,'$.complete')=1) AS chapterCount
       FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, limit, offset) as { id: string; sequence: number; identity: string; novel: string; hasCover: number; chapterCount: number }[];
     const items: WorkSummary[] = rows.map(row => ({ ...row, identity: JSON.parse(row.identity), novel: JSON.parse(row.novel), hasCover: Boolean(row.hasCover) }));
     return { items, total, hasMore: offset + items.length < total };
@@ -130,11 +130,11 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const work = db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;
     if (!work && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
     const titles = work ? (JSON.parse(work.entry) as WorkEntry).metadata.chapters : {};
-    const total = (db.prepare('SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL').get(id) as { n: number }).n;
+    const total = (db.prepare("SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL AND json_extract(entry,'$.complete')=1").get(id) as { n: number }).n;
     const items = db.prepare(`SELECT id,json_extract(entry,'$.manifest.identity.chapterPath') AS chapterPath,
       json_extract(entry,'$.manifest.chapter.position') AS position,json_extract(entry,'$.manifest.chapter.name') AS name,
       json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType
-      FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
+      FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL AND json_extract(entry,'$.complete')=1 ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
     return { items: items.map(item => ({ ...item, name: titles[String(Number(item.chapterNumber))] ?? item.name })), total, hasMore: offset + items.length < total };
   });
   app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string; includeUnavailable?: boolean } }>('/api/v1/catalog/chapter', { schema: {
@@ -156,7 +156,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     }
     if (!chapterNumber || pluginId === 'local') throw problem(404, 'Chapter not found');
     const work = digest(JSON.stringify([pluginId, novelPath]));
-    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR path IS NOT NULL)").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
+    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR (path IS NOT NULL AND json_extract(entry,'$.complete')=1))").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
     if (!matches.length) throw problem(404, 'Chapter not found');
     if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
     if (request.query.includeUnavailable) return JSON.parse(matches[0].entry) as CatalogEntry;

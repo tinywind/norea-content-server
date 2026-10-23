@@ -55,7 +55,7 @@ test('backs up the complete chapter catalog and shows missing server files witho
     const page = await list('?limit=2');
     assert.equal(page.total, 3); assert.equal(page.hasMore, true);
     assert.deepEqual(page.items.map((item: { name: string; entry: unknown }) => [item.name, item.entry !== null]), [['Opening: exact title?', true], ['Missing body', false]]);
-    assert.deepEqual(Object.keys(page.items[0].entry).sort(), ['fileBytes', 'id']);
+    assert.deepEqual(Object.keys(page.items[0].entry).sort(), ['complete', 'fileBytes', 'id']);
     assert.equal((await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters`)).json().items[0].name, work.chapters['1']);
     assert.equal((await list('?search=Missing')).total, 1);
     assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${uploaded.id}`, headers: f.headers })).statusCode, 200);
@@ -228,7 +228,7 @@ test('incremental availability pages preserve ordered deletions and restores wit
     assert.equal(deletion.statusCode, 200, deletion.body);
     const restore = await f.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/restore`, headers: f.headers });
     assert.equal(restore.statusCode, 200, restore.body);
-    const summarize = (entry: typeof first) => ({ identity: entry.manifest.identity, deleted: entry.deleted, sequence: entry.sequence });
+    const summarize = (entry: typeof first) => ({ identity: entry.manifest.identity, complete: entry.complete, deleted: entry.deleted, sequence: entry.sequence });
     const page = await f.app.inject('/api/v1/catalog/changes?limit=2');
     assert.equal(page.statusCode, 200, page.body);
     assert.deepEqual(page.json(), { items: [summarize(first), summarize(second)], cursor: second.sequence, hasMore: true });

@@ -98,10 +98,49 @@ test('indexes original chapter files in place without rewriting, copying or arch
   } finally { await f.close(); }
 });
 
-test('rejects extra media entries and retries a repaired archive without a success checkpoint', async () => {
+test('full folder scans reassess completeness even when the saved inventory signature matches', async () => {
   const f = await fixture();
   try {
-    for (const bytes of [await zip({ 'a.png': 'image', 'unexpected.png': 'extra' }), Buffer.from('incomplete zip')]) {
+    await f.run();
+    const first = stored(f);
+    f.db.prepare('UPDATE chapters SET entry=? WHERE id=?').run(JSON.stringify({ ...first, complete: false }), first.id);
+    await f.run();
+    assert.equal(stored(f).complete, true);
+    assert.ok(stored(f).sequence > first.sequence);
+    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+  } finally { await f.close(); }
+});
+
+test('folder rescans persist completeness transitions and retain incomplete files', async () => {
+  const f = await fixture();
+  try {
+    await f.run();
+    const first = stored(f);
+    assert.equal(first.complete, true);
+    await writeFile(join(f.directory, 'media.zip'), await zip({ 'other.png': 'image' }));
+    assert.equal((await f.run()).registered, 1);
+    const incomplete = stored(f);
+    assert.equal(incomplete.id, first.id);
+    assert.equal(incomplete.complete, false);
+    assert.equal(completeChapter(f.db, f.dataDir, first.id), undefined);
+    assert.equal((f.db.prepare('SELECT path FROM chapters WHERE id=?').get(first.id) as { path: string }).path, relative(f.dataDir, f.directory));
+    assert.equal((await f.run()).unchanged, 2);
+    assert.equal(stored(f).sequence, incomplete.sequence);
+    await rm(join(f.directory, 'media.zip'));
+    assert.equal((await f.run()).registered, 1);
+    assert.equal(stored(f).complete, false);
+    await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: false, media: { files: [{ fileName: 'a.png', path: '', status: 'remote' }] } }));
+    await writeFile(join(f.directory, 'media.zip'), await zip({ 'a.png': 'image', 'extra.png': 'extra' }));
+    assert.equal((await f.run({ full: false })).registered, 1);
+    assert.equal(stored(f).complete, true);
+    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+  } finally { await f.close(); }
+});
+
+test('rejects malformed media archives and retries repair without a success checkpoint', async () => {
+  const f = await fixture();
+  try {
+    for (const bytes of [Buffer.from('incomplete zip')]) {
       await writeFile(join(f.directory, 'media.zip'), bytes);
       assert.equal((await f.run()).skipped, 1);
       assert.equal(f.db.prepare('SELECT 1 FROM scan_checkpoints WHERE path=?').get(f.directory), undefined);
@@ -335,11 +374,11 @@ test('recovers distinct local chapter sequences without rewriting their files', 
   } finally { await f.close(); }
 });
 
-test('remote media and ambiguous body formats are skipped without losing work metadata', async () => {
+test('malformed media and ambiguous body formats are skipped without losing work metadata', async () => {
   const f = await fixture();
   try {
     await writeFile(join(f.directory, 'manifest.json'), JSON.stringify({ version: 1, complete: true, media: { files: [{ status: 'remote' }] } }));
-    assert.equal((await f.run()).skipped, 1); assert.match(f.items.at(-1)!.reason!, /not downloaded/);
+    assert.equal((await f.run()).skipped, 1); assert.match(f.items.at(-1)!.reason!, /Invalid media manifest/);
     await writeFile(join(f.directory, 'content.pdf'), '%PDF-1.4');
     assert.equal((await f.run()).skipped, 1); assert.match(f.items.at(-1)!.reason!, /exactly one/);
     assert.equal((f.db.prepare('SELECT count(*) AS n FROM works').get() as { n: number }).n, 1);
@@ -414,7 +453,7 @@ test('incremental scans discover new entries and refresh only the changed curren
     await writeFile(join(newWork, 'novel.json'), JSON.stringify({ ...workMetadata(), identity: { pluginId: 'example', novelId: 'Another', novelPath: '/another' } }));
     const originalOpen = yauzl.open;
     const archives = t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => originalOpen(...args));
-    const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.unchanged, 2); assert.equal(archives.mock.callCount(), 0);
+    const result = await f.run({ full: false }); assert.equal(result.registered, 2); assert.equal(result.unchanged, 2); assert.equal(archives.mock.callCount(), 0);
     await writeFile(join(f.directory, 'content.html'), '<p>Changed body</p>');
     const changed = await f.run(); assert.equal(changed.registered, 1); assert.equal(changed.unchanged, 3); assert.equal(archives.mock.callCount(), 1);
     const current = JSON.parse((f.db.prepare('SELECT entry FROM chapters WHERE id=?').get(first.id) as { entry: string }).entry) as CatalogEntry;
@@ -431,7 +470,7 @@ test('work metadata and cover changes leave unchanged chapter payloads unopened'
     await f.run(); const metadata = workMetadata(); metadata.novel.name = 'Updated title';
     await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(metadata)); await writeFile(join(f.directory, '..', 'cover.png'), 'updated cover');
     const archives = t.mock.method(yauzl, 'open', () => { throw new Error('Unchanged archive must not be opened'); });
-    const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.unchanged, 1); assert.equal(archives.mock.callCount(), 0);
+    const result = await f.run({ full: false }); assert.equal(result.registered, 1); assert.equal(result.unchanged, 1); assert.equal(archives.mock.callCount(), 0);
     const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', metadata.identity.novelPath])));
     assert.equal(work.metadata.novel.name, 'Updated title'); assert.equal(work.hasCover, true);
   } finally { await f.close(); }

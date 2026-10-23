@@ -39,8 +39,8 @@ content that no participating device has acquired and uploaded.
 - Separate catalog synchronization from downloading every content file. A device
   can discover server content without storing all of it locally.
 - Distinguish local removal from server deletion.
-- Wait for the complete body and required assets before producing and uploading
-  a ZIP package. Do not synchronize an acquisition that is still incomplete.
+- Inspect media completeness from declared assets and regular ZIP entries.
+  Retain valid incomplete copies in the catalog without advertising them for download.
 - Use cross-device content identities instead of local database row IDs.
 - Share the app's plugin ID, source novel ID, and chapter number directories.
   Accept the existing plugin ID collision limitation across distribution sources.
@@ -51,7 +51,7 @@ can disable anonymous reading to require authentication.
 
 ## Boundaries
 
-The server owns the shared catalog, completed content packages, registered
+The server owns the shared catalog, chapter files and their completeness, registered
 devices, and catalog changes. Implement it in TypeScript with Fastify,
 SQLite for metadata, and a filesystem package store. The initial deployment is a
 single server instance distributed as a Linux Docker image with a persistent data
@@ -77,7 +77,7 @@ synchronization can propagate unwanted changes and the server can lose data.
 | Operation | Permission |
 | --- | --- |
 | Browse the catalog and download content | Anonymous by default; device or console credential when anonymous reading is disabled |
-| Upload complete content | Registered, unblocked device |
+| Upload chapter files | Registered, unblocked device |
 | Soft-delete or restore shared content | Registered device or console session |
 | Purge chapters, delete whole work folders, or manage the server | Console session |
 | Read or change personal reading state | Local app only |
@@ -108,7 +108,7 @@ part of the current schema.
 
 | Data | Scope | Behavior |
 | --- | --- | --- |
-| Works, chapters, source identity, complete packages | Shared server catalog | Reused across devices |
+| Works, chapters, source identity, chapter files and completeness | Shared server catalog | Reused across devices |
 | Library membership, reading position, read status, bookmarks | Device | Never synchronized to this server |
 | Downloaded files, local paths, storage usage, download selection | Device | Independently managed |
 | Device keys, pending transfers, local database IDs | Device | Excluded from shared packages and portable credential backups |
@@ -149,23 +149,24 @@ file where available, then preserve it. Independent imports with different file
 bytes remain distinct. Automatic recognition of a revised local book is outside
 the first version.
 
-Keep one complete copy per logical chapter. An upload for an already complete
-chapter returns the current entry and does not store another copy. The app checks
-availability before creating a transfer snapshot. Missing or wrong-sized files
-allow a completed upload to repair the stored copy. To replace complete content,
-delete the server copy and start a new upload. Device copies remain unchanged.
+Keep one current copy per logical chapter. Uploads accept `conflictPolicy` values
+`prefer-complete`, `keep-server`, and `replace-server`. The default prefers complete
+copies and retains the server copy on ties. Keeping the server accepts any
+available copy; replacement accepts the incoming copy regardless of completeness.
+Missing or wrong-sized files allow a new upload to repair the stored copy.
+Apply this decision atomically after validating the incoming files, and reject
+a replacement if a deletion or newer publication occurred during the upload.
 The revision field is a transfer/cache token, not a selectable version history.
 The database stores one path per chapter. There is no historical-copy table or
 upgrade path for previous storage formats.
 
-A canonical metadata manifest identifies a revision. Original-file manifests list
+A canonical metadata manifest identifies the initial revision. Original-file manifests list
 each file's relative path, byte size, and source modification time as a nonnegative
 safe integer Unix timestamp in milliseconds. Use RFC 8785 JSON canonicalization
 and SHA-256 for this small manifest; do not hash original file payloads. Exclude
-uploader identity and transfer timestamps. A same-size edit with a changed source
-modification time changes the transfer token after deletion and republication.
-Payload changes that preserve both size and modification time cannot be
-distinguished by upload metadata. Scanning also records file identity and change
+uploader identity and transfer timestamps. An actual replacement includes a
+fresh publication identifier in the token so same-size edits with unchanged
+modification times cannot reuse a stale download token. Scanning also records file identity and change
 time to detect external edits without reading file payloads.
 
 ## Complete chapter transfers
@@ -179,11 +180,13 @@ New uploads send a `multipart/form-data` body with a versioned metadata manifest
 first, followed by the original `content.html` or `content.pdf`, optional media
 `manifest.json`, and optional `media.zip`. The metadata uses `layout: "chapter-files"`
 and preserves work and chapter identities. Preserve all file bytes and local media
-references without building an outer ZIP. Every media entry must be stored, and
-the media ZIP's central directory must match their names. Byte limits use the
-archive's uncompressed sizes. The download checkpoint's `complete` property and
-cached per-image byte counts are not used for validation. This inventory check
-does not extract assets or verify ZIP CRCs. Store work covers separately at work
+references without building an outer ZIP. Record `complete: true` only when every
+declared asset exists as a regular entry in the media ZIP. Missing archives or
+entries are valid incomplete copies; a body without a manifest is complete.
+Ignore manifest completion flags, asset statuses, and cached byte counts. Safe
+extra entries are allowed, but unsafe or malformed archives are rejected.
+Byte limits use the archive's uncompressed sizes. This inventory check does not
+extract assets or verify ZIP CRCs. Store work covers separately at work
 scope and cache them locally when needed.
 
 Only this original-file format is supported. No outer ZIP encoder, decoder,
@@ -197,13 +200,13 @@ partial chapter.
 
 Publication follows this sequence:
 
-1. Finish local acquisition, including all required assets.
+1. Select the local chapter files to transfer.
 2. Capture an immutable snapshot and its file sizes and modification times.
 3. Enqueue a durable upload operation for the original files.
 4. Upload to a server staging area that is absent from the public catalog.
 5. Validate identity, package version, declared files, sizes, and media inventory.
-6. Publish the completed revision and its catalog change atomically from readers'
-   perspective.
+6. Apply the conflict policy and publish the copy with its inspected completeness
+   and catalog change atomically from readers' perspective.
 
 Readers must never discover a package that has only partially uploaded. A repeated
 upload of the same revision must be safe and must not create duplicate chapters.
@@ -325,8 +328,10 @@ and SQLite. Do not introduce GraphQL, Java, or Spring Boot. File uploads and
 downloads use ordinary streaming HTTP endpoints.
 
 Content synchronization consumes an append-only catalog change log. Reconnecting
-devices resume from a durable cursor. Complete immutable package publication is
-idempotent. Account and personal-state endpoints are removed.
+devices resume from a durable cursor. Each chapter change includes its inspected
+`complete` flag; download availability requires `complete: true` and
+`deleted: false`. The default conflict policy retains already complete copies.
+Account and personal-state endpoints are removed.
 
 Connected clients can wait up to 20 seconds for catalog cursor changes. A hint
 contains only the catalog cursor and triggers ordinary paged feed
@@ -436,8 +441,9 @@ must remain usable when upgrading from the account-based prototype.
 12. An interrupted download resumes only against the same ZIP. An interrupted
     upload restarts safely. Package limits reject excess data without publishing
     incomplete content.
-13. Duplicate or changed uploads preserve a complete server chapter. Deleting
-    and uploading a replacement leaves one stored copy and preserves device files.
+13. The default upload policy preserves a complete server chapter. Explicit
+    replacement leaves one current copy, records its completeness, and preserves
+    device files.
 14. Server deletion enters the 30-day trash period. Permanent file removal retains
     deletion records, and explicit device or administrator restoration permits republication.
 15. First connection registers a device without username/password. Restarting
@@ -524,17 +530,18 @@ or enabled status. The scan never queries plugin code, a repository, or an origi
 site to verify a work's existence. Local imports follow the same completeness and
 identity rules. Storage has manual, periodic, or change-driven scanning;
 periodic reconciliation also covers missed filesystem events. A scan reports each registered, unchanged,
-skipped, or failed candidate. Unsupported old formats and incomplete assets are
-skipped without conversion or repair. Every work requires valid original identity
-and title metadata in its source-folder `novel.json`.
+skipped, or failed candidate. Unsupported old formats are skipped. Valid
+incomplete chapters are indexed without converting or repairing their files.
+Every work requires valid original identity and title metadata in its
+source-folder `novel.json`.
 
 The walker excludes work-level cover images and `.nomedia` markers
 from chapter counts and skip reports. Cover synchronization is not part of the
 chapter package. Text-only bodies do not require a media manifest or archive.
 The app's `manifest.json` is a media inventory, not chapter identity metadata.
-It may exist without `media.zip`; even a complete manifest can contain remote
-assets. The importer reports these as undownloaded media and leaves the chapter
-unavailable until its required assets are stored locally.
+It may exist without `media.zip`. The importer records completeness from regular
+ZIP entries, ignoring completion and asset status flags. Incomplete copies remain
+visible in administration but are excluded from download availability.
 
 Work identity and title come exclusively from `novel.json`. Missing or invalid
 metadata skips the whole work; folder names, cover sidecars, and old databases
@@ -546,7 +553,7 @@ Chapter titles come from the work's chapter map, falling back to the number.
 Already indexed directories retain their original chapter identity.
 New folders use `norea-folder:<number>` within that exact work.
 Synthetic work identities, noncanonical numbers, conflicting bodies,
-incomplete media, and changing files are skipped.
+malformed media, and changing files are skipped.
 
 Metadata-only works and covers can be registered independently. A removed source
 work or plugin does not prevent importing a complete local copy with valid work
@@ -564,7 +571,8 @@ complete chapter rows without visiting those chapter directories, and validate
 new folders. This also reuses chapters validated during uploads before any scan.
 SQLite checkpoints retain successful stat inventories and stable unsupported
 layout results across restarts. Incomplete copies and transient failures retry;
-cached unsupported layouts wait for a change event or full inspection. Work
+cached unsupported layouts wait for a change event or full inspection.
+Full inspection rereads media inventories even when cached stat signatures match. Work
 metadata and cover stats are checked independently on each selected work.
 
 Changes mode debounces affected paths and inspects only related chapters or

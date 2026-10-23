@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { openDatabase, problem } from './db.ts';
 import { authenticate, authenticateDevice, createConsoleSession, installationSecret, registerDevice, tokenDigest } from './auth.ts';
 import { defaultLimits, deleteChapter, purgeChapter, restoreChapter } from './packages.ts';
-import type { Limits } from './packages.ts';
+import type { ChapterConflictPolicy, Limits } from './packages.ts';
 import { createChangeNotifications, readChangeCursors } from './changes.ts';
 import { registerAdministration, savedAnonymousRead } from './administration.ts';
 import { rebuildWorkIndex, registerWorks } from './works.ts';
@@ -21,7 +21,7 @@ const manifestSchema = { type: 'object', required: ['packageVersion','layout','i
   chapter: { type: 'object', required: ['name','position','contentType','page'], properties: { name: string, position: { type: 'number' }, chapterNumber: { type: ['string','null'] }, contentType: { type: 'string', enum: ['html','text','markdown','pdf'] }, page: string } },
   bodyPath: string, files: { type: 'array', items: { type: 'object', required: ['path','size','modifiedAt'], properties: { path: string, size: { type: 'integer' }, modifiedAt: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER } } } },
 } };
-const catalogSchema = { type: 'object', required: ['id','revision','fileBytes','manifest','deleted','sequence'], properties: { id: string, revision: string, fileBytes: { type: 'integer' }, manifest: manifestSchema, deleted: { type: 'boolean' }, sequence: { type: 'integer' } } };
+const catalogSchema = { type: 'object', required: ['id','revision','fileBytes','manifest','complete','deleted','sequence'], properties: { id: string, revision: string, fileBytes: { type: 'integer' }, manifest: manifestSchema, complete: { type: 'boolean' }, deleted: { type: 'boolean' }, sequence: { type: 'integer' } } };
 const cursorSchema = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
 
 export async function buildApp(options: { dataDir: string; anonymousRead?: boolean; limits?: Partial<Limits>; trashDays?: number }) {
@@ -74,9 +74,9 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   app.delete<{ Params: { id: string } }>('/api/v1/chapters/:id', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = deleteChapter(db, dataDir, request.params.id); changes.notify(); return entry; });
   app.post<{ Params: { id: string } }>('/api/v1/chapters/:id/restore', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = await restoreChapter(db, dataDir, request.params.id, limits); changes.notify(); return entry; });
   app.post<{ Params: { id: string } }>('/api/v1/chapters/:id/purge', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: { type: 'object', properties: { purged: { type: 'boolean' } } } } } }, async request => { authenticate(db, request, true); purgeChapter(db, dataDir, request.params.id); return { purged: true }; });
-  app.post('/api/v1/chapter-files', { onRequest: async request => { authenticateDevice(db, request); }, schema: { security: [{ bearerAuth: [] }], consumes: ['multipart/form-data'], response: { 200: catalogSchema }, description: 'Upload original completed chapter files. Send metadata JSON first, then files named by their original paths. No compression or body rewriting.' } }, async request => {
+  app.post<{ Querystring: { conflictPolicy: ChapterConflictPolicy } }>('/api/v1/chapter-files', { onRequest: async request => { authenticateDevice(db, request); }, schema: { security: [{ bearerAuth: [] }], consumes: ['multipart/form-data'], querystring: { type: 'object', additionalProperties: false, properties: { conflictPolicy: { type: 'string', enum: ['prefer-complete', 'keep-server', 'replace-server'], default: 'prefer-complete' } } }, response: { 200: catalogSchema }, description: 'Upload original chapter files and record their inspected media completeness. Send metadata JSON first, then files named by their original paths. No compression or body rewriting.' } }, async request => {
     if (!request.isMultipart()) throw problem(415, 'multipart/form-data is required');
-    const entry = await publishChapterFiles(db, dataDir, request.parts(), limits);
+    const entry = await publishChapterFiles(db, dataDir, request.parts(), limits, request.query.conflictPolicy);
     changes.notify();
     return entry;
   });

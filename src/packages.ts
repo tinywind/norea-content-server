@@ -14,7 +14,8 @@ export interface PackageManifest {
   bodyPath: string;
   files: { path: string; size: number; modifiedAt: number }[];
 }
-export interface CatalogEntry { id: string; revision: string; fileBytes: number; manifest: PackageManifest; deleted: boolean; sequence: number }
+export interface CatalogEntry { id: string; revision: string; fileBytes: number; manifest: PackageManifest; complete: boolean; deleted: boolean; sequence: number }
+export type ChapterConflictPolicy = 'prefer-complete' | 'keep-server' | 'replace-server';
 export interface Limits { zipBytes: number; expandedBytes: number; files: number }
 export const defaultLimits: Limits = { zipBytes: 512 * 1024 ** 2, expandedBytes: 2 * 1024 ** 3, files: 10000 };
 export const chapterFileNames = ['content.html', 'content.pdf', 'manifest.json', 'media.zip'];
@@ -129,7 +130,7 @@ export function completeChapter(db: DatabaseSync, dataDir: string, id: string): 
   const row = db.prepare('SELECT entry,path FROM chapters WHERE id=? AND deleted_at IS NULL').get(id) as { entry: string; path: string | null } | undefined;
   if (!row?.path) return;
   const entry = JSON.parse(row.entry) as CatalogEntry;
-  return storedFilesExist(dataDir, row.path, entry) ? entry : undefined;
+  return entry.complete === true && storedFilesExist(dataDir, row.path, entry) ? entry : undefined;
 }
 
 function normalizedChapterNumber(value: string | null | undefined): string | undefined {
@@ -174,7 +175,7 @@ export function uploadCursor(db: DatabaseSync): { catalog: number; works: number
   return db.prepare('SELECT (SELECT coalesce(max(sequence),0) FROM catalog_changes) AS catalog,(SELECT coalesce(max(sequence),0) FROM work_changes) AS works').get() as { catalog: number; works: number };
 }
 
-export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false): CatalogEntry {
+export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete'): CatalogEntry {
   let { id, manifest } = entry;
   let backup: { from: string; to: string } | undefined;
   let publishedPath: string | undefined;
@@ -195,8 +196,12 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
       const workDeletion = db.prepare('SELECT deleted,sequence FROM work_tombstones WHERE work_id=?').get(work) as { deleted: number; sequence: number } | undefined;
       const deletion = db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(id) as { sequence: number } | undefined;
       if ((imported && existing?.deleted_at != null) || workDeletion?.deleted || (deletion?.sequence ?? 0) > startedAt.catalog || (workDeletion?.sequence ?? 0) > startedAt.works) throw problem(409, 'Content was deleted; start a new upload to replace it');
-      const current = completeChapter(db, dataDir, id);
-      if (current && (!imported || current.revision === entry.revision)) return current;
+      const saved = existing ? JSON.parse(existing.entry) as CatalogEntry : undefined;
+      const current = saved && existing?.deleted_at === null && existing.path && storedFilesExist(dataDir, existing.path, saved) ? saved : undefined;
+      if (current && (imported ? current.revision === entry.revision && current.complete === entry.complete
+        : conflictPolicy === 'keep-server' || (conflictPolicy === 'prefer-complete' && (current.complete || !entry.complete)))) return current;
+      if ((saved?.sequence ?? 0) > startedAt.catalog) throw problem(409, 'Chapter changed during upload; retry the request');
+      if (!imported && existing) entry = { ...entry, revision: digest(canonicalize([manifest, randomUUID()])) };
       const storedWork = db.prepare('SELECT directory FROM works WHERE id=?').get(work) as { directory: string } | undefined;
       if (!storedWork) throw problem(409, 'Register exact work metadata before uploading chapter files');
       const directory = imported ? relative(resolve(dataDir), resolve(source)) : existing?.directory ?? join(storedWork.directory, basename(chapterDirectory(manifest)));
@@ -277,7 +282,7 @@ export async function restoreChapter(db: DatabaseSync, dataDir: string, id: stri
   if (!row.path || !storedFilesExist(dataDir, row.path, row.catalog)) throw problem(410, 'Chapter files are unavailable');
   const { validateMedia } = await import('./chapter-files.ts');
   const source = chapterStoragePath(dataDir, row.path);
-  await validateMedia(source, row.catalog.manifest, limits);
+  const complete = await validateMedia(source, row.catalog.manifest, limits);
   const current = chapterRow(db, id);
   if (!current.catalog.deleted || current.path !== row.path || current.catalog.revision !== row.catalog.revision || !storedFilesExist(dataDir, row.path, row.catalog)) throw problem(409, 'Chapter changed during restoration; retry');
   const destination = chapterStoragePath(dataDir, row.directory);
@@ -287,7 +292,7 @@ export async function restoreChapter(db: DatabaseSync, dataDir: string, id: stri
   try {
     return transaction(db, () => {
       db.prepare('UPDATE chapters SET path=directory,deleted_at=NULL WHERE id=?').run(id);
-      return recordEntry(db, { ...row.catalog, deleted: false });
+      return recordEntry(db, { ...row.catalog, complete, deleted: false });
     });
   } catch (error) { moveChapterFiles(destination, source); throw error; }
 }

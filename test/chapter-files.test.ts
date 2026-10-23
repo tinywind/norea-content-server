@@ -35,9 +35,10 @@ async function archive(files: Record<string, Buffer> | [string, Buffer][], optio
   return Buffer.concat(chunks);
 }
 
-async function upload(s: Awaited<ReturnType<typeof setup>>, files: Record<string, Buffer>, metadata = description(files)) {
+async function upload(s: Awaited<ReturnType<typeof setup>>, files: Record<string, Buffer>, metadata = description(files), conflictPolicy?: string) {
   const body = await multipart(files, metadata);
-  return s.app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...s.headers, 'content-type': body.type }, payload: body.payload });
+  const url = conflictPolicy ? `/api/v1/chapter-files?conflictPolicy=${conflictPolicy}` : '/api/v1/chapter-files';
+  return s.app.inject({ method: 'POST', url, headers: { ...s.headers, 'content-type': body.type }, payload: body.payload });
 }
 
 async function waitFor(check: () => Promise<boolean>) {
@@ -52,6 +53,129 @@ async function multipart(files: Record<string, Buffer>, metadata = description(f
   const request = new Request('http://localhost', { method: 'POST', body: form });
   return { payload: Buffer.from(await request.arrayBuffer()), type: request.headers.get('content-type')! };
 }
+
+for (const state of ['missing-archive', 'missing-entry', 'missing-regular-file', 'remote-with-entry', 'extra-entry']) test(`catalog completeness uses declared ZIP assets: ${state}`, async () => {
+  const s = await setup();
+  try {
+    const media = { version: 1, complete: state.startsWith('missing'), media: { files: [{ fileName: 'a.png', path: state === 'remote-with-entry' ? '' : 'media/a.png', status: state === 'remote-with-entry' ? 'remote' : 'stored' }] } };
+    if (state === 'missing-entry') media.media.files.push({ fileName: 'b.png', path: 'media/b.png', status: 'stored' });
+    const files: Record<string, Buffer> = { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(media)) };
+    if (state !== 'missing-archive') files['media.zip'] = await archive(state === 'extra-entry' ? { 'a.png': Buffer.from('image'), 'extra.png': Buffer.from('extra') } : { 'a.png': Buffer.from('image') });
+    if (state === 'missing-regular-file') {
+      const centralDirectory = files['media.zip'].indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+      files['media.zip'].writeUInt32LE(0x10, centralDirectory + 38);
+    }
+    const response = await upload(s, files);
+    assert.equal(response.statusCode, 200, response.body);
+    const entry = response.json();
+    const complete = !state.startsWith('missing');
+    assert.equal(entry.complete, complete);
+    const saved = JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry);
+    assert.equal(saved.complete, complete);
+    const query = new URLSearchParams({ pluginId: 'source', novelPath: '/work', chapterPath: '/chapter/1' });
+    assert.equal((await s.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, complete ? 200 : 404);
+    const lookup = await s.app.inject(`/api/v1/catalog/chapter?${query}&includeUnavailable=true`);
+    assert.equal(lookup.json().complete, complete);
+    const work = digest(JSON.stringify(['source', '/work']));
+    assert.equal((await s.app.inject(`/api/v1/catalog/works/${work}/chapters`)).json().total, complete ? 1 : 0);
+    assert.equal((await s.app.inject('/api/v1/catalog/works')).json().items[0].chapterCount, complete ? 1 : 0);
+    assert.equal((await s.app.inject('/api/v1/catalog/changes')).json().items[0].complete, complete);
+    const headers = await consoleHeaders(s.app, s.dataDir);
+    const managed = await s.app.inject({ url: `/api/v1/admin/works/${work}/chapters`, headers });
+    assert.equal(managed.json().items[0].entry.complete, complete);
+    const works = await s.app.inject({ url: '/api/v1/admin/works', headers });
+    assert.equal(works.json().items[0].downloadedChapters, complete ? 1 : 0);
+  } finally { await s.close(); }
+});
+
+for (const [policy, storedComplete, incomingComplete, replaces] of [
+  [undefined, false, true, true],
+  ['prefer-complete', false, false, false],
+  ['prefer-complete', true, true, false],
+  ['prefer-complete', true, false, false],
+  ['keep-server', false, true, false],
+  ['keep-server', true, false, false],
+  ['replace-server', true, false, true],
+  ['replace-server', true, true, true],
+] as const) test(`upload conflict ${policy ?? 'default'}: ${storedComplete} -> ${incomingComplete}`, async () => {
+  const s = await setup();
+  try {
+    const files = (body: string, complete: boolean) => ({
+      'content.html': Buffer.from(body),
+      ...(complete ? {} : { 'manifest.json': Buffer.from(JSON.stringify({ version: 1, complete: true, media: { files: [{ fileName: 'missing.png', path: 'media/missing.png', status: 'stored' }] } })) }),
+    });
+    const original = await upload(s, files('original body', storedComplete));
+    assert.equal(original.statusCode, 200, original.body);
+    const first = original.json();
+    const incoming = files('replacement body', incomingComplete);
+    const response = await upload(s, incoming, description(incoming), policy);
+    assert.equal(response.statusCode, 200, response.body);
+    const current = response.json();
+    assert.equal(current.id, first.id);
+    assert.equal(current.complete, replaces ? incomingComplete : storedComplete);
+    assert.equal(current.sequence > first.sequence, replaces);
+    const downloaded = await s.app.inject(`/api/v1/chapters/${current.id}/files?revision=${current.revision}&path=content.html`);
+    assert.equal(downloaded.body, replaces ? 'replacement body' : 'original body');
+    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+  } finally { await s.close(); }
+});
+
+test('replace-server changes the download token when metadata stays identical', async () => {
+  const s = await setup();
+  try {
+    const first = (await upload(s, { 'content.html': Buffer.from('first') })).json();
+    const files = { 'content.html': Buffer.from('other') };
+    const replacement = await upload(s, files, description(files), 'replace-server');
+    assert.equal(replacement.statusCode, 200, replacement.body);
+    assert.notEqual(replacement.json().revision, first.revision);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${first.revision}&path=content.html`)).statusCode, 404);
+  } finally { await s.close(); }
+});
+
+test('replace-server rejects an upload overtaken by a newer replacement', { timeout: 5000 }, async () => {
+  const s = await setup();
+  try {
+    const first = (await upload(s, { 'content.html': Buffer.from('first') })).json();
+    const files = { 'content.html': Buffer.alloc(128 * 1024, 65) };
+    const body = await multipart(files);
+    const address = await s.app.listen({ host: '127.0.0.1', port: 0 });
+    let request!: ReturnType<typeof httpRequest>;
+    const response = new Promise<{ status: number; body: string }>((accept, reject) => {
+      request = httpRequest(`${address}/api/v1/chapter-files?conflictPolicy=replace-server`, { method: 'POST', headers: { ...s.headers, 'content-type': body.type } }, incoming => {
+        void (async () => {
+          const chunks: Buffer[] = []; for await (const chunk of incoming) chunks.push(chunk);
+          accept({ status: incoming.statusCode!, body: Buffer.concat(chunks).toString() });
+        })().catch(reject);
+      });
+      request.on('error', reject);
+    });
+    const split = Math.floor(body.payload.length / 2);
+    request.write(body.payload.subarray(0, split));
+    await waitFor(async () => (await readdir(join(s.dataDir, 'staging'))).length === 1);
+    const newer = { 'content.html': Buffer.from('newer copy') };
+    const winner = await upload(s, newer, description(newer), 'replace-server');
+    assert.equal(winner.statusCode, 200, winner.body);
+    request.end(body.payload.subarray(split));
+    const result = await response;
+    assert.equal(result.status, 409, result.body);
+    assert.equal((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${winner.json().revision}&path=content.html`)).body, 'newer copy');
+    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+  } finally { await s.close(); }
+});
+
+test('conflicting uploads are validated before retention and reject unknown policies', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('existing') };
+    const original = (await upload(s, files)).json();
+    for (const policy of ['prefer-complete', 'keep-server', 'replace-server']) {
+      const incoming = { ...files, 'manifest.json': Buffer.from('invalid JSON') };
+      assert.equal((await upload(s, incoming, description(incoming), policy)).statusCode, 400);
+    }
+    assert.equal((await upload(s, files, description(files), 'unexpected')).statusCode, 400);
+    assert.equal(JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(original.id) as { entry: string }).entry).sequence, original.sequence);
+  } finally { await s.close(); }
+});
 
 test('a complete server copy ignores later uploads and can be replaced after deletion', async () => {
   const s = await setup();
@@ -708,7 +832,7 @@ for (const alias of [false, true]) for (const removal of ['filesystem', 'api-aft
   } finally { await s.close(); }
 });
 
-test('unsafe paths, incorrect body types, incomplete media and undeclared parts are rejected', { timeout: 5000 }, async () => {
+test('unsafe paths, incorrect body types, malformed media and undeclared parts are rejected', { timeout: 5000 }, async () => {
   const s = await setup();
   try {
     const files = { 'content.html': Buffer.from('body') };
@@ -717,7 +841,7 @@ test('unsafe paths, incorrect body types, incomplete media and undeclared parts 
       { files, metadata: { ...metadata, bodyPath: '../content.html', files: [{ ...metadata.files[0], path: '../content.html' }] } },
       { files, metadata: { ...metadata, files: [metadata.files[0], { path: 'media/a.png', size: 1, modifiedAt: 1700000000000 }] } },
       { files, metadata: { ...metadata, chapter: { ...metadata.chapter, contentType: 'pdf' } } },
-      { files: { ...files, 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[{"fileName":"a.png","path":"","bytes":0,"status":"remote"}]}}') }, metadata: description({ ...files, 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[{"fileName":"a.png","path":"","bytes":0,"status":"remote"}]}}') }) },
+      { files: { ...files, 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[{"fileName":"../a.png","path":"","bytes":0,"status":"remote"}]}}') }, metadata: description({ ...files, 'manifest.json': Buffer.from('{"version":1,"complete":true,"media":{"files":[{"fileName":"../a.png","path":"","bytes":0,"status":"remote"}]}}') }) },
       { files: { ...files, 'media.zip': Buffer.from('archive') }, metadata: description({ ...files, 'media.zip': Buffer.from('archive') }) },
       { files: { ...files, 'extra.txt': Buffer.from('extra') }, metadata },
     ];
@@ -768,15 +892,12 @@ test('raw artifact byte, metadata and file limits fail before publication', { ti
   } finally { await s.close(); }
 });
 
-test('media central directories must exactly match stored manifest filenames', async () => {
+test('unsafe ZIP entries and malformed media inventories are rejected', async () => {
   const s = await setup();
   try {
     const media = { version: 1, complete: true, media: { files: [{ fileName: 'a.png', path: 'media/a.png', bytes: 4, status: 'stored' }] } };
     const invalidArchives = [
       Buffer.from('invalid archive'),
-      await archive({}),
-      await archive({ 'b.png': Buffer.from('data') }),
-      await archive({ 'a.png': Buffer.from('data'), 'extra.png': Buffer.from('extra') }),
       await archive([['a.png', Buffer.from('data')], ['a.png', Buffer.from('data')]]),
       await archive({ 'a.png': Buffer.from('data') }, { compress: false, mode: 0o120777 }),
     ];
@@ -785,7 +906,7 @@ test('media central directories must exactly match stored manifest filenames', a
       assert.equal(response.statusCode, 400, response.body);
     }
     const zip = await archive({ 'a.png': Buffer.from('data') });
-    for (const changed of [{ fileName: '../a.png' }, { path: 'outside/a.png' }, { status: 'remote' }]) {
+    for (const changed of [{ fileName: '../a.png' }, { path: 'outside/a.png' }]) {
       const invalid = { ...media, media: { files: [{ ...media.media.files[0], ...changed }] } };
       const response = await upload(s, { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(invalid)), 'media.zip': zip });
       assert.equal(response.statusCode, 400, response.body);
