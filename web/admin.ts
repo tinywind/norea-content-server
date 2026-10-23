@@ -7,7 +7,7 @@ interface Plugin { id: string; name: string; url: string; enabled: boolean; upda
 interface StorageSettings { path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; removed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
-interface Entry { id: string; revision: string; fileBytes: number; deleted: boolean; sequence: number; manifest: { layout: 'chapter-files'; identity: { pluginId: string; novelId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; modifiedAt: number }[] } }
+interface Entry { id: string; revision: string; fileBytes: number; complete: boolean; deleted: boolean; sequence: number; manifest: { layout: 'chapter-files'; identity: { pluginId: string; novelId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; modifiedAt: number }[] } }
 interface NovelMetadata {
   schemaVersion: 1;
   identity: { pluginId: string; novelId: string; novelPath: string };
@@ -15,7 +15,7 @@ interface NovelMetadata {
   cover: { fileName: string; contentType: string | null } | null;
   chapters: Record<string, string>;
 }
-interface WorkChapter { chapterNumber: string | null; name: string; position: number; entry: Pick<Entry, 'id' | 'fileBytes'> | null }
+interface WorkChapter { chapterNumber: string | null; name: string; position: number; entry: Pick<Entry, 'id' | 'fileBytes' | 'complete'> | null }
 interface Work { id: string; sequence: number; metadata: Omit<NovelMetadata, 'chapters'> & { chapters?: NovelMetadata['chapters'] }; hasCover: boolean; chapterCount?: number; downloadedChapters?: number }
 interface WorkView { search: string; offset: number; layout: 'grid' | 'list' }
 interface Settings { anonymousRead: boolean; limits: { zipBytes: number; expandedBytes: number; files: number }; dataDir: string }
@@ -412,7 +412,7 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
         updateQuery({ chapterSearch: search.value.trim(), chapterOffset: offset, deleted: null });
         results.replaceChildren(table(['Chapter', 'Server files', 'Actions'], data.items.map(chapter => [
           el('div', '', el('div', 'cell-title', chapter.name), el('div', 'hint', `Chapter ${chapter.chapterNumber ?? chapter.position}`)),
-          chapter.entry ? el('div', '', 'Available', el('div', 'hint', bytes(chapter.entry.fileBytes))) : el('span', 'hint', 'Not backed up'),
+          chapter.entry ? el('div', '', chapter.entry.complete ? 'Complete' : 'Incomplete', el('div', 'hint', bytes(chapter.entry.fileBytes))) : el('span', 'hint', 'Not backed up'),
           chapter.entry ? el('div', 'actions', action('Inspect', () => inspectEntry(chapter.entry!.id, () => load(offset)), 'small'), action('Delete', async () => {
             if (!confirm(`Delete “${chapter.name}” from the server? Its catalog title and local device copies remain.`)) return;
             await api(`/chapters/${encodeURIComponent(chapter.entry!.id)}`, 'DELETE'); await load(offset);
@@ -425,7 +425,7 @@ async function chapters(current: number, work: Work | undefined, back: () => Pro
       updateQuery({ chapterSearch: search.value.trim(), chapterOffset: offset, deleted: deleted.value === 'Trash' ? 'true' : null });
       results.replaceChildren(table(['Chapter', 'Source', 'Stored content', 'Actions'], data.items.map(entry => [
         el('div', '', el('div', 'cell-title', entry.manifest.chapter.name), el('div', 'hint', `Position ${entry.manifest.chapter.position} · ${entry.manifest.novel.name}`)),
-        el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', bytes(entry.fileBytes), el('div', 'hint mono', entry.revision.slice(0, 12))),
+        el('div', 'mono', entry.manifest.identity.pluginId), el('div', '', badge(entry.complete ? 'complete' : 'incomplete'), el('div', '', bytes(entry.fileBytes)), el('div', 'hint mono', entry.revision.slice(0, 12))),
         el('div', 'actions', action('Inspect', () => inspectEntry(entry.id, () => load(offset)), 'small'), entry.deleted ? null : action('Delete', async () => {
           if (!confirm(`Delete “${entry.manifest.chapter.name}” from the server? Local device copies remain. You can upload a replacement after deletion.`)) return;
           await api(`/chapters/${encodeURIComponent(entry.id)}`, 'DELETE'); await load(offset);
@@ -456,7 +456,7 @@ async function inspectEntry(id: string, changed: () => Promise<void>) {
       actions.append(action('Restore chapter', async () => { await api(`${endpoint}/restore`, 'POST'); await done(); }, 'primary', errors),
         action('Permanently purge', async () => { if (!confirm(`Permanently purge “${entry.manifest.chapter.name}” from server trash? This cannot be undone.`)) return; await api(`${endpoint}/purge`, 'POST'); await done(); }, 'danger', errors));
     } else actions.append(action('Delete from server', async () => { if (!confirm(`Delete “${entry.manifest.chapter.name}” from the server? Local device copies remain. You can upload a replacement after deletion.`)) return; await api(endpoint, 'DELETE'); await done(); }, 'danger', errors));
-    const metadata: [string, Child][] = [['Status', badge(entry.deleted ? 'deleted' : 'active')], ['Position', entry.manifest.chapter.position], ['Content type', entry.manifest.chapter.contentType]];
+    const metadata: [string, Child][] = [['Status', badge(entry.deleted ? 'deleted' : 'active')], ['Completeness', badge(entry.complete ? 'complete' : 'incomplete')], ['Position', entry.manifest.chapter.position], ['Content type', entry.manifest.chapter.contentType]];
     if (entry.manifest.novel.author) metadata.push(['Author', entry.manifest.novel.author]);
     if (entry.manifest.novel.summary) metadata.push(['Summary', entry.manifest.novel.summary]);
     metadata.push(['Chapter ID', el('span', 'mono', entry.id)], ['Plugin ID', entry.manifest.identity.pluginId], ['Novel path', el('span', 'mono', entry.manifest.identity.novelPath)], ['Chapter path', el('span', 'mono', entry.manifest.identity.chapterPath)], ['Current file token', el('span', 'mono', entry.revision)], ['Storage format', 'Original chapter files'], ['Stored size', bytes(entry.fileBytes)]);
