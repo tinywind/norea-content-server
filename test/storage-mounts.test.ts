@@ -13,7 +13,7 @@ async function setup() {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(resolve('.tmp', 'storage-mounts-'));
   const db = openDatabase(dataDir);
-  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'source', novelPath: '/work' }, novel: { name: 'Work', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null });
+  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'source', novelId: 'work', novelPath: '/work' }, novel: { name: 'Work', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null });
   const app = await buildApp({ dataDir });
   const headers = await deviceHeaders(app);
   return { app, db, dataDir, headers, close: async () => { db.close(); await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
@@ -21,7 +21,7 @@ async function setup() {
 
 async function upload(s: Awaited<ReturnType<typeof setup>>) {
   const body = Buffer.from('Original chapter bytes');
-  const manifest = { packageVersion: 1, layout: 'chapter-files', identity: { pluginId: 'source', novelPath: '/work', chapterPath: '/raw' }, novel: { name: 'Work', isLocal: false }, chapter: { name: 'Raw', position: 1, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: body.length, modifiedAt: 1700000000000 }] };
+  const manifest = { packageVersion: 1, layout: 'chapter-files', identity: { pluginId: 'source', novelId: 'work', novelPath: '/work', chapterPath: '/raw' }, novel: { name: 'Work', isLocal: false }, chapter: { name: 'Raw', position: 1, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: body.length, modifiedAt: 1700000000000 }] };
   const form = new FormData();
   form.append('metadata', JSON.stringify(manifest));
   form.append('content.html', new Blob([body]), 'content.html');

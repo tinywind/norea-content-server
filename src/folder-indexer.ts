@@ -32,7 +32,6 @@ interface IndexedChapter { id: string; work_id: string; directory: string; path:
 interface IndexedWork { id: string; directory: string; entry: string }
 class UnsupportedChapterError extends Error {}
 const fail = (message: string): never => { throw new Error(message); };
-const segment = (value: string) => { const result = value.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96); return !result || result === '.' || result === '..' ? 'source' : result; };
 function aborted(signal?: AbortSignal): void { signal?.throwIfAborted(); }
 async function noLinks(path: string): Promise<void> {
   let current = resolve(path);
@@ -175,7 +174,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
           aborted(options.signal);
           const original = await signature(metadataPath);
           value = readNovelMetadata(metadataPath);
-          if (segment(value.identity.pluginId) !== sourceId) fail('Work metadata source does not match its folder');
+          if (value.identity.pluginId !== sourceId || value.identity.novelId !== directory.split(sep).at(-1)) fail('Work metadata IDs do not match its folder');
           before = await workSignature();
           if (original === await signature(metadataPath)) break;
           if (attempt === 1) fail('Work metadata changed during indexing');
@@ -203,34 +202,29 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     }
     folders.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
     const isLocal = value.identity.pluginId === 'local';
-    const numbers = new Map<string, number>();
-    for (const folder of folders) {
-      const number = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/)?.[1];
-      if (number) numbers.set(number, (numbers.get(number) ?? 0) + 1);
-    }
     for (const folder of folders) {
       aborted(options.signal);
       const path = join(directory, folder.name);
-      const key = canonicalize([value.identity, folder.name, isLocal ? null : numbers.get(folder.name.match(/^(\d+(?:\.\d+)?)-/)?.[1] ?? '') ?? null]);
+      const key = canonicalize([value.identity, folder.name]);
       const saved = checkpoint(path);
       const published = chapters.get(relative(dataDir, path));
       if (!published?.path && !inspect(path) && saved?.signature === key) { await report(JSON.parse(saved.entry) as FolderIndexItem, true); continue; }
       const entry = published ? JSON.parse(published.entry) as CatalogEntry : undefined;
-      const parts = folder.name.match(/^(\d+(?:\.\d+)?)-(.+)$/);
-      const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
-      if (!exactIdentity && (!parts || (!isLocal && numbers.get(parts[1]) !== 1))) {
+      const number = /^\d+(?:\.\d+)?$/.test(folder.name) && Number.isFinite(Number(folder.name)) && String(Number(folder.name)) === folder.name ? folder.name : undefined;
+      if (number === undefined) {
         if (published) unavailable(published);
-        await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must have a unique number followed by a hyphen and title' }); continue;
+        await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must be a canonical nonnegative number' }); continue;
       }
+      const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
       if (entry && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
         await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); continue;
       }
       if (exactIdentity) { await process(path, entry!.manifest, key); continue; }
       const files = await readdir(path);
       await process(path, {
-        identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${folder.name}` : `norea-folder:${parts![1]}` },
+        identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${number}` : `norea-folder:${number}` },
         novel: { name: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal },
-        chapter: { name: value.chapters[String(Number(parts![1]))] ?? parts![2], chapterNumber: parts![1], position: Number(parts![1]), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
+        chapter: { name: value.chapters[number] ?? number, chapterNumber: number, position: Number(number), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
       }, key);
     }
   };

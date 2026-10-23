@@ -15,14 +15,14 @@ async function fixture() {
   const addWork = async (name: string) => {
     const work = join(dataDir, 'contents/example', name);
     await fsp.mkdir(work, { recursive: true });
-    await fsp.writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelPath: '/' + name }, novel: { name } }));
+    await fsp.writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelId: name, novelPath: '/' + name }, novel: { name } }));
     return work;
   };
   const addChapter = async (work: string, name: string) => {
     const chapter = join(work, name); await fsp.mkdir(chapter, { recursive: true });
     await fsp.writeFile(join(chapter, 'content.html'), '<p>Complete chapter</p>'); return chapter;
   };
-  const work = await addWork('Book'); const chapter = await addChapter(work, '1-First');
+  const work = await addWork('Book'); const chapter = await addChapter(work, '1');
   const run = (options: Partial<FolderIndexOptions> = {}) => scanFolder({ dataDir, db, limits: defaultLimits, ...options });
   return { dataDir, db, work, chapter, addWork, addChapter, run, close: async () => { db.close(); await fsp.rm(dataDir, { recursive: true, force: true }); } };
 }
@@ -30,8 +30,8 @@ async function fixture() {
 test('incremental discovery never opens or stats known complete or unsupported chapter folders', async t => {
   const f = await fixture();
   try {
-    const rejected = join(f.work, '2-Unsupported'); await fsp.mkdir(join(rejected, 'loose-media'), { recursive: true });
-    const archive = join(f.work, '3-Archive'); await fsp.mkdir(archive); await fsp.writeFile(join(archive, 'outer.zip'), 'Unsupported archive');
+    const rejected = join(f.work, '2'); await fsp.mkdir(join(rejected, 'loose-media'), { recursive: true });
+    const archive = join(f.work, '3'); await fsp.mkdir(archive); await fsp.writeFile(join(archive, 'outer.zip'), 'Unsupported archive');
     await f.run();
     const accesses: string[] = [];
     const record = (path: unknown) => { const value = String(path); if ([f.chapter, rejected, archive].some(root => value === root || value.startsWith(root + sep))) accesses.push(value); };
@@ -47,7 +47,7 @@ test('incremental discovery never opens or stats known complete or unsupported c
     const unchanged = await f.run();
     assert.equal(unchanged.unchanged, 2); assert.equal(unchanged.skipped, 2);
     assert.deepEqual(accesses, [], 'Previously classified chapter folders must not be visited');
-    const next = await f.addChapter(f.work, '4-Fourth'); const other = await f.addWork('Other'); await f.addChapter(other, '1-One');
+    const next = await f.addChapter(f.work, '4'); const other = await f.addWork('Other'); await f.addChapter(other, '1');
     const added = await f.run();
     assert.equal(added.registered, 3); assert.equal(added.failed, 0);
     assert.deepEqual(accesses, []); assert.ok(fs.existsSync(join(next, 'content.html')));
@@ -82,7 +82,7 @@ test('discovery reuses validated database chapters without scanner checkpoints',
 test('persisted scan results survive restart and reject paths outside contents', async t => {
   const f = await fixture();
   try {
-    const rejected = join(f.work, '2-Unsupported'); await fsp.mkdir(join(rejected, 'loose-media'), { recursive: true });
+    const rejected = join(f.work, '2'); await fsp.mkdir(join(rejected, 'loose-media'), { recursive: true });
     await f.run();
     const restarted = openDatabase(f.dataDir);
     try {
@@ -101,11 +101,11 @@ test('persisted scan results survive restart and reject paths outside contents',
 test('changed-path scans inspect the affected chapter without visiting another work', async t => {
   const f = await fixture();
   try {
-    const other = await f.addWork('Other'); await f.addChapter(other, '1-One'); await f.run();
+    const other = await f.addWork('Other'); await f.addChapter(other, '1'); await f.run();
     await fsp.writeFile(join(f.chapter, 'content.html'), '<p>Edited after indexing</p>');
     const original = fsp.readdir; const visited: string[] = [];
     t.mock.method(fsp, 'readdir', (...args: Parameters<typeof original>) => { visited.push(String(args[0])); return Reflect.apply(original, fsp, args); }); syncBuiltinESMExports();
-    const result = await f.run({ changedPaths: ['example/Book/1-First/content.html'] });
+    const result = await f.run({ changedPaths: ['example/Book/1/content.html'] });
     assert.equal(result.registered, 1); assert.equal(result.failed, 0);
     assert.equal(visited.some(path => path === other || path.startsWith(other + sep)), false);
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); await f.close(); }
@@ -114,15 +114,15 @@ test('changed-path scans inspect the affected chapter without visiting another w
 test('incomplete copies are retried and cached rejections are reconsidered on explicit changes', async () => {
   const f = await fixture();
   try {
-    const pending = join(f.work, '2-Copying'); await fsp.mkdir(pending);
-    const rejected = join(f.work, '3-Unsupported'); await fsp.mkdir(join(rejected, 'loose-media'), { recursive: true });
+    const pending = join(f.work, '2'); await fsp.mkdir(pending);
+    const rejected = join(f.work, '3'); await fsp.mkdir(join(rejected, 'loose-media'), { recursive: true });
     assert.equal((await f.run()).skipped, 2);
     await fsp.writeFile(join(pending, 'content.html'), '<p>Copy finished</p>');
     assert.equal((await f.run()).registered, 1);
     await fsp.rm(join(rejected, 'loose-media'), { recursive: true });
     await fsp.writeFile(join(rejected, 'content.html'), '<p>Repaired</p>');
     assert.equal((await f.run()).registered, 0);
-    assert.equal((await f.run({ changedPaths: ['example/Book/3-Unsupported/content.html'] })).registered, 1);
+    assert.equal((await f.run({ changedPaths: ['example/Book/3/content.html'] })).registered, 1);
   } finally { await f.close(); }
 });
 
@@ -138,7 +138,7 @@ test('external chapter and work removal updates the index without preventing red
     assert.equal(f.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(deletion.id)!.sequence, deletion.sequence);
     assert.equal((await f.run()).removed, 0);
     assert.equal(f.db.prepare('SELECT max(sequence) AS sequence FROM catalog_changes').get()!.sequence, deletion.sequence);
-    await f.addChapter(f.work, '1-First'); assert.equal((await f.run()).registered, 1);
+    await f.addChapter(f.work, '1'); assert.equal((await f.run()).registered, 1);
     const restored = JSON.parse(f.db.prepare('SELECT entry FROM chapters').get()!.entry as string);
     assert.equal(restored.id, deletion.id); assert.equal(restored.deleted, false);
     assert.equal(f.db.prepare('SELECT sequence FROM chapter_tombstones WHERE chapter_id=?').get(deletion.id)!.sequence, deletion.sequence);
@@ -146,7 +146,7 @@ test('external chapter and work removal updates the index without preventing red
     assert.ok((await f.run()).removed > 0);
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM works').get()!.n, 0);
     assert.equal(f.db.prepare('SELECT count(*) AS n FROM work_tombstones').get()!.n, 0);
-    await f.addWork('Book'); await f.addChapter(f.work, '1-First'); assert.equal((await f.run()).registered, 2);
+    await f.addWork('Book'); await f.addChapter(f.work, '1'); assert.equal((await f.run()).registered, 2);
   } finally { await f.close(); }
 });
 

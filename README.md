@@ -56,7 +56,7 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   `{blocked:true}` or `{blocked:false}` with `PATCH /api/v1/admin/devices/:id`.
 - `GET /api/v1/catalog/changes?after=0&limit=100` returns lightweight availability
   changes as `{items,cursor,hasMore}`. Each item contains only
-  `{identity:{pluginId,novelPath,chapterPath},deleted,sequence}`. Apply repeated
+  `{identity:{pluginId,novelId,novelPath,chapterPath},deleted,sequence}`. Apply repeated
   identities in sequence order, including deletions and restorations. The cursor
   is the last returned sequence, or `after` when the page is empty. Limits range
   from 1 to 100. Package file inventories are excluded; use the exact chapter
@@ -161,11 +161,22 @@ files. Scan those files first. Only the declared current files are served.
 
 ## Storage and limits
 
-Original files use the Norea readable directory rules:
-`contents/<plugin>/<work-name>-<work-path>/<chapter-number>-<chapter-name>/`.
+Original files use the same ID directories as the app:
+`contents/<pluginId>/<novelId>/<chapter-number>/`.
+The source plugin provides `novelId`; it is stored literally and is required in
+both work and chapter metadata. Titles remain in metadata. Chapter numbers use
+canonical decimal notation, including fractional numbers; a missing source number
+uses the chapter's positive position.
+Plugin IDs use lowercase kebab-case. Storage IDs are at most 240 UTF-8 bytes and
+must be valid portable directory names: no separators, Windows reserved names,
+control characters, leading dot or space, trailing dot or space, or unfinished
+file suffixes. Invalid IDs are rejected rather than sanitized or hashed.
 The chapter directory directly contains the original body, media manifest, and
 media archive. SQLite stores one current path per chapter, without revision rows.
-An identity that collides with another chapter's sanitized directory is rejected.
+An identity that collides with another work or chapter directory is rejected.
+Changing a registered work's source novel ID is also rejected. API work and chapter
+IDs remain hashes of the original plugin and source paths; these hashes are never
+directory names. Only the current directory format is indexed.
 Uploads stream through a staging directory and are validated before becoming
 visible in SQLite. The catalog metadata stays in SQLite; the uploaded media
 `manifest.json` is never replaced by catalog metadata.
@@ -268,13 +279,14 @@ this path and controls its scan schedule. Scans traverse source directories rega
 installation, or enabled status.
 They never check the original site or whether it still publishes the work.
 Each work folder must contain valid `novel.json` with its original plugin ID,
-base-URL-relative work path and title. Other metadata is optional. Missing or invalid metadata
+plugin-provided novel ID, base-URL-relative work path and title. The plugin and
+novel IDs must match the enclosing directories. Other metadata is optional. Missing or invalid metadata
 skips the whole work. The importer never recovers work identity from a folder
 name, `cover.json`, an old app database, or source-site requests. Synthetic
 `norea-folder:` work identities are rejected.
 
 `novel.json` writers emit `schemaVersion`, `identity`, `novel`, `cover`, and `chapters`.
-Readers require only `identity.pluginId`, `identity.novelPath`, and `novel.name`.
+Readers require `identity.pluginId`, `identity.novelId`, `identity.novelPath`, and `novel.name`.
 Unknown fields are ignored and omitted on write and transfer. An absent schema
 version defaults to 1. `chapters` maps source chapter numbers to their exact titles
 and defaults to an empty map when absent. Source metadata fetches update the map;
@@ -287,11 +299,13 @@ status text and a nullable rating from 0 to 5. The scanner discovers actual work
 the optional cover descriptor is absent. The console serves these local files. Metadata-only works can be registered without chapters.
 See [Filesystem Metadata v1](docs/design.md#filesystem-metadata-v1).
 
-Chapter folders follow `<number>-<title>`. Additional hyphens belong to the title.
-The scanner discovers actual `content.html` or `content.pdf` files. Already indexed
-directories retain their exact chapter identity. New folders use `norea-folder:<number>` as a
-chapter identity within that exact work. Duplicate numbers, conflicting body
-formats, unfinished files, and incomplete media are skipped with reasons in Jobs.
+Chapter folders contain only a canonical chapter number, such as `1` or `1.5`.
+The scanner discovers actual `content.html` or `content.pdf` files and restores
+titles from the `novel.json` chapter map, falling back to the number.
+Already indexed directories retain their exact chapter identity. New folders use
+`norea-folder:<number>` as a chapter identity within that exact work.
+Noncanonical numbers, conflicting body formats, unfinished files, and incomplete
+media are skipped with reasons in Jobs.
 
 Text-only chapters need no media manifest or archive. A chapter's `manifest.json`
 describes media assets and contains no source identities. Remote assets remain

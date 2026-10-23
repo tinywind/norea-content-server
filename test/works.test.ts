@@ -12,7 +12,7 @@ import { digest } from '../src/packages.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 export function metadata() {
-  return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/books/1?lang=ko' },
+  return { schemaVersion: 1, identity: { pluginId: 'example', novelId: 'Book', novelPath: '/books/1?lang=ko' },
     novel: { name: 'Book', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
     cover: { fileName: 'cover.png', contentType: 'image/png' }, chapters: {} };
 }
@@ -30,7 +30,7 @@ test('restores minimal work files and local covers without source URLs or exact 
   const dataDir = await mkdtemp(resolve('.tmp/minimal-work-'));
   const directory = join(dataDir, 'contents/example/Book');
   await mkdir(directory, { recursive: true });
-  const document = { identity: { pluginId: 'example', novelPath: '/books/1?lang=ko' },
+  const document = { identity: { pluginId: 'example', novelId: 'Book', novelPath: '/books/1?lang=ko' },
     novel: { name: 'Book', cover: 'https://removed.invalid/cover.jpg' }, extra: true };
   await writeFile(join(directory, 'novel.json'), JSON.stringify(document));
   const bytes = Buffer.from('stored cover');

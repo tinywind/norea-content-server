@@ -16,14 +16,14 @@ async function setup(options: Partial<Parameters<typeof buildApp>[0]> = {}) {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(join('.tmp', 'chapter-files-'));
   const db = openDatabase(dataDir);
-  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'source', novelPath: '/work' }, novel: { name: 'Work', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null });
+  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'source', novelId: 'work', novelPath: '/work' }, novel: { name: 'Work', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null });
   const app = await buildApp({ ...options, dataDir });
   const headers = await deviceHeaders(app);
   return { app, db, headers, dataDir, close: async () => { db.close(); await app.close(); await rm(dataDir, { recursive: true }); } };
 }
 
 function description(files: Record<string, Buffer>): PackageManifest {
-  return { packageVersion: 1, layout: 'chapter-files', identity: { pluginId: 'source', novelPath: '/work', chapterPath: '/chapter/1' }, novel: { name: 'Work', isLocal: false }, chapter: { name: 'First', position: 1, chapterNumber: '1', contentType: 'html', page: '1' }, bodyPath: 'content.html', files: Object.entries(files).sort(([a], [b]) => a.localeCompare(b)).map(([path, data]) => ({ path, size: data.length, modifiedAt: 1700000000000 })) };
+  return { packageVersion: 1, layout: 'chapter-files', identity: { pluginId: 'source', novelId: 'work', novelPath: '/work', chapterPath: '/chapter/1' }, novel: { name: 'Work', isLocal: false }, chapter: { name: 'First', position: 1, chapterNumber: '1', contentType: 'html', page: '1' }, bodyPath: 'content.html', files: Object.entries(files).sort(([a], [b]) => a.localeCompare(b)).map(([path, data]) => ({ path, size: data.length, modifiedAt: 1700000000000 })) };
 }
 
 async function archive(files: Record<string, Buffer> | [string, Buffer][], options = { compress: false, mode: 0o100644 }) {
@@ -144,45 +144,17 @@ for (const deleted of [false, true]) test(`a stored folder identity does not mer
     assert.equal(firstResponse.statusCode, 200, firstResponse.body);
     const first = firstResponse.json();
     if (deleted) assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${first.id}`, headers: s.headers })).statusCode, 200);
-    const ids = new Set([first.id]);
     for (const [path, name] of [['/chapter/1', 'Source A'], ['/other/chapter/1', 'Source B']]) {
       const sourceFiles = { 'content.html': Buffer.from(name) };
       const source = description(sourceFiles); source.identity.chapterPath = path; source.chapter.name = name;
       const response = await upload(s, sourceFiles, source);
-      assert.equal(response.statusCode, 200, response.body);
-      const entry = response.json();
-      assert.ok(!ids.has(entry.id)); ids.add(entry.id);
-      assert.equal(entry.manifest.identity.chapterPath, path);
-      assert.deepEqual((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).rawPayload, sourceFiles['content.html']);
+      assert.equal(response.statusCode, 409, response.body);
     }
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 3);
+    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
     const row = s.db.prepare('SELECT path,entry FROM chapters WHERE id=?').get(first.id) as { path: string; entry: string };
     assert.equal(JSON.parse(row.entry).deleted, deleted);
     assert.equal(JSON.parse(row.entry).manifest.identity.chapterPath, 'norea-folder:1');
     assert.deepEqual(await readFile(join(s.dataDir, row.path, 'content.html')), files['content.html']);
-  } finally { await s.close(); }
-});
-
-for (const deleted of [false, true]) test(`folder aliases do not guess between different source chapters with the same number (deleted: ${deleted})`, async () => {
-  const s = await setup();
-  try {
-    const files = { 'content.html': Buffer.from('original') };
-    const first = (await upload(s, files)).json();
-    const other = description(files); other.identity.chapterPath = '/other/chapter/1'; other.chapter.name = 'Other source chapter';
-    const secondResponse = await upload(s, files, other);
-    assert.equal(secondResponse.statusCode, 200, secondResponse.body);
-    const second = secondResponse.json();
-    assert.notEqual(second.id, first.id);
-    if (deleted) for (const entry of [first, second]) await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
-    const alias = description(files); alias.identity.chapterPath = 'norea-folder:1';
-    const rejected = await upload(s, files, alias);
-    assert.equal(rejected.statusCode, 409, rejected.body);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 2);
-    for (const entry of [first, second]) {
-      const row = s.db.prepare('SELECT path,entry FROM chapters WHERE id=?').get(entry.id) as { path: string; entry: string };
-      assert.equal(JSON.parse(row.entry).deleted, deleted);
-      assert.deepEqual(await readFile(join(s.dataDir, row.path, 'content.html')), files['content.html']);
-    }
   } finally { await s.close(); }
 });
 
@@ -220,7 +192,7 @@ test('current uploads, rescans, and repairs preserve unrelated files in a chapte
   const s = await setup();
   try {
     const work = s.db.prepare('SELECT directory FROM works').get() as { directory: string };
-    const directory = join(s.dataDir, work.directory, '1-First');
+    const directory = join(s.dataDir, work.directory, '1');
     await mkdir(directory);
     const unrelated = Buffer.from('Opaque file that must not be read or replaced');
     await writeFile(join(directory, 'attachment.zip'), unrelated);
@@ -252,7 +224,7 @@ test('uploads never overwrite an unindexed current chapter file', async () => {
   const s = await setup();
   try {
     const work = s.db.prepare('SELECT directory FROM works').get() as { directory: string };
-    const directory = join(s.dataDir, work.directory, '1-First');
+    const directory = join(s.dataDir, work.directory, '1');
     await mkdir(directory);
     await writeFile(join(directory, 'content.html'), 'Original body');
     const response = await upload(s, { 'content.html': Buffer.from('Replacement') });
@@ -266,7 +238,7 @@ test('failed publication removes only newly added files from an occupied folder'
   const s = await setup();
   try {
     const work = s.db.prepare('SELECT directory FROM works').get() as { directory: string };
-    const directory = join(s.dataDir, work.directory, '1-First');
+    const directory = join(s.dataDir, work.directory, '1');
     await mkdir(directory);
     await writeFile(join(directory, 'notes.txt'), 'Preserve this file');
     s.db.exec("CREATE TRIGGER reject_publication BEFORE INSERT ON catalog_changes BEGIN SELECT RAISE(ABORT, 'Publication failed'); END");

@@ -8,7 +8,7 @@ import { problem, transaction } from './db.ts';
 export interface PackageManifest {
   packageVersion: 1;
   layout: 'chapter-files';
-  identity: { pluginId: string; novelPath: string; chapterPath: string };
+  identity: { pluginId: string; novelId: string; novelPath: string; chapterPath: string };
   novel: { name: string; author?: string | null; summary?: string | null; isLocal: boolean };
   chapter: { name: string; position: number; chapterNumber?: string | null; contentType: 'html' | 'text' | 'markdown' | 'pdf'; page: string };
   bodyPath: string;
@@ -21,27 +21,24 @@ export const chapterFileNames = ['content.html', 'content.pdf', 'manifest.json',
 export const isUnfinishedContentName = (name: string) => name.startsWith('.') || /(?:\.tmp|\.bak|\.part|\.partial|\.norea-sync-backup)$/i.test(name);
 export const digest = (data: string | Buffer) => createHash('sha256').update(data).digest('hex');
 export const workId = (identity: PackageManifest['identity']) => digest(JSON.stringify([identity.pluginId, identity.novelPath]));
-function safeSegment(value: string | null | undefined, fallback: string): string {
-  const sanitized = (value?.trim() || fallback).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 96);
-  return !sanitized || sanitized === '.' || sanitized === '..' ? fallback : sanitized;
-}
-
-function safeLabel(value: string, fallback: string): string {
-  const sanitized = [...(value.trim() || fallback)].map(ch => {
-    const code = ch.codePointAt(0)!;
-    const unsafeFormat = code === 0x180e || (code >= 0x200b && code <= 0x200f) || (code >= 0x202a && code <= 0x202e) || (code >= 0x2060 && code <= 0x206f) || code === 0xfeff;
-    return /[\s/:*?"<>|\\]/.test(ch) || unsafeFormat ? '-' : ch;
-  }).join('').replace(/^[.-]+|[.-]+$/g, '').slice(0, 96);
-  return !sanitized || sanitized === '.' || sanitized === '..' ? fallback : sanitized;
+export function validateStorageIdentity(identity: { pluginId: unknown; novelId: unknown }): void {
+  for (const value of [identity.pluginId, identity.novelId]) {
+    if (typeof value !== 'string' || !value || !value.isWellFormed() || Buffer.byteLength(value, 'utf8') > 240 ||
+      /^[. ]|[. ]$/.test(value) || /[<>:"/\\|?*\x00-\x1f]/.test(value) ||
+      /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(value) || isUnfinishedContentName(value)) {
+      throw problem(400, 'Storage IDs must be portable directory names');
+    }
+  }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(identity.pluginId as string)) throw problem(400, 'Plugin ID must use lowercase kebab-case');
 }
 
 function chapterDirectory(manifest: PackageManifest): string {
-  const plugin = safeSegment(manifest.identity.pluginId, 'source');
-  const novel = `${safeLabel(manifest.novel.name, 'novel')}-${safeSegment(manifest.identity.novelPath, 'novel')}`;
-  const chapter = `${safeSegment(manifest.chapter.chapterNumber, manifest.chapter.position > 0 ? String(manifest.chapter.position) : 'chapter')}-${safeLabel(manifest.chapter.name, 'chapter')}`;
-  const path = join('contents', plugin, novel, chapter);
-  if (!safeArchivePath(path.split('\\').join('/'))) throw problem(400, 'Content identity cannot be stored in a portable readable directory');
-  return path;
+  validateStorageIdentity(manifest.identity);
+  const chapter = manifest.chapter.chapterNumber == null
+    ? (manifest.chapter.position > 0 ? normalizedChapterNumber(String(manifest.chapter.position)) : undefined)
+    : normalizedChapterNumber(manifest.chapter.chapterNumber);
+  if (chapter === undefined) throw problem(400, 'A chapter number or positive position is required for storage');
+  return join('contents', manifest.identity.pluginId, manifest.identity.novelId, chapter);
 }
 
 export function safeArchivePath(path: string): boolean {
@@ -54,7 +51,8 @@ export function validateManifest(value: unknown): asserts value is PackageManife
   const allowed = (object: object, names: string[]) => { if (Object.keys(object).some(key => !names.includes(key))) throw problem(400, 'Unknown package manifest field'); };
   allowed(m, ['packageVersion','layout','identity','novel','chapter','bodyPath','files']);
   if (m.layout !== 'chapter-files') throw problem(400, 'Unsupported chapter file layout');
-  allowed(m.identity, ['pluginId','novelPath','chapterPath']);
+  allowed(m.identity, ['pluginId','novelId','novelPath','chapterPath']);
+  validateStorageIdentity(m.identity);
   allowed(m.novel, ['name','author','summary','isLocal']);
   allowed(m.chapter, ['name','position','chapterNumber','contentType','page']);
   for (const value of [m.novel.author, m.novel.summary, m.chapter.chapterNumber]) if (value !== undefined && value !== null && typeof value !== 'string') throw problem(400, 'Invalid optional package metadata');
@@ -65,6 +63,7 @@ export function validateManifest(value: unknown): asserts value is PackageManife
   validUnicode(m);
   for (const v of [m.identity.pluginId, m.identity.novelPath, m.identity.chapterPath, m.novel.name, m.chapter.name]) if (typeof v !== 'string' || !v || v.length > 4096) throw problem(400, 'Invalid package identity or title');
   if (typeof m.novel.isLocal !== 'boolean' || !Number.isFinite(m.chapter.position) || typeof m.chapter.page !== 'string' || !['html','text','markdown','pdf'].includes(m.chapter.contentType)) throw problem(400, 'Invalid package metadata');
+  chapterDirectory(m);
   if (typeof m.bodyPath !== 'string' || !safeArchivePath(m.bodyPath)) throw problem(400, 'Invalid body path');
   for (let index = 0; index < m.files.length; index++) {
     const file = m.files[index];
@@ -136,9 +135,10 @@ export function completeChapter(db: DatabaseSync, dataDir: string, id: string): 
 function normalizedChapterNumber(value: string | null | undefined): string | undefined {
   const match = /^(\d+)(?:\.(\d+))?$/.exec(value ?? '');
   if (!match) return;
-  const integer = match[1].replace(/^0+(?=\d)/, '');
-  const fraction = match[2]?.replace(/0+$/, '');
-  return fraction ? `${integer}.${fraction}` : integer;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return;
+  const normalized = String(number);
+  return /^\d+(?:\.\d+)?$/.test(normalized) ? normalized : undefined;
 }
 
 function folderChapterNumber(path: string): string | undefined {
@@ -146,6 +146,8 @@ function folderChapterNumber(path: string): string | undefined {
 }
 
 export function findChapterUploadIdentity(db: DatabaseSync, manifest: PackageManifest): CatalogEntry | undefined {
+  const storedWork = db.prepare('SELECT entry FROM works WHERE id=?').get(workId(manifest.identity)) as { entry: string } | undefined;
+  if (storedWork && JSON.parse(storedWork.entry).metadata.identity.novelId !== manifest.identity.novelId) throw problem(409, 'Chapter source novel ID does not match its registered work');
   const recovered = folderChapterNumber(manifest.identity.chapterPath);
   const declared = normalizedChapterNumber(manifest.chapter.chapterNumber);
   if (recovered !== undefined && manifest.chapter.chapterNumber != null && recovered !== declared) throw problem(400, 'Folder chapter identity does not match its chapter number');

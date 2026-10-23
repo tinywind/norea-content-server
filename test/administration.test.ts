@@ -37,8 +37,8 @@ test('single-root scan registers current chapter files without plugins and prese
     const headers = await s.admin();
     assert.deepEqual((await s.app.inject({ url: '/api/v1/admin/plugins', headers })).json(), { items: [] });
     const body = '<p>Original chapter</p>';
-    const source = join(s.original, 'contents/removed-source/Removed/1-First'); await mkdir(source, { recursive: true });
-    await writeFile(join(source, '..', 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'removed-source', novelPath: '/gone' }, novel: { name: 'Removed work', isLocal: false, author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null }, cover: null }));
+    const source = join(s.original, 'contents/removed-source/Removed/1'); await mkdir(source, { recursive: true });
+    await writeFile(join(source, '..', 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'removed-source', novelId: 'Removed', novelPath: '/gone' }, novel: { name: 'Removed work', isLocal: false, author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null }, cover: null }));
     await writeFile(join(source, 'content.html'), body);
     const started = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers });
     assert.equal(started.statusCode, 202, started.body);
@@ -84,11 +84,11 @@ test('manual scans aggregate reused results and full inspection refreshes edited
   const s = await setup();
   try {
     const headers = await s.admin();
-    const work = join(s.dataDir, 'contents/example/Work'); const chapter = join(work, '1-First');
+    const work = join(s.dataDir, 'contents/example/Work'); const chapter = join(work, '1');
     await mkdir(chapter, { recursive: true });
-    await writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelPath: '/work' }, novel: { name: 'Work' } }));
+    await writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelId: 'Work', novelPath: '/work' }, novel: { name: 'Work' } }));
     await writeFile(join(chapter, 'content.html'), '<p>Saved chapter</p>');
-    await mkdir(join(work, '2-Unsupported', 'loose-media'), { recursive: true });
+    await mkdir(join(work, '2', 'loose-media'), { recursive: true });
     const scan = async (full: boolean) => {
       const started = await s.app.inject({ method: 'POST', url: '/api/v1/admin/storage/scan', headers, payload: { full } });
       assert.equal(started.statusCode, 202, started.body);
@@ -188,9 +188,9 @@ test('in-place indexing does not cause repeated change-driven scans', async () =
   const s = await setup();
   try {
     const headers = await s.admin();
-    const work = join(s.dataDir, 'contents/example/Work'); const chapter = join(work, '1-First');
+    const work = join(s.dataDir, 'contents/example/Work'); const chapter = join(work, '1');
     await mkdir(chapter, { recursive: true });
-    await writeFile(join(work, 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/work' }, novel: { name: 'Work', author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }));
+    await writeFile(join(work, 'novel.json'), JSON.stringify({ schemaVersion: 1, identity: { pluginId: 'example', novelId: 'Work', novelPath: '/work' }, novel: { name: 'Work', author: null, artist: null, cover: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }));
     await writeFile(join(chapter, 'content.html'), '<p>Saved chapter</p>');
     const response = await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload: { mode: 'changes', intervalMinutes: 15 } });
     assert.equal(response.statusCode, 200);
@@ -212,9 +212,9 @@ test('filesystem events inspect only the changed work and reconcile removed chap
     const headers = await s.admin();
     for (const name of ['First', 'Other']) {
       const work = join(s.dataDir, 'contents/example', name);
-      await mkdir(join(work, '1-One'), { recursive: true });
-      await writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelPath: '/' + name }, novel: { name } }));
-      await writeFile(join(work, '1-One/content.html'), '<p>Original chapter</p>');
+      await mkdir(join(work, '1'), { recursive: true });
+      await writeFile(join(work, 'novel.json'), JSON.stringify({ identity: { pluginId: 'example', novelId: name, novelPath: '/' + name }, novel: { name } }));
+      await writeFile(join(work, '1/content.html'), '<p>Original chapter</p>');
     }
     const waitForJob = async (count: number) => {
       for (let i = 0; i < 200; i++) {
@@ -226,7 +226,7 @@ test('filesystem events inspect only the changed work and reconcile removed chap
     };
     await s.app.inject({ method: 'PATCH', url: '/api/v1/admin/storage', headers, payload: { mode: 'changes', intervalMinutes: 15 } });
     assert.equal((await waitForJob(1)).summary.registered, 4);
-    const chapter = join(s.dataDir, 'contents/example/First/1-One');
+    const chapter = join(s.dataDir, 'contents/example/First/1');
     await writeFile(join(chapter, 'content.html'), '<p>Edited chapter body</p>');
     const changed = await waitForJob(2);
     assert.equal(changed.summary.scanned, 2); assert.equal(changed.summary.registered, 1);

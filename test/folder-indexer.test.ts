@@ -26,7 +26,7 @@ async function fixture() {
   await mkdir('.tmp', { recursive: true });
   const temp = await mkdtemp(resolve('.tmp/folder-index-'));
   const dataDir = join(temp, 'server');
-  const directory = join(dataDir, 'contents/example/Book-book/1-First');
+  const directory = join(dataDir, 'contents/example/book/1');
   await mkdir(directory, { recursive: true });
   await writeFile(join(directory, '..', 'novel.json'), JSON.stringify(workMetadata()));
   await writeFile(join(directory, 'content.html'), '\ufeff<p>norea-media://reader-asset/prose</p>\r\n<img src="norea-media://reader-asset/a.png">');
@@ -40,7 +40,7 @@ async function fixture() {
 }
 
 function workMetadata() {
-  return { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/real/book?lang=ko' },
+  return { schemaVersion: 1, identity: { pluginId: 'example', novelId: 'book', novelPath: '/real/book?lang=ko' },
     novel: { name: 'Portable Book', author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false },
     cover: { fileName: 'cover.png', contentType: 'image/png' }, chapters: {} };
 }
@@ -301,27 +301,27 @@ test('missing or invalid work metadata never infers identities from folders or o
   } finally { await f.close(); }
 });
 
-test('duplicate numbers and unfinished bodies remain unavailable within an exact work', async () => {
+test('noncanonical chapter numbers and unfinished bodies are skipped within an exact work', async () => {
   const f = await fixture();
   try {
-    await cp(f.directory, join(f.directory, '..', '1-Duplicate'), { recursive: true });
-    const incomplete = join(f.directory, '..', '2-Incomplete'); await mkdir(incomplete);
+    await cp(f.directory, join(f.directory, '..', '1.0'), { recursive: true });
+    const incomplete = join(f.directory, '..', '2'); await mkdir(incomplete);
     await writeFile(join(incomplete, 'content.html'), 'partial'); await writeFile(join(incomplete, 'content.html.part'), 'partial');
-    const result = await f.run(); assert.equal(result.registered, 1); assert.equal(result.skipped, 3);
-    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
+    const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.skipped, 2);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
   } finally { await f.close(); }
 });
 
-test('recovers distinct local files with the same chapter number without rewriting either file', async () => {
+test('recovers distinct local chapter sequences without rewriting their files', async () => {
   const f = await fixture();
   try {
     const directory = join(f.dataDir, 'contents/local/local');
     const metadata = workMetadata();
-    metadata.identity = { pluginId: 'local', novelPath: 'local' };
+    metadata.identity = { pluginId: 'local', novelId: 'local', novelPath: 'local' };
     metadata.novel.isLocal = true;
     await mkdir(directory, { recursive: true });
     await writeFile(join(directory, 'novel.json'), JSON.stringify(metadata));
-    for (const name of ['1-First', '1-Second']) {
+    for (const name of ['1', '2']) {
       await mkdir(join(directory, name));
       await writeFile(join(directory, name, 'content.html'), `<p>${name}</p>`);
     }
@@ -329,7 +329,7 @@ test('recovers distinct local files with the same chapter number without rewriti
     await f.run();
     const entries = (f.db.prepare("SELECT entry FROM chapters WHERE json_extract(entry,'$.manifest.identity.pluginId')='local' ORDER BY directory").all() as { entry: string }[])
       .map(row => JSON.parse(row.entry) as CatalogEntry);
-    assert.deepEqual(entries.map(entry => entry.manifest.identity.chapterPath), ['local-folder:1-First', 'local-folder:1-Second']);
+    assert.deepEqual(entries.map(entry => entry.manifest.identity.chapterPath), ['local-folder:1', 'local-folder:2']);
     assert.equal((await f.run()).registered, 0);
     assert.deepEqual(await snapshot(directory), before);
   } finally { await f.close(); }
@@ -346,17 +346,17 @@ test('remote media and ambiguous body formats are skipped without losing work me
   } finally { await f.close(); }
 });
 
-test('a newly duplicated number disables a previously indexed folder until resolved', async () => {
+test('a noncanonical number cannot displace an indexed canonical chapter folder', async () => {
   const f = await fixture();
   try {
     await f.run();
     const first = stored(f);
-    const duplicate = join(f.directory, '..', '1-Duplicate');
+    const duplicate = join(f.directory, '..', '1.0');
     await cp(f.directory, duplicate, { recursive: true });
-    assert.equal((await f.run()).skipped, 2);
-    assert.equal(completeChapter(f.db, f.dataDir, first.id), undefined);
+    assert.equal((await f.run()).skipped, 1);
+    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
     await rm(duplicate, { recursive: true });
-    assert.equal((await f.run()).registered, 1);
+    assert.equal((await f.run()).registered, 0);
     assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
   } finally { await f.close(); }
 });
@@ -365,7 +365,8 @@ test('text-only and PDF folders need no media manifest and preserve title hyphen
   const f = await fixture();
   try {
     await rm(f.directory, { recursive: true });
-    for (const [name, body] of [['2-Title-with-hyphens', 'content.html'], ['10-Tenth', 'content.pdf']]) {
+    await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify({ ...workMetadata(), chapters: { '2': 'Title-with-hyphens', '10': 'Tenth' } }));
+    for (const [name, body] of [['2', 'content.html'], ['10', 'content.pdf']]) {
       const directory = join(f.directory, '..', name); await mkdir(directory); await writeFile(join(directory, body), body === 'content.pdf' ? '%PDF-1.4\n%%EOF' : '<p>Text</p>');
     }
     assert.equal((await f.run()).registered, 3, JSON.stringify(f.items));
@@ -408,9 +409,9 @@ test('incremental scans discover new entries and refresh only the changed curren
   const f = await fixture();
   try {
     await f.run(); const first = stored(f);
-    const second = join(f.directory, '..', '0-New'); await mkdir(second); await writeFile(join(second, 'content.html'), '<p>New</p>');
+    const second = join(f.directory, '..', '0'); await mkdir(second); await writeFile(join(second, 'content.html'), '<p>New</p>');
     const newWork = join(f.dataDir, 'contents/example/Another'); await mkdir(newWork);
-    await writeFile(join(newWork, 'novel.json'), JSON.stringify({ ...workMetadata(), identity: { pluginId: 'example', novelPath: '/another' } }));
+    await writeFile(join(newWork, 'novel.json'), JSON.stringify({ ...workMetadata(), identity: { pluginId: 'example', novelId: 'Another', novelPath: '/another' } }));
     const originalOpen = yauzl.open;
     const archives = t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => originalOpen(...args));
     const result = await f.run(); assert.equal(result.registered, 2); assert.equal(result.unchanged, 2); assert.equal(archives.mock.callCount(), 0);
@@ -453,7 +454,7 @@ test('same-size source changes refresh the current token even when the modificat
 test('current chapter directory lookups use an index for large filesystem inventories', async () => {
   const f = await fixture();
   try {
-    const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT entry FROM chapters WHERE directory=?').all('contents/example/work/1-First') as { detail: string }[];
+    const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT entry FROM chapters WHERE directory=?').all('contents/example/work/1') as { detail: string }[];
     assert.ok(plan.some(row => /USING INDEX sqlite_autoindex_chapters_/.test(row.detail)), JSON.stringify(plan));
     assert.ok(plan.every(row => !/SCAN chapters/.test(row.detail)));
   } finally { await f.close(); }

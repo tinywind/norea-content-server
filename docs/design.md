@@ -42,7 +42,7 @@ content that no participating device has acquired and uploaded.
 - Wait for the complete body and required assets before producing and uploading
   a ZIP package. Do not synchronize an acquisition that is still incomplete.
 - Use cross-device content identities instead of local database row IDs.
-- Preserve Norea's existing readable plugin/work/chapter folder structure.
+- Share the app's plugin ID, source novel ID, and chapter number directories.
   Accept the existing plugin ID collision limitation across distribution sources.
 
 A public source repository does not determine the deployed server's network
@@ -133,12 +133,14 @@ Local numeric row IDs remain device-specific. Matching plugin IDs and paths from
 different distributions can collide; this limitation is explicitly accepted for
 the intended personal and small-server use.
 
-Preserve the current readable storage layout: plugin ID, work name/path, then
-chapter number/name. Users must remain able to find and open a work or chapter
-directly in the filesystem. Do not replace these directories with hash-only names
-or migrate existing folders for synchronization. Canonical metadata digests identify
-revisions within the readable directory hierarchy. Packages
-carry original identity fields separately from sanitized filesystem paths.
+Store original files under `contents/<pluginId>/<novelId>/<chapter-number>/`
+on both the app and server. The source plugin supplies the literal novel ID.
+Titles remain in metadata; changing a title does not rename a directory.
+Chapter directories use canonical numeric notation, including fractional numbers,
+or the chapter's positive position when no source number exists.
+Reject unsafe IDs, ID changes for an existing work, and directory collisions.
+Metadata digests identify API records and revisions without becoming folder names.
+Only the current layout is supported; existing folders are never migrated.
 
 For local imports, the original file's SHA-256 digest detects identical imported
 files. A work and its extracted chapters also need identities that survive
@@ -513,7 +515,7 @@ credentials remain in stored repository and plugin URLs and are visible to
 authenticated console administrators.
 Repository inventory is independent of folder scanning. Existing source IDs,
 including multi-source instances, come from local content metadata or package
-manifests. IDs and readable folder rules stay unchanged.
+manifests. Their literal plugin and novel IDs determine work directories.
 
 The sole content root is `<NOREA_DATA_DIR>/contents`, selected at server startup.
 The console displays it but cannot add, select, edit, or detach content roots.
@@ -538,11 +540,13 @@ Work identity and title come exclusively from `novel.json`. Missing or invalid
 metadata skips the whole work; folder names, cover sidecars, and old databases
 cannot establish a work identity. No plugin or source-site requests are made.
 
-Discover actual chapters from `<number>-<title>` folders, splitting at the first
-hyphen. Already indexed directories retain their original chapter identity.
-New folders use `norea-folder:<number>` within that exact
-work. Synthetic work identities are rejected. Duplicate chapter numbers,
-conflicting bodies, incomplete media, and changing files are skipped.
+The work directory must match `identity.pluginId` and `identity.novelId`.
+Discover chapters from numeric-only folders such as `1` or `1.5`.
+Chapter titles come from the work's chapter map, falling back to the number.
+Already indexed directories retain their original chapter identity.
+New folders use `norea-folder:<number>` within that exact work.
+Synthetic work identities, noncanonical numbers, conflicting bodies,
+incomplete media, and changing files are skipped.
 
 Metadata-only works and covers can be registered independently. A removed source
 work or plugin does not prevent importing a complete local copy with valid work
@@ -597,7 +601,7 @@ Each work directory stores this metadata-only document:
 ```json
 {
   "schemaVersion": 1,
-  "identity": { "pluginId": "example", "novelPath": "/novel/123456" },
+  "identity": { "pluginId": "example", "novelId": "123456", "novelPath": "/novel/123456" },
   "novel": {
     "name": "Example work",
     "author": null,
@@ -619,7 +623,12 @@ Each work directory stores this metadata-only document:
 }
 ```
 
-Readers require only `identity.pluginId`, `identity.novelPath`, and `novel.name`.
+Readers require `identity.pluginId`, `identity.novelId`, `identity.novelPath`,
+and `novel.name`. Plugin IDs use lowercase kebab-case. Storage IDs are
+well-formed Unicode with at most 240 UTF-8 bytes. They cannot contain separators,
+Windows filename punctuation, C0 controls, reserved device names, leading dot or
+space, trailing dot or space, or unfinished suffixes (`.tmp`, `.bak`, `.part`,
+`.partial`, `.norea-sync-backup`). IDs are rejected without sanitization.
 An absent `schemaVersion` means 1. Missing text, rating, and cover fields default
 to null; `isLocal` defaults to false. Unknown fields are ignored and omitted when
 writing or transferring metadata. Present supported fields must have valid types.

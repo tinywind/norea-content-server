@@ -12,7 +12,7 @@ import type { NovelMetadataV1 } from '../src/works.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 function metadata(pluginId: string, name: string): NovelMetadataV1 {
-  return { schemaVersion: 1, identity: { pluginId, novelPath: `/books/${name}` }, novel: { name, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null, chapters: {} };
+  return { schemaVersion: 1, identity: { pluginId, novelId: name, novelPath: `/books/${name}` }, novel: { name, author: 'Writer', artist: null, summary: 'Summary', status: null, rating: null, genres: null, isLocal: false }, cover: null, chapters: {} };
 }
 async function fixture(anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });
@@ -24,11 +24,11 @@ async function fixture(anonymousRead = true) {
     const response = await app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers, payload: value });
     assert.equal(response.statusCode, 200, response.body); return response.json();
   };
-  const putChapter = async (work: NovelMetadataV1, path: string, position: number) => {
+  const putChapter = async (work: NovelMetadataV1, path: string, position: number, chapterNumber = String(position)) => {
     const id = digest(JSON.stringify([work.identity.pluginId, work.identity.novelPath]));
     if ((await app.inject({ url: `/api/v1/works/${id}`, headers })).statusCode === 404) await putWork(work);
     const bytes = Buffer.from('Chapter content');
-    const manifest: PackageManifest = { packageVersion: 1, layout: 'chapter-files', identity: { ...work.identity, chapterPath: path }, novel: { name: work.novel.name, isLocal: work.novel.isLocal }, chapter: { name: path, position, chapterNumber: String(position), contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: bytes.length, modifiedAt: 1 }] };
+    const manifest: PackageManifest = { packageVersion: 1, layout: 'chapter-files', identity: { ...work.identity, chapterPath: path }, novel: { name: work.novel.name, isLocal: work.novel.isLocal }, chapter: { name: path, position, chapterNumber, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: bytes.length, modifiedAt: 1 }] };
     const form = new FormData();
     form.append('metadata', JSON.stringify(manifest));
     form.append('content.html', new Blob([bytes]), 'content.html');
@@ -102,7 +102,7 @@ test('pages live chapters by position and id and resolves exact identities witho
   try {
     const work = metadata('source-a', 'Alpha'); const stored = await f.putWork(work);
     const last = await f.putChapter(work, '/chapter/last?x=1&y=2', 8);
-    const first = await f.putChapter(work, '/chapter/first', 1); const tied = await f.putChapter(work, '/chapter/tied', 1);
+    const first = await f.putChapter(work, '/chapter/first', 1); const tied = await f.putChapter(work, '/chapter/tied', 1, '2');
     const ordered = [first, tied].sort((a, b) => a.id.localeCompare(b.id));
     const summarize = (entry: typeof first) => ({ id: entry.id, chapterPath: entry.manifest.identity.chapterPath, position: entry.manifest.chapter.position, name: entry.manifest.chapter.name, chapterNumber: entry.manifest.chapter.chapterNumber, page: entry.manifest.chapter.page, contentType: entry.manifest.chapter.contentType });
     const page = (await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters?limit=1`)).json();
@@ -133,9 +133,7 @@ test('resolves folder chapters only within the exact canonical work', async () =
     assert.deepEqual((await lookup()).json(), stored);
     query.set('novelPath', '/different'); assert.equal((await lookup()).statusCode, 404);
     query.set('novelPath', work.identity.novelPath);
-    await f.putChapter(work, '/chapter/other', 7);
-    assert.equal((await lookup()).statusCode, 409);
-    const exact = await f.putChapter(work, '/chapter/seven', 7);
+    const exact = await f.putChapter(work, '/chapter/seven', 8);
     assert.deepEqual((await lookup()).json(), exact);
     await f.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${exact.id}`, headers: f.headers });
     assert.equal((await lookup()).statusCode, 404);

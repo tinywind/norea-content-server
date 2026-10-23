@@ -16,7 +16,7 @@ const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
 const manifestSchema = { type: 'object', required: ['packageVersion','layout','identity','novel','chapter','bodyPath','files'], properties: {
   layout: { type: 'string', enum: ['chapter-files'] },
-  packageVersion: { const: 1, type: 'integer' }, identity: { type: 'object', required: ['pluginId','novelPath','chapterPath'], properties: { pluginId: string, novelPath: string, chapterPath: string } },
+  packageVersion: { const: 1, type: 'integer' }, identity: { type: 'object', required: ['pluginId','novelId','novelPath','chapterPath'], properties: { pluginId: string, novelId: string, novelPath: string, chapterPath: string } },
   novel: { type: 'object', required: ['name','isLocal'], properties: { name: string, author: { type: ['string','null'] }, summary: { type: ['string','null'] }, isLocal: { type: 'boolean' } } },
   chapter: { type: 'object', required: ['name','position','contentType','page'], properties: { name: string, position: { type: 'number' }, chapterNumber: { type: ['string','null'] }, contentType: { type: 'string', enum: ['html','text','markdown','pdf'] }, page: string } },
   bodyPath: string, files: { type: 'array', items: { type: 'object', required: ['path','size','modifiedAt'], properties: { path: string, size: { type: 'integer' }, modifiedAt: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER } } } },

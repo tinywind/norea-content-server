@@ -6,11 +6,11 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { canonicalize } from 'json-canonicalize';
 import { authenticate, authenticateDevice } from './auth.ts';
 import { problem, transaction } from './db.ts';
-import { digest, recordEntry, safeArchivePath, type CatalogEntry } from './packages.ts';
+import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
 
 export interface NovelMetadataV1 {
   schemaVersion: 1;
-  identity: { pluginId: string; novelPath: string };
+  identity: { pluginId: string; novelId: string; novelPath: string };
   novel: {
     name: string;
     author: string | null;
@@ -50,6 +50,7 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
   }
   const identity = record(value.identity);
   text(identity.pluginId); text(identity.novelPath);
+  validateStorageIdentity({ pluginId: identity.pluginId, novelId: identity.novelId });
   if ((identity.novelPath as string).startsWith('norea-folder:')) throw problem(400, 'work metadata: source work identity required');
   if (/^(?:https?:)?\/\//i.test(identity.novelPath as string)) throw problem(400, 'work metadata: work identity must exclude the base URL');
   const novel = record(value.novel);
@@ -60,7 +61,7 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
   const chapters: NovelMetadataV1['chapters'] = {};
   if (value.chapters !== undefined) {
     for (const [number, name] of Object.entries(record(value.chapters))) {
-      if (!Number.isFinite(Number(number)) || String(Number(number)) !== number) throw problem(400, 'work metadata: invalid chapter number');
+      if (!/^\d+(?:\.\d+)?$/.test(number) || !Number.isFinite(Number(number)) || String(Number(number)) !== number) throw problem(400, 'work metadata: invalid chapter number');
       text(name);
       chapters[number] = name as string;
     }
@@ -77,7 +78,7 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
   const parsed = value as unknown as NovelMetadataV1;
   return {
     schemaVersion: 1,
-    identity: { pluginId: parsed.identity.pluginId, novelPath: parsed.identity.novelPath },
+    identity: { pluginId: parsed.identity.pluginId, novelId: parsed.identity.novelId, novelPath: parsed.identity.novelPath },
     novel: {
       name: parsed.novel.name, author: parsed.novel.author ?? null,
       artist: parsed.novel.artist ?? null, summary: parsed.novel.summary ?? null, status: parsed.novel.status ?? null,
@@ -143,6 +144,9 @@ function discoverCover(directory: string, preferred: NovelMetadataV1['cover']): 
   return fileName ? { fileName, contentType: fileName === preferred?.fileName ? preferred.contentType : coverContentType(fileName) } : preferred;
 }
 export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1, restore = false): WorkEntry {
+  if (directory !== workDirectory(db, metadata)) throw problem(409, 'Work folder does not match its source IDs');
+  const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, metadataWorkId(metadata));
+  if (collision) throw problem(409, 'Work directory is already assigned');
   metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover) };
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(409, 'Work was deleted from the server');
@@ -170,10 +174,11 @@ export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
       if (!work.isDirectory() || work.isSymbolicLink()) continue;
       const directory = join('contents', source.name, work.name); const file = join(dataDir, directory, 'novel.json');
       if (!existsSync(file)) continue;
-      let metadata: NovelMetadataV1;
-      try { metadata = readNovelMetadata(file); } catch { continue; }
-      if (db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(metadataWorkId(metadata))) continue;
-      valid.add(cacheWork(db, dataDir, directory, metadata).id);
+      try {
+        const metadata = readNovelMetadata(file);
+        if (db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(metadataWorkId(metadata))) continue;
+        valid.add(cacheWork(db, dataDir, directory, metadata).id);
+      } catch { continue; }
     }
   }
   transaction(db, () => {
@@ -190,13 +195,12 @@ export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
   });
 }
 function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
-  const id = metadataWorkId(metadata); const existing = rowFor(db, id); if (existing) return existing.directory;
+  const id = metadataWorkId(metadata);
+  const directory = join('contents', metadata.identity.pluginId, metadata.identity.novelId);
+  const existing = rowFor(db, id);
+  if (existing && existing.directory !== directory) throw problem(409, 'Stored work source novel ID changed');
   const chapter = db.prepare('SELECT directory FROM chapters WHERE work_id=? LIMIT 1').get(id) as { directory: string } | undefined;
-  if (chapter) return dirname(chapter.directory);
-  const segment = (value: string, fallback: string) => value.replace(/[<>:"/\\|?*\x00-\x1f]/g, '-').replace(/[. ]+$/g, '').slice(0, 80) || fallback;
-  const source = segment(metadata.identity.pluginId, 'source'); const name = segment(metadata.novel.name, 'work');
-  const directory = join('contents', safeArchivePath(source) ? source : 'source', `${name}-${id.slice(0, 16)}`);
-  if (!safeArchivePath(directory.split('\\').join('/'))) throw problem(400, 'Invalid readable work directory');
+  if (chapter && dirname(chapter.directory) !== directory) throw problem(409, 'Stored chapters belong to another work directory');
   return directory;
 }
 export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false): WorkEntry {
@@ -209,10 +213,14 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
   const file = join(dataDir, directory, 'novel.json');
   let current: unknown;
   if (existsSync(file)) {
-    const bytes = readBytes(file, metadataByteLimit);
-    try { current = JSON.parse(bytes.toString('utf8')); } catch { current = undefined; }
+    let stored: NovelMetadataV1;
+    try {
+      current = JSON.parse(readBytes(file, metadataByteLimit).toString('utf8'));
+      stored = parseNovelMetadata(current);
+    } catch { throw problem(409, 'Existing work metadata must be valid before it can be replaced'); }
+    if (metadataWorkId(stored) !== id || stored.identity.novelId !== metadata.identity.novelId) throw problem(409, 'Work directory belongs to another source identity');
+    metadata.chapters = { ...stored.chapters, ...metadata.chapters };
   }
-  if (current !== undefined) metadata.chapters = { ...parseNovelMetadata(current).chapters, ...metadata.chapters };
   parseNovelMetadata(metadata);
   if (current === undefined || canonicalize(current) !== canonicalize(metadata)) atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
   return cacheWork(db, dataDir, directory, metadata, restore);

@@ -33,9 +33,12 @@ and the design capabilities that remain unimplemented.
 
 ## Wire contract version 2
 
-All JSON uses camelCase. An Identity is `{pluginId, novelPath, chapterPath}`.
+All JSON uses camelCase. An Identity is `{pluginId, novelId, novelPath, chapterPath}`.
 The canonical identity string is `JSON.stringify([pluginId, novelPath, chapterPath])`.
 An opaque server chapter ID can be a SHA-256 of this string; it is not a folder name.
+The source plugin provides `novelId`, a required literal portable directory ID.
+App and server files use `contents/<pluginId>/<novelId>/<chapter-number>/`;
+titles remain in metadata. Unsafe IDs and directory collisions are rejected.
 
 A PackageManifest is:
 
@@ -43,7 +46,7 @@ A PackageManifest is:
 interface PackageManifest {
   packageVersion: 1;
   layout: "chapter-files";
-  identity: { pluginId: string; novelPath: string; chapterPath: string };
+  identity: { pluginId: string; novelId: string; novelPath: string; chapterPath: string };
   novel: { name: string; author?: string | null; summary?: string | null; isLocal: boolean };
   chapter: { name: string; position: number; chapterNumber?: string | null; contentType: "html" | "text" | "markdown" | "pdf"; page: string };
   bodyPath: string;

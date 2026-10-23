@@ -22,12 +22,12 @@ const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', '
   id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf'] },
 } };
 const chapterChangeSchema = { type: 'object', required: ['identity', 'deleted', 'sequence'], properties: {
-  identity: { type: 'object', required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelPath: text, chapterPath: text } },
+  identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelId: text, novelPath: text, chapterPath: text } },
   deleted: { type: 'boolean' }, sequence: count,
 } };
 const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identity', 'novel', 'hasCover', 'chapterCount'], properties: {
   id: text, sequence: count,
-  identity: { type: 'object', required: ['pluginId', 'novelPath'], properties: { pluginId: text, novelPath: text } },
+  identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath'], properties: { pluginId: text, novelId: text, novelPath: text } },
   novel: { type: 'object', required: ['name', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal'], properties: { name: text, author: nullableText, artist: nullableText, summary: nullableText, status: nullableText, rating: { type: ['number', 'null'], minimum: 0, maximum: 5 }, genres: nullableText, isLocal: { type: 'boolean' } } },
   hasCover: { type: 'boolean' }, chapterCount: count,
 } };

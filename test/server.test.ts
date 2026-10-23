@@ -14,7 +14,7 @@ async function setup(anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(join('.tmp', 'test-'));
   const db = openDatabase(dataDir);
-  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'example', novelPath: '/book/one' }, novel: { name: 'Example book', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }); db.close();
+  saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'example', novelId: 'one', novelPath: '/book/one' }, novel: { name: 'Example book', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }); db.close();
   const app = await buildApp({ dataDir, anonymousRead });
   return { app, dataDir, device: () => deviceHeaders(app), admin: () => consoleHeaders(app, dataDir), close: async () => { await app.close(); await rm(dataDir, { recursive: true }); } };
 }
@@ -22,7 +22,7 @@ async function setup(anonymousRead = true) {
 const multipartType = 'multipart/form-data; boundary=norea-test';
 async function chapterFiles(body = '<p>Chapter one</p>', change: (manifest: any) => void = () => {}) {
   const bytes = Buffer.from(body);
-  const manifest = { packageVersion: 1, layout: 'chapter-files', identity: { pluginId: 'example', novelPath: '/book/one', chapterPath: '/chapter/one' }, novel: { name: 'Example book', isLocal: false }, chapter: { name: 'First chapter', position: 1, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: bytes.length, modifiedAt: 1 }] };
+  const manifest = { packageVersion: 1, layout: 'chapter-files', identity: { pluginId: 'example', novelId: 'one', novelPath: '/book/one', chapterPath: '/chapter/one' }, novel: { name: 'Example book', isLocal: false }, chapter: { name: 'First chapter', position: 1, contentType: 'html', page: '1' }, bodyPath: 'content.html', files: [{ path: 'content.html', size: bytes.length, modifiedAt: 1 }] };
   change(manifest);
   return Buffer.concat([
     Buffer.from('--norea-test\r\nContent-Disposition: form-data; name="metadata"\r\n\r\n' + JSON.stringify(manifest) + '\r\n'),
