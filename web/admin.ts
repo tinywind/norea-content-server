@@ -7,10 +7,10 @@ interface Plugin { id: string; name: string; url: string; enabled: boolean; upda
 interface StorageSettings { path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; removed: number; scanned: number; cancelled: boolean } }
 interface JobItem { path: string; sourceId?: string; status: string; reason?: string; chapterId?: string; workId?: string; revision?: string }
-interface Entry { id: string; revision: string; fileBytes: number; deleted: boolean; sequence: number; manifest: { layout: 'chapter-files'; identity: { pluginId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; modifiedAt: number }[] } }
+interface Entry { id: string; revision: string; fileBytes: number; deleted: boolean; sequence: number; manifest: { layout: 'chapter-files'; identity: { pluginId: string; novelId: string; novelPath: string; chapterPath: string }; novel: { name: string; author?: string | null; summary?: string | null }; chapter: { name: string; position: number; contentType: string }; files: { path: string; size: number; modifiedAt: number }[] } }
 interface NovelMetadata {
   schemaVersion: 1;
-  identity: { pluginId: string; novelPath: string };
+  identity: { pluginId: string; novelId: string; novelPath: string };
   novel: { name: string; author: string | null; artist: string | null; summary: string | null; status: string | null; rating: number | null; genres: string | null; isLocal: boolean };
   cover: { fileName: string; contentType: string | null } | null;
   chapters: Record<string, string>;
