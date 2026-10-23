@@ -16,6 +16,7 @@ const schema = `
     CREATE TABLE IF NOT EXISTS works (id TEXT PRIMARY KEY, directory TEXT UNIQUE NOT NULL, entry TEXT NOT NULL, fingerprint TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS work_changes (sequence INTEGER PRIMARY KEY AUTOINCREMENT, work_id TEXT NOT NULL, entry TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS chapters_path ON chapters(path);
+    CREATE INDEX IF NOT EXISTS chapters_directory_casefold ON chapters(lower(directory));
     CREATE INDEX IF NOT EXISTS works_catalog_name ON works(json_extract(entry,'$.metadata.novel.name'),id);
     CREATE INDEX IF NOT EXISTS works_catalog_source ON works(json_extract(entry,'$.metadata.identity.pluginId'),json_extract(entry,'$.metadata.novel.name'),id);
     CREATE INDEX IF NOT EXISTS chapters_catalog_work ON chapters(work_id,deleted_at,json_extract(entry,'$.manifest.chapter.position'),id);

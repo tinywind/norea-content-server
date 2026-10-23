@@ -59,6 +59,18 @@ function stored(f: Awaited<ReturnType<typeof fixture>>): CatalogEntry {
   return JSON.parse((f.db.prepare('SELECT entry FROM chapters').get() as { entry: string }).entry);
 }
 
+test('folder collision checks use an index as the recovered catalog grows', async () => {
+  const f = await fixture();
+  try {
+    await f.run();
+    const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT id FROM chapters WHERE lower(directory)=lower(?) AND id<>?')
+      .all('contents/EXAMPLE/BOOK/1', 'another-identity') as { detail: string }[];
+    assert.ok(plan.some(row => row.detail.startsWith('SEARCH chapters USING INDEX')), JSON.stringify(plan));
+    assert.equal(f.db.prepare('SELECT id FROM chapters WHERE lower(directory)=lower(?) AND id<>?')
+      .get('contents/EXAMPLE/BOOK/1', 'another-identity')?.id, stored(f).id);
+  } finally { await f.close(); }
+});
+
 async function download(f: Awaited<ReturnType<typeof fixture>>, entry: CatalogEntry, path: string): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of chapterFileStream(f.db, f.dataDir, entry.id, entry.revision, path).open()) chunks.push(Buffer.from(chunk));
