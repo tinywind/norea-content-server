@@ -193,7 +193,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       aborted(options.signal);
       await report({ path: metadataPath, sourceId, status: 'skipped', reason: (error as Error).message }); return;
     }
-    const folders = [];
+    const folders: typeof entries = [];
     for (const entry of entries) {
       if (entry.name === 'novel.json' || isCoverFile(entry.name) || entry.name === '.nomedia') continue;
       if (!entry.isDirectory() || entry.isSymbolicLink() || unfinished(entry.name)) {
@@ -203,30 +203,36 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     }
     folders.sort((a, b) => a.name.localeCompare(b.name, 'en', { numeric: true }));
     const isLocal = value.identity.pluginId === 'local';
-    for (const folder of folders) {
+    const indexChapter = async (folder: typeof folders[number]) => {
       aborted(options.signal);
       const path = join(directory, folder.name);
       const key = canonicalize([value.identity, folder.name]);
       const saved = checkpoint(path);
       const published = chapters.get(relative(dataDir, path));
-      if (!published?.path && !inspect(path) && saved?.signature === key) { await report(JSON.parse(saved.entry) as FolderIndexItem, true); continue; }
+      if (!published?.path && !inspect(path) && saved?.signature === key) { await report(JSON.parse(saved.entry) as FolderIndexItem, true); return; }
       const entry = published ? JSON.parse(published.entry) as CatalogEntry : undefined;
       const number = /^\d+(?:\.\d+)?$/.test(folder.name) && Number.isFinite(Number(folder.name)) && String(Number(folder.name)) === folder.name ? folder.name : undefined;
       if (number === undefined) {
         if (published) unavailable(published);
-        await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must be a canonical nonnegative number' }); continue;
+        await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must be a canonical nonnegative number' }); return;
       }
       const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
       if (entry?.complete && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
-        await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); continue;
+        await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); return;
       }
-      if (exactIdentity) { await process(path, entry!.manifest, key); continue; }
+      if (exactIdentity) { await process(path, entry!.manifest, key); return; }
       const files = await readdir(path);
       await process(path, {
         identity: { ...value.identity, chapterPath: isLocal ? `local-folder:${number}` : `norea-folder:${number}` },
         novel: { name: value.novel.name, author: value.novel.author, summary: value.novel.summary, isLocal: value.novel.isLocal },
         chapter: { name: value.chapters[number] ?? number, chapterNumber: number, position: Number(number), page: '1', contentType: files.includes('content.pdf') ? 'pdf' : 'html' },
       }, key);
+    };
+    for (let offset = 0; offset < folders.length; offset += 4) {
+      aborted(options.signal);
+      // Drain reads before returning so cancellation cannot leave publishers running.
+      const results = await Promise.allSettled(folders.slice(offset, offset + 4).map(indexChapter));
+      for (const result of results) if (result.status === 'rejected') throw result.reason;
     }
   };
   try {

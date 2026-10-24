@@ -59,6 +59,57 @@ function stored(f: Awaited<ReturnType<typeof fixture>>): CatalogEntry {
   return JSON.parse((f.db.prepare('SELECT entry FROM chapters').get() as { entry: string }).entry);
 }
 
+test('inspects four chapter archives concurrently before accepting more work', async t => {
+  const f = await fixture();
+  for (let number = 2; number <= 9; number++) await cp(f.directory, join(f.directory, '..', String(number)), { recursive: true });
+  const open = yauzl.open;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let active = 0;
+  let peak = 0;
+  t.mock.method(yauzl, 'open', ((...args: Parameters<typeof open>) => {
+    active++; peak = Math.max(peak, active);
+    void gate.then(() => { active--; open(...args); });
+  }) as typeof open);
+  const recovery = f.run();
+  try {
+    for (let attempt = 0; attempt < 200 && active < 4; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(active, 4);
+    release();
+    const summary = await recovery;
+    assert.equal(peak, 4);
+    assert.equal(summary.registered, 10);
+    assert.equal(summary.skipped + summary.failed, 0);
+    assert.equal(f.db.prepare('SELECT count(*) AS total FROM chapters WHERE json_extract(entry,\'$.complete\')=1').get()?.total, 9);
+  } finally { release(); await recovery; t.mock.restoreAll(); await f.close(); }
+});
+
+test('cancellation drains concurrent archive inspections before returning', async t => {
+  const f = await fixture();
+  for (let number = 2; number <= 8; number++) await cp(f.directory, join(f.directory, '..', String(number)), { recursive: true });
+  const open = yauzl.open;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let started = 0;
+  t.mock.method(yauzl, 'open', ((...args: Parameters<typeof open>) => {
+    started++;
+    void gate.then(() => { open(...args); });
+  }) as typeof open);
+  const controller = new AbortController();
+  let settled = false;
+  const recovery = f.run({ signal: controller.signal }).finally(() => { settled = true; });
+  try {
+    for (let attempt = 0; attempt < 200 && started < 4; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(started, 4);
+    controller.abort();
+    assert.equal(settled, false);
+    release();
+    assert.equal((await recovery).cancelled, true);
+    assert.equal(started, 4);
+    assert.equal(f.db.prepare('SELECT count(*) AS total FROM chapters').get()?.total, 0);
+  } finally { release(); await recovery; t.mock.restoreAll(); await f.close(); }
+});
+
 test('folder collision checks use an index as the recovered catalog grows', async () => {
   const f = await fixture();
   try {
