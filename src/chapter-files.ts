@@ -127,5 +127,5 @@ export function chapterFileStream(db: DatabaseSync, dataDir: string, id: string,
   if (!existsSync(target)) throw problem(410, 'Chapter file is unavailable');
   const stat = lstatSync(target);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== file.size) throw problem(410, 'Chapter file is unavailable');
-  return { file, open: () => createReadStream(target) };
+  return { file, path: target, open: () => createReadStream(target) };
 }

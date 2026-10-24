@@ -930,3 +930,64 @@ test('media uncompressed byte limits are checked without extracting the archive'
     assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
   } finally { await s.close(); }
 });
+
+test('individual media retrieval preserves healthy assets in an incomplete archive and rejects bad CRCs', async () => {
+  const s = await setup();
+  try {
+    const good = Buffer.from('healthy asset bytes');
+    const broken = Buffer.from('broken asset bytes');
+    const zip = await archive({ 'good.png': good, 'broken.png': broken });
+    zip[zip.indexOf(broken)] ^= 0xff;
+    const media = { version: 1, complete: false, updatedAt: 1, media: { files: [
+      { fileName: 'good.png', path: 'media/good.png', sourceUrl: 'https://source.test/good.png', bytes: 0, status: 'remote', updatedAt: 1 },
+      { fileName: 'broken.png', path: 'media/broken.png', sourceUrl: 'https://source.test/broken.png', bytes: broken.length, status: 'stored', updatedAt: 1 },
+      { fileName: 'missing.png', path: 'media/missing.png', sourceUrl: 'https://source.test/missing.png', bytes: 1, status: 'remote', updatedAt: 1 },
+    ] } };
+    const files = { 'content.html': Buffer.from('original body'), 'manifest.json': Buffer.from(JSON.stringify(media)), 'media.zip': zip };
+    const uploadResponse = await upload(s, files);
+    assert.equal(uploadResponse.statusCode, 200, uploadResponse.body);
+    const entry = uploadResponse.json();
+    assert.equal(entry.complete, false);
+    const request = (name: string) => `/api/v1/chapters/${entry.id}/media?${new URLSearchParams({ revision: entry.revision, fileName: name, sourceUrl: `https://source.test/${name}` })}`;
+    const response = await s.app.inject(request('good.png'));
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.rawPayload, good);
+    assert.equal(response.headers['content-length'], String(good.length));
+    assert.equal((await s.app.inject(request('broken.png'))).statusCode, 410);
+    assert.equal((await s.app.inject(request('missing.png'))).statusCode, 404);
+    assert.deepEqual(await readFile(join(s.dataDir, 'contents/source/work/1/media.zip')), zip);
+    assert.deepEqual(await readFile(join(s.dataDir, 'contents/source/work/1/content.html')), files['content.html']);
+  } finally { await s.close(); }
+});
+
+test('individual media retrieval checks read authorization, revision and exact asset identity', async () => {
+  const s = await setup({ anonymousRead: false });
+  try {
+    const media = { version: 1, complete: true, updatedAt: 1, media: { files: [{ fileName: 'page.png', path: 'media/page.png', sourceUrl: 'epub/images/page.png', bytes: 5, status: 'stored', updatedAt: 1 }] } };
+    const entry = (await upload(s, { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(media)), 'media.zip': await archive({ 'page.png': Buffer.from('image') }) })).json();
+    const query = { revision: entry.revision, fileName: 'page.png', sourceUrl: 'epub/images/page.png' };
+    const url = `/api/v1/chapters/${entry.id}/media?${new URLSearchParams(query)}`;
+    assert.equal((await s.app.inject(url)).statusCode, 401);
+    const allowed = await s.app.inject({ url, headers: s.headers });
+    assert.equal(allowed.statusCode, 200, allowed.body);
+    assert.equal(allowed.body, 'image');
+    for (const changed of [{ revision: '0'.repeat(64) }, { sourceUrl: 'epub/images/other.png' }, { fileName: 'other.png' }]) {
+      assert.equal((await s.app.inject({ url: `/api/v1/chapters/${entry.id}/media?${new URLSearchParams({ ...query, ...changed })}`, headers: s.headers })).statusCode, 404);
+    }
+    assert.equal((await s.app.inject({ url: `/api/v1/chapters/${entry.id}/media?${new URLSearchParams({ ...query, fileName: '../page.png' })}`, headers: s.headers })).statusCode, 400);
+    const console = await consoleHeaders(s.app, s.dataDir);
+    const devices = (await s.app.inject({ url: '/api/v1/admin/devices', headers: console })).json();
+    await s.app.inject({ method: 'PATCH', url: `/api/v1/admin/devices/${devices.items[0].id}`, headers: console, payload: { blocked: true } });
+    assert.equal((await s.app.inject({ url, headers: s.headers })).statusCode, 403);
+  } finally { await s.close(); }
+});
+
+test('individual media retrieval rejects a declared size mismatch', async () => {
+  const s = await setup();
+  try {
+    const media = { version: 1, complete: true, updatedAt: 1, media: { files: [{ fileName: 'page.png', path: 'media/page.png', sourceUrl: 'https://source.test/page.png', bytes: 100, status: 'stored', updatedAt: 1 }] } };
+    const entry = (await upload(s, { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(media)), 'media.zip': await archive({ 'page.png': Buffer.from('short') }) })).json();
+    const response = await s.app.inject(`/api/v1/chapters/${entry.id}/media?${new URLSearchParams({ revision: entry.revision, fileName: 'page.png', sourceUrl: 'https://source.test/page.png' })}`);
+    assert.equal(response.statusCode, 410);
+  } finally { await s.close(); }
+});

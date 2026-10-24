@@ -135,6 +135,17 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   Content-Length is its declared size. The route uses the same read policy as the
   catalog and checks supplied device keys even when anonymous reading is enabled.
   Check each file's size and receive the complete chapter before installing it.
+- `GET /api/v1/chapters/:id/media?revision=<revision>&fileName=<name>&sourceUrl=<source>`
+  returns one declared media asset for selective repair. URL-encode the exact
+  filename and source URL from the device's media manifest. The server requires
+  both to match its manifest, checks archive safety and the selected entry's size
+  and CRC, and returns only that entry's bytes with Content-Length. A healthy asset
+  can be retrieved from an incomplete chapter or an archive with another corrupt
+  asset. Assets are limited to 256 MiB and the configured archive limits also apply.
+  Stale revisions or missing assets return 404; unavailable or corrupt artifacts
+  return 410. This route uses the catalog read policy and preserves every stored
+  file. Clients merge the response into their existing media workspace without
+  replacing the chapter body or valid local assets.
 - Registered devices and console administrators use `DELETE /api/v1/chapters/:id`
   and `POST /api/v1/chapters/:id/restore` to manage shared availability.
   There is no revision selection endpoint. Upload conflict policy controls

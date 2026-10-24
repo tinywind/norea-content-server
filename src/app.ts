@@ -11,6 +11,7 @@ import { registerAdministration, savedAnonymousRead } from './administration.ts'
 import { rebuildWorkIndex, registerWorks } from './works.ts';
 import { registerCatalog } from './catalog.ts';
 import { chapterFileStream, publishChapterFiles } from './chapter-files.ts';
+import { readChapterMediaAsset } from './chapter-media.ts';
 
 const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
@@ -84,6 +85,20 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
     requireRead(request);
     const { file, open } = chapterFileStream(db, dataDir, request.params.id, request.query.revision, request.query.path);
     return reply.header('Content-Length', file.size).header('ETag', `"${request.query.revision}:${file.path}"`).header('X-Content-Type-Options', 'nosniff').type('application/octet-stream').send(open());
+  });
+  app.get<{ Params: { id: string }; Querystring: { revision: string; fileName: string; sourceUrl: string } }>('/api/v1/chapters/:id/media', { schema: {
+    params: idParams,
+    querystring: { type: 'object', additionalProperties: false, required: ['revision', 'fileName', 'sourceUrl'], properties: {
+      revision: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+      fileName: { type: 'string', minLength: 1, maxLength: 255, pattern: '^[A-Za-z0-9._-]+$' },
+      sourceUrl: { type: 'string', minLength: 1, maxLength: 16384 },
+    } },
+  } }, async (request, reply) => {
+    requireRead(request);
+    const { revision, fileName, sourceUrl } = request.query;
+    const body = await readChapterMediaAsset(db, dataDir, request.params.id, revision, fileName, sourceUrl, limits);
+    return reply.header('Content-Length', body.length).header('ETag', `"${revision}:media/${fileName}"`)
+      .header('X-Content-Type-Options', 'nosniff').type('application/octet-stream').send(body);
   });
   const cutoff = Date.now() - (options.trashDays ?? 30) * 86400000;
   for (const row of db.prepare('SELECT id FROM chapters WHERE deleted_at<?').all(cutoff) as { id: string }[]) purgeChapter(db, dataDir, row.id);
