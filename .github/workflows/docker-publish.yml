@@ -1,0 +1,269 @@
+name: Validate and publish Docker image
+
+on:
+  pull_request:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CI: "true"
+  IMAGE_NAME: tinywind0/norea-content-server
+  LOCAL_IMAGE: norea-content-server-ci:${{ github.sha }}
+
+jobs:
+  validate:
+    name: Test and smoke-test the image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    outputs:
+      artifact_id: ${{ steps.image_artifact.outputs.artifact-id }}
+      archive_sha256: ${{ steps.image_archive.outputs.sha256 }}
+      image_config_digest: ${{ steps.image_archive.outputs.image_config_digest }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate a publishing branch name
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+        env:
+          SOURCE_BRANCH: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$SOURCE_BRANCH" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || [[ "$SOURCE_BRANCH" == latest ]]; then
+            echo '::error::A publishing branch must be an exact Docker-compatible tag (for example 0.2 or 0.3), and cannot be named latest. Branch names are never silently rewritten.'
+            exit 1
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 11.25.0
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: |
+          test "$(pnpm --version)" = '11.25.0'
+          pnpm install --frozen-lockfile
+
+      - name: Check types, run tests, and build the console
+        run: |
+          pnpm typecheck
+          pnpm test
+          pnpm build
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --exit-code
+          git diff --cached --exit-code
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the committed image once
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # A Git context excludes generated or untracked files from the test job.
+          context: https://github.com/${{ github.repository }}.git#${{ github.sha }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=norea-content-server-${{ github.event_name == 'pull_request' && 'pr' || 'trusted' }}
+          cache-to: type=gha,mode=max,scope=norea-content-server-${{ github.event_name == 'pull_request' && 'pr' || 'trusted' }}
+
+      - name: Smoke-test capabilities and built console assets
+        run: |
+          set -euo pipefail
+          container_name="norea-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm -f "$container_name" >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name "$container_name" \
+            --publish 127.0.0.1::8787 \
+            --tmpfs /data:rw,uid=1000,gid=1000,mode=0700 \
+            --env NOREA_HOST=0.0.0.0 --env NOREA_PORT=8787 --env NOREA_DATA_DIR=/data \
+            "$LOCAL_IMAGE"
+          port="$(docker port "$container_name" 8787/tcp | cut -d: -f2)"
+          base_url="http://127.0.0.1:${port}"
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --max-time 2 "$base_url/api/v1/capabilities" -o "$RUNNER_TEMP/capabilities.json"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != true ]]; then
+            docker logs "$container_name"
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 10 "$base_url/admin/" -o "$RUNNER_TEMP/admin.html"
+          curl --fail --silent --show-error --max-time 10 "$base_url/admin/admin.js" -o "$RUNNER_TEMP/admin.js"
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const read = name => readFileSync(`${process.env.RUNNER_TEMP}/${name}`, 'utf8');
+          const capabilities = JSON.parse(read('capabilities.json'));
+          for (const [key, value] of Object.entries({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1 })) {
+            assert.equal(capabilities[key], value, key);
+          }
+          assert.match(read('admin.html'), /<html[\s>]/i);
+          assert.ok(read('admin.js').trim().length > 0, 'built admin.js must be present');
+          NODE
+
+      - name: Export the exact smoke-tested image
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+        id: image_archive
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+          docker save --output "$RUNNER_TEMP/norea-image.tar" "$LOCAL_IMAGE"
+          python3 <<'PY'
+          import hashlib, json, os, tarfile
+          with tarfile.open(os.environ['RUNNER_TEMP'] + '/norea-image.tar') as archive:
+              manifest = json.load(archive.extractfile('manifest.json'))
+              matches = [item for item in manifest if os.environ['LOCAL_IMAGE'] in (item.get('RepoTags') or [])]
+              assert len(matches) == 1, 'Archive must contain the one tested image tag'
+              config_bytes = archive.extractfile(matches[0]['Config']).read()
+              config = json.loads(config_bytes)
+              assert config['os'] == 'linux' and config['architecture'] == 'amd64'
+              assert config['config']['Labels']['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA']
+              digest = 'sha256:' + hashlib.sha256(config_bytes).hexdigest()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('image_config_digest=' + digest + '\n')
+          PY
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/norea-image.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer the tested image to the publishing job
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+        id: image_artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: norea-image-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/norea-image.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  publish:
+    name: Publish branch and latest tags
+    needs: validate
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    concurrency:
+      group: norea-content-server-dockerhub-publish
+      cancel-in-progress: false
+      queue: max
+    env:
+      SOURCE_BRANCH: ${{ github.ref_name }}
+      EXPECTED_CONFIG_DIGEST: ${{ needs.validate.outputs.image_config_digest }}
+      EXPECTED_ARCHIVE_SHA256: ${{ needs.validate.outputs.archive_sha256 }}
+    steps:
+      - name: Skip an outdated branch commit
+        id: current
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SOURCE_BRANCH" --jq '.object.sha')"
+          if [[ "$head" == "$GITHUB_SHA" ]]; then
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo "Publication skipped: the branch has advanced beyond the tested commit." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download the exact tested image artifact
+        if: steps.current.outputs.publish == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.validate.outputs.artifact_id }}
+          path: ${{ runner.temp }}/tested-image
+          digest-mismatch: error
+
+      - name: Verify the archive and image identity
+        if: steps.current.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/tested-image/norea-image.tar"
+          test "$(sha256sum "$archive" | cut -d' ' -f1)" = "$EXPECTED_ARCHIVE_SHA256"
+          docker load --input "$archive"
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{.Os}}/{{.Architecture}}')" = 'linux/amd64'
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+
+      - name: Set up registry inspection
+        if: steps.current.outputs.publish == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to Docker Hub
+        if: steps.current.outputs.publish == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish and verify the same image under branch and latest tags
+        if: steps.current.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SOURCE_BRANCH" --jq '.object.sha')"
+          if [[ "$head" != "$GITHUB_SHA" ]]; then
+            echo 'Publication skipped: branch advanced while transferring the image.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          docker tag "$LOCAL_IMAGE" "$IMAGE_NAME:$SOURCE_BRANCH"
+          docker push "$IMAGE_NAME:$SOURCE_BRANCH"
+          docker buildx imagetools inspect "$IMAGE_NAME:$SOURCE_BRANCH" --raw > "$RUNNER_TEMP/registry-manifest.json"
+          platform_digest="$(python3 <<'PY'
+          import json, os
+          manifest = json.load(open(os.environ['RUNNER_TEMP'] + '/registry-manifest.json'))
+          if 'manifests' in manifest:
+              matches = [item for item in manifest['manifests'] if item.get('platform', {}).get('os') == 'linux' and item.get('platform', {}).get('architecture') == 'amd64']
+              assert len(matches) == 1, 'Registry index must contain one linux/amd64 image'
+              print(matches[0]['digest'])
+          PY
+          )"
+          if [[ -n "$platform_digest" ]]; then
+            [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            docker buildx imagetools inspect "$IMAGE_NAME@$platform_digest" --raw > "$RUNNER_TEMP/registry-manifest.json"
+          fi
+          python3 -c 'import json,os; m=json.load(open(os.environ["RUNNER_TEMP"]+"/registry-manifest.json")); assert m["config"]["digest"] == os.environ["EXPECTED_CONFIG_DIGEST"], "Published image differs from tested image"'
+          digest="$(docker buildx imagetools inspect "$IMAGE_NAME:$SOURCE_BRANCH" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          latest='skipped because the branch advanced'
+          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SOURCE_BRANCH" --jq '.object.sha')"
+          if [[ "$head" == "$GITHUB_SHA" ]]; then
+            docker tag "$LOCAL_IMAGE" "$IMAGE_NAME:latest"
+            docker push "$IMAGE_NAME:latest"
+            test "$(docker buildx imagetools inspect "$IMAGE_NAME:latest" --format '{{.Manifest.Digest}}')" = "$digest"
+            latest="$IMAGE_NAME:latest"
+          fi
+          {
+            echo '## Published Docker image'
+            echo "- Source commit: $GITHUB_SHA"
+            echo "- Branch tag: $IMAGE_NAME:$SOURCE_BRANCH"
+            echo "- Latest: $latest"
+            echo "- Registry image: $IMAGE_NAME@$digest"
+            echo "- Tested image configuration: $EXPECTED_CONFIG_DIGEST"
+            echo '- Platform: linux/amd64'
+            echo '- Publication complete; tinywind-SER rollout remains a separate completion step.'
+          } >> "$GITHUB_STEP_SUMMARY"

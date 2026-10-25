@@ -239,6 +239,11 @@ are not implemented. Protect public deployments with proxy-level rate limits and
 
 ## Docker
 
+GitHub Actions validates branch changes and publishes the exact smoke-tested
+image to Docker Hub as `latest` and the committed branch name (currently `0.2`).
+See [deployment.md](docs/deployment.md) for CI configuration, the version-branch
+contract, digest verification, tinywind-SER rollout, and rollback.
+
 `docker compose up --build -d` exposes the service at `127.0.0.1:8787`.
 The `norea-state` volume holds `/data`, including SQLite, staging, trash, and the
 installation secret. Only `/data/contents` is bound to a host content directory;
