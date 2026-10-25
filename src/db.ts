@@ -30,6 +30,19 @@ const schema = `
     );
 `;
 
+// Additive extensions stay outside the original schema checksum so existing
+// installations retain their catalog, credentials, settings and chapter files.
+const readingStateSchema = `
+    CREATE TABLE IF NOT EXISTS reading_state_entries (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      profile_hash TEXT NOT NULL,
+      entry_key TEXT NOT NULL,
+      entry TEXT NOT NULL,
+      UNIQUE(profile_hash, entry_key)
+    );
+    CREATE INDEX IF NOT EXISTS reading_state_profile_sequence ON reading_state_entries(profile_hash, sequence);
+`;
+
 export function openDatabase(dataDir: string): DatabaseSync {
   mkdirSync(resolve(dataDir), { recursive: true });
   const db = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
@@ -44,6 +57,7 @@ export function openDatabase(dataDir: string): DatabaseSync {
       transaction(db, () => { db.exec(schema); db.prepare('INSERT INTO schema_state VALUES(?)').run(checksum); });
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
+    transaction(db, () => db.exec(readingStateSchema));
     return db;
   } catch (error) { db.close(); throw error; }
 }

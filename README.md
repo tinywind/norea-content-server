@@ -2,8 +2,9 @@
 
 An optional content server for Norea. One Node.js 24 process stores catalog and
 device metadata in SQLite and original chapter files on local disk.
-Reading state stays on each device. The API and
-package versions remain 1.
+Reading state stays usable on each device and can be explicitly exchanged with
+the server using a private sync key. The API and package versions remain 1;
+the optional reading-state protocol is advertised separately as version 1.
 
 The server is an optional shadow backup. App navigation, reading, local downloads,
 and metadata updates must finish without waiting for server discovery or uploads.
@@ -52,6 +53,15 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `POST /api/v1/devices/register` accepts `{deviceKey,deviceName}` and returns
   `{id,deviceName}`. Registration is idempotent; blocked keys are rejected.
   Device requests use `Authorization: Bearer <deviceKey>` without an account login.
+- `POST /api/v1/reading-state/read` accepts `{syncKey,offset?,limit?}` and returns
+  `{entries,total,nextOffset}`. Default offset is 0; page size is 1–500, default 500.
+- `POST /api/v1/reading-state/merge` accepts `{syncKey,entries}` (at most 200 entries)
+  and returns `{received,updated,total}`. Both reading-state endpoints require a
+  registered device bearer key, even when anonymous catalog reading is enabled.
+  A separate private 64-character hexadecimal sync key identifies the person's
+  records. Reuse that key on another device to transfer the same reading history;
+  keep it private. See [reading-state.md](docs/reading-state.md) for entry identity,
+  merge behavior, limits, and upgrade guarantees.
 - `GET /api/v1/admin/devices` lists devices. Console administrators can set
   `{blocked:true}` or `{blocked:false}` with `PATCH /api/v1/admin/devices/:id`.
 - `GET /api/v1/catalog/changes?after=0&limit=100` returns lightweight availability
@@ -170,10 +180,12 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   publish. Direct edits to server files are indexed at startup; opening one work
   refreshes only that work from its authoritative `novel.json` and cover.
 
-Capabilities include `authentication: "device-key"` and `personalStateSync: false`.
-Account sessions and personal-state endpoints are unsupported. This development
-version supports only the current database and original-file protocol. There are
-no upgrade migrations, ZIP package endpoints, or format conversion paths.
+Capabilities include `authentication: "device-key"`, `personalStateSync: true`,
+and `readingStateVersion: 1`. Account sessions and the legacy `/state` endpoints
+are unsupported. The reading-state extension adds its table without changing the
+current database checksum or replacing existing data. This development version
+otherwise supports only the current database and original-file protocol. There
+are no legacy format migrations, ZIP package endpoints, or format conversion paths.
 An incompatible server database fails startup. Stop the server and use a fresh
 state volume, retaining the `contents` mount and installation password, then scan
 current chapter folders. Older formats remain untouched but are not registered.

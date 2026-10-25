@@ -72,7 +72,10 @@ files. Reject unsafe, duplicate, missing, wrong-sized, and unlisted entries.
 
 Endpoints (all under `/api/v1`):
 
-- `GET /capabilities`: `{apiVersion:1,packageVersion:1,anonymousRead:boolean,authentication:"device-key",personalStateSync:false}`.
+- `GET /capabilities`: `{apiVersion:1,packageVersion:1,anonymousRead:boolean,authentication:"device-key",personalStateSync:true,readingStateVersion:1}`.
+- `POST /reading-state/read` and `POST /reading-state/merge`: private, explicit
+  reading-history exchange added on 2026-10-25; see [reading-state.md](reading-state.md)
+  for the complete current contract and preservation of the existing database.
 - `GET /openapi.json`: generated OpenAPI from route schemas.
 - `POST /console-sessions` `{password}` -> `{token}`; 24-hour administrator session.
 - `DELETE /console-sessions/current`: revoke the current console session.

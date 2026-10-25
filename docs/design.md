@@ -11,6 +11,12 @@ implemented behavior from remaining work.
 The account-free access update is verified separately in
 [verification-2026-10-12.md](verification-2026-10-12.md).
 
+The 2026-10-25 request extends this original content-only design with explicit
+private reading-state exchange. [reading-state.md](reading-state.md) defines the
+current protocol, safe merge rules, and additive database upgrade. Its decisions
+supersede statements below that personal reading state is never exchanged;
+content synchronization itself remains independent of this explicit operation.
+
 Repository: <https://github.com/tinywind/norea-content-server>
 
 ## Purpose

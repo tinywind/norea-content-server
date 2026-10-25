@@ -16,7 +16,7 @@ test('installation secret, console sessions and automatically admitted devices s
     const secret = (await readFile(secretPath, 'utf8')).trim();
     assert.match(secret, /^[0-9a-f]{64}$/);
     if (process.platform !== 'win32') assert.equal((await stat(secretPath)).mode & 0o777, 0o600);
-    assert.deepEqual((await app.inject('/api/v1/capabilities')).json(), { apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: false, anonymousRead: false });
+    assert.deepEqual((await app.inject('/api/v1/capabilities')).json(), { apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, anonymousRead: false });
     assert.equal((await app.inject({ method: 'POST', url: '/api/v1/console-sessions', payload: { password: 'wrong' } })).statusCode, 401);
     const session = await app.inject({ method: 'POST', url: '/api/v1/console-sessions', payload: { password: secret } });
     assert.equal(session.statusCode, 200, session.body);
@@ -60,7 +60,7 @@ test('installation secret, console sessions and automatically admitted devices s
   } finally { await app.close(); await rm(dataDir, { recursive: true }); }
 });
 
-test('account sessions and personal-state routes are unavailable', async () => {
+test('legacy account sessions and legacy personal-state routes remain unavailable', async () => {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(join('.tmp', 'removed-access-'));
   const app = await buildApp({ dataDir, anonymousRead: false });

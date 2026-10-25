@@ -1,5 +1,12 @@
 # Account-free device access
 
+Historical scope note: the content-only reading-state decision below was extended
+on 2026-10-25 by explicit private reading-history exchange. The current capability
+is `personalStateSync:true,readingStateVersion:1`; see
+[reading-state.md](reading-state.md). Device admission and console separation
+remain as described here. The current-format database receives only an additive
+reading-state table; it is not reset during this upgrade.
+
 ## Approved scope
 
 Remove accounts and cross-device personal reading-state synchronization. New
