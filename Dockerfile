@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS build
+FROM node:25-bookworm-slim AS build
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@11.25.0 --activate
 COPY package.json pnpm-lock.yaml ./
@@ -7,7 +7,7 @@ COPY tsconfig.web.json ./
 COPY web ./web
 RUN pnpm build && pnpm prune --prod
 
-FROM node:24-bookworm-slim
+FROM node:25-bookworm-slim
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@11.25.0 --activate
 COPY --from=build /app/node_modules ./node_modules
