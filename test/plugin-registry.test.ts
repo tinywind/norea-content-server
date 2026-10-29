@@ -118,3 +118,39 @@ test('uses embedded URL credentials for HTTP authentication and preserves regist
     assert.equal(listPlugins(context.db).length, 1);
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); await context.close(); }
 });
+
+test('repository redirects stay on the selected origin and never contact source URLs', async () => {
+  const context = await setup();
+  let otherRequests = 0;
+  const other = createServer((_request, response) => { otherRequests++; response.end(JSON.stringify([source('other')])); });
+  await new Promise<void>(resolve => other.listen(0, '127.0.0.1', resolve));
+  const otherAddress = other.address(); assert.ok(otherAddress && typeof otherAddress !== 'string');
+  const otherUrl = `http://127.0.0.1:${otherAddress.port}/index.json`;
+  const authorization = `Basic ${Buffer.from('operator:fixture-token').toString('base64')}`;
+  const requests: string[] = [];
+  const server = createServer((request, response) => {
+    requests.push(request.url!); assert.equal(request.headers.authorization, authorization);
+    if (request.url === '/cross') { response.writeHead(302, { location: otherUrl }).end(); return; }
+    if (request.url === '/same') { response.writeHead(302, { location: '/index.json' }).end(); return; }
+    if (request.url === '/credentials') { response.writeHead(302, { location: `http://other:secret@${request.headers.host}/index.json` }).end(); return; }
+    if (request.url === '/loop') { response.writeHead(302, { location: '/loop' }).end(); return; }
+    response.end(JSON.stringify([{ ...source('redirected'), url: otherUrl }]));
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://operator:fixture-token@127.0.0.1:${address.port}`;
+  try {
+    const registered = await registerPlugin(context.db, { url: `${origin}/same` });
+    assert.equal(registered.sources[0].url, otherUrl);
+    assert.deepEqual(requests, ['/same', '/index.json']);
+    await assert.rejects(registerPlugin(context.db, { url: `${origin}/cross` }), /selected origin/);
+    await assert.rejects(registerPlugin(context.db, { url: `${origin}/credentials` }), /credentials/);
+    await assert.rejects(registerPlugin(context.db, { url: `${origin}/loop` }), /redirect limit/);
+    assert.equal(otherRequests, 0);
+    assert.equal(listPlugins(context.db).length, 1);
+  } finally {
+    server.closeAllConnections(); other.closeAllConnections();
+    await Promise.all([new Promise<void>(resolve => server.close(() => resolve())), new Promise<void>(resolve => other.close(() => resolve()))]);
+    await context.close();
+  }
+});

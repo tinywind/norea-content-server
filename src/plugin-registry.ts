@@ -79,7 +79,7 @@ async function readRepository(location: string): Promise<string> {
       return buffer.subarray(0, length).toString('utf8');
     } finally { await file.close(); }
   }
-  const url = new URL(location);
+  let url = new URL(location);
   const headers: Record<string, string> = { accept: 'application/json' };
   if (url.username || url.password) {
     const credentials = `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`;
@@ -87,7 +87,21 @@ async function readRepository(location: string): Promise<string> {
     url.username = '';
     url.password = '';
   }
-  const response = await fetch(url, { signal: AbortSignal.timeout(15_000), headers });
+  const origin = url.origin;
+  const signal = AbortSignal.timeout(15_000);
+  let response: Response;
+  for (let redirects = 0; ; redirects++) {
+    response = await fetch(url, { signal, headers, redirect: 'manual' });
+    if (![301, 302, 303, 307, 308].includes(response.status)) break;
+    await response.body?.cancel();
+    const location = response.headers.get('location');
+    if (!location) throw problem(400, 'Repository redirect has no destination.');
+    if (redirects >= 5) throw problem(400, 'Repository redirect limit exceeded.');
+    const next = new URL(location, url);
+    if (next.origin !== origin) throw problem(400, 'Repository redirects must stay on the selected origin.');
+    if (next.username || next.password) throw problem(400, 'Repository redirects cannot change credentials.');
+    url = next;
+  }
   if (!response.ok) { await response.body?.cancel(); throw problem(400, `Repository returned HTTP ${response.status}.`); }
   if (Number(response.headers.get('content-length')) > MAX_INDEX_BYTES) {
     await response.body?.cancel();

@@ -40,6 +40,14 @@ means anyone who can reach the server can register another key; blocking a key
 does not identify or permanently ban a person. Device keys never grant console
 access. Keep the server data directory and device credentials private.
 
+Requests are limited by the direct client IP: 6,000 requests per minute per route,
+10 console login attempts per minute, and 60 device registrations per minute.
+Excess requests return HTTP 429 with `Retry-After`. Forwarded IP headers are not
+trusted; clients behind a reverse proxy share that proxy's limits.
+
+Secret and work-file reads reject symbolic links and read through the validated
+file descriptor. Keep storage directories writable only by trusted operators.
+
 ## API
 
 `GET /api/v1/openapi.json` serves OpenAPI generated from route schemas.
@@ -311,6 +319,9 @@ Private repositories may use `https://username:token@host/path/plugins.json`.
 The server sends embedded credentials as HTTP Basic authentication when fetching
 the index. Repository and plugin URLs are stored as entered, including credentials,
 and are visible in the authenticated management console.
+HTTP redirects may stay on the operator-selected origin, for at most five hops;
+changes of origin or embedded credentials are rejected before another request.
+Use the final index URL directly when a repository redirects to a different host.
 
 The server scans only `<NOREA_DATA_DIR>/contents/`. Configure `NOREA_DATA_DIR`
 at startup; the console cannot add, select, or detach roots. Storage displays

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -107,9 +107,15 @@ function readBytes(path: string, limit: number): Buffer {
   const info = lstatSync(path);
   if (!info.isFile()) throw problem(400, 'Expected a regular work file');
   if (info.size > limit) throw problem(413, 'Work file exceeds byte limit');
-  const bytes = readFileSync(path);
-  if (bytes.length > limit) throw problem(413, 'Work file exceeds byte limit');
-  return bytes;
+  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino) throw problem(400, 'Work file changed while opening');
+    if (opened.size > limit) throw problem(413, 'Work file exceeds byte limit');
+    const bytes = readFileSync(descriptor);
+    if (bytes.length > limit) throw problem(413, 'Work file exceeds byte limit');
+    return bytes;
+  } finally { closeSync(descriptor); }
 }
 export function readNovelMetadata(path: string): NovelMetadataV1 {
   let value: unknown;

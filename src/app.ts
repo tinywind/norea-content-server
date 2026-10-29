@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import swagger from '@fastify/swagger';
 import multipart from '@fastify/multipart';
+import rateLimit from '@fastify/rate-limit';
 import { resolve } from 'node:path';
 import { openDatabase, problem } from './db.ts';
 import { authenticate, authenticateDevice, createConsoleSession, installationSecret, registerDevice, tokenDigest } from './auth.ts';
@@ -32,7 +33,8 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const db = openDatabase(dataDir);
   try { rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
-  const app = Fastify({ bodyLimit: 1024 * 1024, requestTimeout: 120000, logger: false });
+  const app = Fastify({ bodyLimit: 1024 * 1024, requestTimeout: 120000, logger: false, trustProxy: false });
+  await app.register(rateLimit, { global: true, max: 6000, timeWindow: '1 minute' });
   let anonymousRead = savedAnonymousRead(db, options.anonymousRead ?? true);
   const changes = createChangeNotifications(db);
   await app.register(swagger, { openapi: { info: { title: 'Norea Content Server', version: '1.0.0' }, components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } } } });
@@ -45,7 +47,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   registerReadingState(app, db);
   app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
-  app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
+  app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
     return createConsoleSession(db, secret, request.body.password);
   });
@@ -54,7 +56,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
     db.prepare('DELETE FROM console_sessions WHERE token_hash=?').run(tokenDigest(request.headers.authorization!.slice(7)));
     return reply.code(204).send();
   });
-  app.post<{ Body: { deviceKey: string; deviceName: string } }>('/api/v1/devices/register', { schema: { body: { type: 'object', additionalProperties: false, required: ['deviceKey','deviceName'], properties: { deviceKey: { type: 'string', pattern: '^[0-9a-f]{64}$' }, deviceName: { type: 'string', minLength: 1, maxLength: 200 } } }, response: { 200: { type: 'object', properties: { id: string, deviceName: string } } } } }, async request => registerDevice(db, request.body.deviceKey, request.body.deviceName));
+  app.post<{ Body: { deviceKey: string; deviceName: string } }>('/api/v1/devices/register', { config: { rateLimit: { max: 60 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['deviceKey','deviceName'], properties: { deviceKey: { type: 'string', pattern: '^[0-9a-f]{64}$' }, deviceName: { type: 'string', minLength: 1, maxLength: 200 } } }, response: { 200: { type: 'object', properties: { id: string, deviceName: string } } } } }, async request => registerDevice(db, request.body.deviceKey, request.body.deviceName));
   app.get<{ Querystring: { catalogAfter: number; workAfter: number; waitSeconds?: number } }>('/api/v1/changes', { preValidation: async request => {
     if (Object.keys(request.query).some(key => !['catalogAfter', 'workAfter', 'waitSeconds'].includes(key))) throw problem(400, 'Only catalogAfter, workAfter and waitSeconds are accepted');
   }, schema: {
