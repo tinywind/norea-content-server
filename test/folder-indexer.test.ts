@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { test } from 'node:test';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, statSync, utimesSync } from 'node:fs';
+import { existsSync, fstatSync, statSync, utimesSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
@@ -57,6 +57,12 @@ async function snapshot(root: string): Promise<Record<string, string>> {
 
 function stored(f: Awaited<ReturnType<typeof fixture>>): CatalogEntry {
   return JSON.parse((f.db.prepare('SELECT entry FROM chapters').get() as { entry: string }).entry);
+}
+
+function readsFile(file: Parameters<typeof fs.readFileSync>[0], path: string): boolean {
+  if (typeof file !== 'number') return file === path;
+  const opened = fstatSync(file); const expected = statSync(path);
+  return opened.dev === expected.dev && opened.ino === expected.ino;
 }
 
 test('inspects four chapter archives concurrently before accepting more work', async t => {
@@ -322,7 +328,7 @@ test('work metadata is indexed on the first scan after a one-time stat change du
     const path = join(f.directory, '..', 'novel.json'); const originalRead = fs.readFileSync; let changed = false;
     t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
       const bytes = originalRead(...args);
-      if (args[0] === path && !changed) {
+      if (readsFile(args[0], path) && !changed) {
         changed = true; const info = statSync(path); utimesSync(path, info.atime, new Date(info.mtimeMs + 1000));
       }
       return bytes;
@@ -341,7 +347,7 @@ test('work metadata retry publishes only the contents read after the change', as
     const metadata = workMetadata(); metadata.novel.name = 'Changed while reading';
     t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
       const bytes = originalRead(...args);
-      if (args[0] === path && !changed) {
+      if (readsFile(args[0], path) && !changed) {
         changed = true; const info = statSync(path); fs.writeFileSync(path, JSON.stringify(metadata)); utimesSync(path, info.atime, new Date(info.mtimeMs + 1000));
       }
       return bytes;
@@ -360,7 +366,7 @@ test('work metadata that changes on both reads is skipped without publishing or 
     const path = join(f.directory, '..', 'novel.json'); const originalRead = fs.readFileSync; let reads = 0;
     t.mock.method(fs, 'readFileSync', (...args: Parameters<typeof fs.readFileSync>) => {
       const bytes = originalRead(...args);
-      if (args[0] === path) {
+      if (readsFile(args[0], path)) {
         reads++; const info = statSync(path); utimesSync(path, info.atime, new Date(info.mtimeMs + 1000));
       }
       return bytes;

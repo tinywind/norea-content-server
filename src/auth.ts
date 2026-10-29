@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyRequest } from 'fastify';
@@ -14,9 +14,16 @@ export function installationSecret(dataDir: string): string {
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
   const file = lstatSync(path);
   if (!file.isFile() || file.size > 66) throw new Error('Invalid installation secret file');
-  const secret = readFileSync(path, 'utf8').trim();
-  if (!/^[0-9a-f]{64}$/.test(secret)) throw new Error('Invalid installation secret file');
-  return secret;
+  let descriptor: number;
+  try { descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error('Invalid installation secret file'); throw error; }
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.size > 66 || opened.dev !== file.dev || opened.ino !== file.ino) throw new Error('Invalid installation secret file');
+    const secret = readFileSync(descriptor, 'utf8').trim();
+    if (!/^[0-9a-f]{64}$/.test(secret)) throw new Error('Invalid installation secret file');
+    return secret;
+  } finally { closeSync(descriptor); }
 }
 
 export function createConsoleSession(db: DatabaseSync, secret: string, password: string): { token: string } {
