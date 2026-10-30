@@ -382,7 +382,7 @@ while the server process is running, without an open console. Disabling the
 schedule still allows Scan now. Jobs are serialized, persist progress/results,
 can be cancelled, and are marked interrupted after an unclean restart.
 
-**Scan now** and periodic scans list source and work directories to discover
+Scan now and periodic scans list source and work directories to discover
 added or removed chapter folders. Known complete chapters reuse the database
 index without opening or statting their contents, including chapters uploaded by
 the app. Work metadata and covers are checked separately on every scan.
@@ -393,7 +393,7 @@ The first pass still inspects every previously unclassified chapter folder.
 
 Changes mode retains the affected paths and inspects those chapters or works.
 Filesystem events can be missed, particularly on Docker host mounts. Periodic
-scans still discover additions and removals; use **Full inspection** after editing
+scans still discover additions and removals; use Full inspection after editing
 existing chapter files or repairing unsupported folders when no event was
 received. Full inspection compares file identity, size, modification time, and
 change time before revalidating changed payloads. No scan hashes or repacks
@@ -427,30 +427,32 @@ identity, ID, and directory. The selected conflict policy still applies. Ambiguo
 chapter numbers are rejected, and a real source path never adopts another
 identity solely because its chapter number matches.
 
-In Content, each chapter has **Delete** beside **Inspect**. Chapter deletion moves
+In Content, each chapter has Delete beside Inspect. Chapter deletion moves
 the indexed chapter directory to trash; local device copies remain intact.
 A new upload after deletion replaces it and removes the trash copy. Scanning
 alone does not restore deleted chapters. In the app, select chapters and choose
-**Delete from server**, then use **Sync now** or wait for the configured sync mode
+Delete from server, then use Sync now or wait for the configured sync mode
 to upload replacements from completed local files. No local edit or explicit app
 rescan is required. Other complete server chapters remain unchanged.
 
 Deleting a chapter through the API or console publishes its deletion immediately.
 When a chapter folder is removed directly from the filesystem, the server must
-first observe that removal through Changes scanning, a periodic scan, or **Scan
-now** before the app receives the deletion event. API and console deletions do
+first observe that removal through Changes scanning, a periodic scan, or Scan
+now before the app receives the deletion event. API and console deletions do
 not need this extra scan.
 
-Work cards have **Delete** beside **Metadata**. The chapter page also has
-**Delete work** beside the work title. After confirmation, work deletion removes
+Work cards have Delete beside Metadata. The chapter page also has
+Delete work beside the work title. After confirmation, work deletion removes
 the entire server work folder, including original loose chapters, metadata and
 cover images, and removes its DB index. This action is permanent. Deletion
 records prevent automatic reuploads; an explicit app rescan can republish the
 work. Copies and reading state on devices remain intact.
-The app offers **Delete work from server** in Browse -> Content server and in
+The app offers Delete work from server in Browse -> Content server and in
 each work's server data page, using the same whole-work deletion policy.
 Devices can be blocked or unblocked independently. Personal reading records stay
-on each app and are never synchronized to the server.
+local unless a device explicitly exchanges them with the server using a private
+reading sync key. See [reading-state.md](docs/reading-state.md) for the protocol
+and merge limits.
 
 Settings persists the anonymous-download policy. Its saved value takes precedence
 over `NOREA_ANONYMOUS_READ` after the first console edit. Package limits and the
