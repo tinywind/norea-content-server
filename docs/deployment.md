@@ -129,12 +129,16 @@ Verify the running container's image ID equals `docker image inspect` for the
 pulled digest. Using the deployment's actual mapped port, verify:
 
 - The server is running and `/api/v1/capabilities` responds with the expected
-  API/package version and `readingStateVersion: 1`.
+  API/package version, `readingStateVersion: 1`, and `deviceBackupVersion: 1`.
 - `/admin/` and `/admin/admin.js` load, and the affected authenticated API works.
 - The existing catalog, registered devices, administrator settings, installation
   password, and representative original content remain available.
 - For a reading-state change, the app can exchange its private records and an
   unauthenticated reading-state request remains rejected.
+- For a device-backup change, a disposable registered device can upload/list/
+  download an exact archive and a replaced digest returns 409. Anonymous and
+  blocked requests must remain rejected; never overwrite an existing user backup
+  as a deployment smoke test.
 
 Report the source commit, published branch tag and digest, running digest, and
 verification outcome. A healthy old container is not evidence that a new image

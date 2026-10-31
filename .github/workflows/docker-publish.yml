@@ -120,7 +120,7 @@ jobs:
           import { readFileSync } from 'node:fs';
           const read = name => readFileSync(`${process.env.RUNNER_TEMP}/${name}`, 'utf8');
           const capabilities = JSON.parse(read('capabilities.json'));
-          for (const [key, value] of Object.entries({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1 })) {
+          for (const [key, value] of Object.entries({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, deviceBackupVersion: 1 })) {
             assert.equal(capabilities[key], value, key);
           }
           assert.match(read('admin.html'), /<html[\s>]/i);

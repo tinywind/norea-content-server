@@ -2,9 +2,10 @@
 
 An optional content server for Norea. One Node.js 24 process stores catalog and
 device metadata in SQLite and original chapter files on local disk.
-Reading state stays usable on each device and can be explicitly exchanged with
-the server using a private sync key. The API and package versions remain 1;
-the optional reading-state protocol is advertised separately as version 1.
+The app can explicitly back up its complete local database, installed plugin
+code and settings under its device name, then select a saved device to restore.
+The older reading-state API remains available for existing clients. API/package
+versions remain 1; full-device backup is advertised as `deviceBackupVersion: 1`.
 
 The server is an optional shadow backup. App navigation, reading, local downloads,
 and metadata updates must finish without waiting for server discovery or uploads.
@@ -61,6 +62,22 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `POST /api/v1/devices/register` accepts `{deviceKey,deviceName}` and returns
   `{id,deviceName}`. Registration is idempotent; blocked keys are rejected.
   Device requests use `Authorization: Bearer <deviceKey>` without an account login.
+- `GET /api/v1/device-backups` returns `{items:[{deviceName,updatedAt,size,sha256}]}`.
+  `updatedAt` is a Unix timestamp in milliseconds; `size` is the archive byte count.
+- `PUT /api/v1/device-backups/:name` stores one opaque archive with
+  `Content-Type: application/octet-stream` and the required `X-Backup-Sha256`
+  lowercase hexadecimal digest. URL-encode the device name. Maximum archive size
+  is 512 MiB and uploads time out after 120 seconds. A successful upload atomically
+  replaces the latest backup for that exact name; interrupted or invalid uploads
+  retain the previous backup. Uploaded bytes are preserved without extraction.
+- `GET /api/v1/device-backups/:name?sha256=<listed-digest>` streams the archive.
+  The optional digest prevents restoring a backup replaced after listing: a stale
+  digest returns 409. The response includes `Content-Length` and `X-Backup-Sha256`.
+  All three backup endpoints require a registered, unblocked device key, even when
+  anonymous catalog reading is enabled. All admitted devices can list and restore
+  all saved device names; the name is a shared backup slot, not an access secret.
+  Backups include private app settings, so protect server admission and storage.
+  See [device-backups.md](docs/device-backups.md) for storage and client behavior.
 - `POST /api/v1/reading-state/read` accepts `{syncKey,offset?,limit?}` and returns
   `{entries,total,nextOffset}`. Default offset is 0; page size is 1–500, default 500.
 - `POST /api/v1/reading-state/merge` accepts `{syncKey,entries}` (at most 200 entries)
@@ -189,7 +206,7 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   refreshes only that work from its authoritative `novel.json` and cover.
 
 Capabilities include `authentication: "device-key"`, `personalStateSync: true`,
-and `readingStateVersion: 1`. Account sessions and the legacy `/state` endpoints
+`readingStateVersion: 1`, and `deviceBackupVersion: 1`. Account sessions and the legacy `/state` endpoints
 are unsupported. The reading-state extension adds its table without changing the
 current database checksum or replacing existing data. This development version
 otherwise supports only the current database and original-file protocol. There

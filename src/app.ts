@@ -14,6 +14,7 @@ import { registerCatalog } from './catalog.ts';
 import { chapterFileStream, publishChapterFiles } from './chapter-files.ts';
 import { readChapterMediaAsset } from './chapter-media.ts';
 import { registerReadingState } from './reading-state.ts';
+import { registerDeviceBackups } from './device-backups.ts';
 
 const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
@@ -45,7 +46,8 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   registerWorks(app, { db, dataDir, requireRead, notify: () => changes.notify() });
   registerCatalog(app, { db, dataDir, requireRead, catalogSchema });
   registerReadingState(app, db);
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, anonymousRead }));
+  await registerDeviceBackups(app, db, dataDir);
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, deviceBackupVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
