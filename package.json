@@ -22,7 +22,7 @@
     "yauzl": "^3.4.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.5",
+    "@types/node": "^26.6.6",
     "@types/yauzl": "^3.4.0",
     "@types/yazl": "^3.3.1",
     "typescript": "^7.0.2",
