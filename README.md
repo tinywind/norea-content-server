@@ -167,6 +167,21 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   returns 409; retry with a new request. Missing or wrong-sized server files can
   be repaired under any policy. Every catalog record includes the inspected
   `complete` flag and `fileBytes`, the sum of original file sizes.
+- `GET /api/v1/chapters/:id/storage-inventory?revision=<revision>` returns
+  `{identity, revision, inventory}` for a current chapter copy. `inventory`
+  contains `body: {sha256, bytes}`, `expectedAssetKeys`, and `storedAssets`
+  entries with `{key, sha256, bytes}`. Keys use `media/<fileName>`, and asset
+  hashes cover valid uncompressed bytes. Missing or malformed manifests return
+  `expectedAssetKeys: null`; corrupt individual entries are excluded. This route
+  reads the stored files without repairing or rewriting them. It checks the
+  revision and file state throughout inspection, uses the catalog read policy,
+  and limits concurrent inventory workers.
+  Set `presenceOnly=true` to check and hash only the body. The response then has
+  `expectedAssetKeys: null` and `storedAssets: []`; it provides no media
+  comparison evidence. The revision must be a lowercase SHA-256 string. Missing
+  chapters or stale revisions return 404, deleted chapters or unavailable files
+  return 410, and authorization failures return 401 or 403. A busy inventory
+  worker pool returns 503.
 - `GET /api/v1/chapters/:id/files?revision=<revision>&path=<original-path>` streams
   one original file from the current copy, including copies with incomplete media.
   A stale revision returns 404.

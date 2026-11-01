@@ -28,6 +28,8 @@ const manifestSchema = { type: 'object', required: ['packageVersion','layout','i
 const catalogSchema = { type: 'object', required: ['id','revision','fileBytes','manifest','complete','deleted','sequence'], properties: { id: string, revision: string, fileBytes: { type: 'integer' }, manifest: manifestSchema, complete: { type: 'boolean' }, deleted: { type: 'boolean' }, sequence: { type: 'integer' } } };
 const cursorSchema = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
 
+import { inspectChapterInventory } from './chapter-inventory.ts';
+
 export async function buildApp(options: { dataDir: string; anonymousRead?: boolean; limits?: Partial<Limits>; trashDays?: number }) {
   const dataDir = resolve(options.dataDir);
   const secret = installationSecret(dataDir);
@@ -86,6 +88,11 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
     const entry = await publishChapterFiles(db, dataDir, request.parts(), limits, request.query.conflictPolicy);
     changes.notify();
     return entry;
+  });
+  app.get<{ Params: { id: string }; Querystring: { revision: string; presenceOnly?: boolean } }>('/api/v1/chapters/:id/storage-inventory', { schema: { params: idParams, querystring: { type: 'object', additionalProperties: false, required: ['revision'], properties: { revision: { type: 'string', pattern: '^[0-9a-f]{64}$' }, presenceOnly: { type: 'boolean', default: false } } } } }, async (request, reply) => {
+    requireRead(request);
+    reply.header('Cache-Control', 'no-store');
+    return inspectChapterInventory(db, dataDir, request.params.id, request.query.revision, limits, request.query.presenceOnly);
   });
   app.get<{ Params: { id: string }; Querystring: { revision: string; path: string } }>('/api/v1/chapters/:id/files', { schema: { params: idParams, querystring: { type: 'object', required: ['revision', 'path'], properties: { revision: { type: 'string', pattern: '^[0-9a-f]{64}$' }, path: { type: 'string', enum: ['content.html', 'content.pdf', 'manifest.json', 'media.zip'] } } } } }, async (request, reply) => {
     requireRead(request);
