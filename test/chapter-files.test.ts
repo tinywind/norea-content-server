@@ -73,18 +73,32 @@ for (const state of ['missing-archive', 'missing-entry', 'missing-regular-file',
     const saved = JSON.parse((s.db.prepare('SELECT entry FROM chapters WHERE id=?').get(entry.id) as { entry: string }).entry);
     assert.equal(saved.complete, complete);
     const query = new URLSearchParams({ pluginId: 'source', novelPath: '/work', chapterPath: '/chapter/1' });
-    assert.equal((await s.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, complete ? 200 : 404);
+    const exact = await s.app.inject(`/api/v1/catalog/chapter?${query}`);
+    assert.equal(exact.statusCode, 200, exact.body);
+    assert.equal(exact.json().complete, complete);
+    const alias = new URLSearchParams({ pluginId: 'source', novelPath: '/work', chapterPath: 'norea-folder:1', chapterNumber: '1' });
+    const aliasLookup = await s.app.inject(`/api/v1/catalog/chapter?${alias}`);
+    assert.equal(aliasLookup.statusCode, 200, aliasLookup.body);
+    assert.equal(aliasLookup.json().id, entry.id);
+    assert.equal(aliasLookup.json().complete, complete);
+    for (const [path, bytes] of Object.entries(files)) {
+      const download = await s.app.inject(`/api/v1/chapters/${entry.id}/files?${new URLSearchParams({ revision: entry.revision, path })}`);
+      assert.equal(download.statusCode, 200, download.body);
+      assert.deepEqual(download.rawPayload, bytes);
+    }
     const lookup = await s.app.inject(`/api/v1/catalog/chapter?${query}&includeUnavailable=true`);
     assert.equal(lookup.json().complete, complete);
     const work = digest(JSON.stringify(['source', '/work']));
-    assert.equal((await s.app.inject(`/api/v1/catalog/works/${work}/chapters`)).json().total, complete ? 1 : 0);
-    assert.equal((await s.app.inject('/api/v1/catalog/works')).json().items[0].chapterCount, complete ? 1 : 0);
+    const chapters = (await s.app.inject(`/api/v1/catalog/works/${work}/chapters`)).json();
+    assert.equal(chapters.total, 1);
+    assert.equal(chapters.items[0].complete, complete);
+    assert.equal((await s.app.inject('/api/v1/catalog/works')).json().items[0].chapterCount, 1);
     assert.equal((await s.app.inject('/api/v1/catalog/changes')).json().items[0].complete, complete);
     const headers = await consoleHeaders(s.app, s.dataDir);
     const managed = await s.app.inject({ url: `/api/v1/admin/works/${work}/chapters`, headers });
     assert.equal(managed.json().items[0].entry.complete, complete);
     const works = await s.app.inject({ url: '/api/v1/admin/works', headers });
-    assert.equal(works.json().items[0].downloadedChapters, complete ? 1 : 0);
+    assert.equal(works.json().items[0].downloadedChapters, 1);
   } finally { await s.close(); }
 });
 

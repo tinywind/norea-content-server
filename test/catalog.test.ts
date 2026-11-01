@@ -104,7 +104,7 @@ test('pages live chapters by position and id and resolves exact identities witho
     const last = await f.putChapter(work, '/chapter/last?x=1&y=2', 8);
     const first = await f.putChapter(work, '/chapter/first', 1); const tied = await f.putChapter(work, '/chapter/tied', 1, '2');
     const ordered = [first, tied].sort((a, b) => a.id.localeCompare(b.id));
-    const summarize = (entry: typeof first) => ({ id: entry.id, chapterPath: entry.manifest.identity.chapterPath, position: entry.manifest.chapter.position, name: entry.manifest.chapter.name, chapterNumber: entry.manifest.chapter.chapterNumber, page: entry.manifest.chapter.page, contentType: entry.manifest.chapter.contentType });
+    const summarize = (entry: typeof first) => ({ id: entry.id, chapterPath: entry.manifest.identity.chapterPath, position: entry.manifest.chapter.position, name: entry.manifest.chapter.name, chapterNumber: entry.manifest.chapter.chapterNumber, page: entry.manifest.chapter.page, contentType: entry.manifest.chapter.contentType, complete: true });
     const page = (await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters?limit=1`)).json();
     assert.deepEqual(page, { items: [summarize(ordered[0])], total: 3, hasMore: true });
     assert.deepEqual((await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters?offset=1&limit=2`)).json(), { items: [summarize(ordered[1]), summarize(last)], total: 3, hasMore: false });
@@ -214,6 +214,9 @@ test('catalog reads follow anonymous, invalid-key and blocked-device policies an
     for (const suffix of ['limit=0', 'limit=101', 'offset=-1']) assert.equal((await f.app.inject(`/api/v1/catalog/works/${stored.id}/chapters?${suffix}`)).statusCode, 400, suffix);
     assert.equal((await f.app.inject('/api/v1/catalog/chapter?pluginId=source-a')).statusCode, 400);
     const schema = (await f.app.inject('/api/v1/openapi.json')).json();
+    const chapterSummary = schema.paths['/api/v1/catalog/works/{id}/chapters'].get.responses['200'].content['application/json'].schema.properties.items.items;
+    assert.equal(chapterSummary.properties.complete.type, 'boolean');
+    assert.ok(chapterSummary.required.includes('complete'));
     for (const path of ['/api/v1/catalog/changes', '/api/v1/catalog/works', '/api/v1/catalog/sources', '/api/v1/catalog/works/{id}/chapters', '/api/v1/catalog/chapter']) assert.ok(schema.paths[path].get.responses['200'].content['application/json'].schema);
   } finally { await f.close(); }
 });

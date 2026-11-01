@@ -59,8 +59,9 @@ New original-file transfers use `layout: "chapter-files"` and each descriptor is
 in milliseconds. Send the metadata as the first multipart field, then the original
 body (`content.html` or `content.pdf`), optional `manifest.json`, and optional
 `media.zip`. The file field name and filename match the original path. Preserve
-all file bytes and media references. Media must be complete; validate archive
-central-directory names and sizes without extracting assets or checking CRCs.
+all file bytes and media references. Record media completeness as status and
+allow downloads of incomplete copies. Validate archive central-directory names
+and sizes without extracting assets or checking CRCs.
 
 Only the current original-file format is supported. Check declared sizes,
 complete receive, and inventory before publication or installation. Do not retain

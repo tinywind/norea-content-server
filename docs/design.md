@@ -46,7 +46,7 @@ content that no participating device has acquired and uploaded.
   can discover server content without storing all of it locally.
 - Distinguish local removal from server deletion.
 - Inspect media completeness from declared assets and regular ZIP entries.
-  Retain valid incomplete copies in the catalog without advertising them for download.
+  List and allow downloads of valid incomplete copies. Completeness is status only.
 - Use cross-device content identities instead of local database row IDs.
 - Share the app's plugin ID, source novel ID, and chapter number directories.
   Accept the existing plugin ID collision limitation across distribution sources.
@@ -335,8 +335,8 @@ downloads use ordinary streaming HTTP endpoints.
 
 Content synchronization consumes an append-only catalog change log. Reconnecting
 devices resume from a durable cursor. Each chapter change includes its inspected
-`complete` flag; download availability requires `complete: true` and
-`deleted: false`. The default conflict policy retains already complete copies.
+`complete` flag as media status. Nondeleted copies with available original files
+can be downloaded regardless of media completeness. The default conflict policy retains already complete copies.
 Account and personal-state endpoints are removed.
 
 Connected clients can wait up to 20 seconds for catalog cursor changes. A hint
@@ -547,7 +547,8 @@ chapter package. Text-only bodies do not require a media manifest or archive.
 The app's `manifest.json` is a media inventory, not chapter identity metadata.
 It may exist without `media.zip`. The importer records completeness from regular
 ZIP entries, ignoring completion and asset status flags. Incomplete copies remain
-visible in administration but are excluded from download availability.
+visible in administration and client catalogs and can be downloaded. Completeness
+is status only; missing original files and explicit deletions remain unavailable.
 
 Work identity and title come exclusively from `novel.json`. Missing or invalid
 metadata skips the whole work; folder names, cover sidecars, and old databases

@@ -126,11 +126,11 @@ export function chapterStoragePath(dataDir: string, path: string): string {
   return target;
 }
 
-export function completeChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry | undefined {
+export function availableChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry | undefined {
   const row = db.prepare('SELECT entry,path FROM chapters WHERE id=? AND deleted_at IS NULL').get(id) as { entry: string; path: string | null } | undefined;
   if (!row?.path) return;
   const entry = JSON.parse(row.entry) as CatalogEntry;
-  return entry.complete === true && storedFilesExist(dataDir, row.path, entry) ? entry : undefined;
+  return storedFilesExist(dataDir, row.path, entry) ? entry : undefined;
 }
 
 function normalizedChapterNumber(value: string | null | undefined): string | undefined {

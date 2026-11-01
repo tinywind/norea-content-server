@@ -9,7 +9,7 @@ import { ZipFile } from 'yazl';
 import yauzl from 'yauzl';
 import { openDatabase } from '../src/db.ts';
 import { chapterFileStream } from '../src/chapter-files.ts';
-import { completeChapter, defaultLimits, deleteChapter, digest, workId, type CatalogEntry } from '../src/packages.ts';
+import { availableChapter, defaultLimits, deleteChapter, digest, workId, type CatalogEntry } from '../src/packages.ts';
 import { scanFolder, type FolderIndexItem } from '../src/folder-indexer.ts';
 import { getWork } from '../src/works.ts';
 
@@ -176,7 +176,7 @@ test('full folder scans reassess completeness even when the saved inventory sign
     await f.run();
     assert.equal(stored(f).complete, true);
     assert.ok(stored(f).sequence > first.sequence);
-    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+    assert.equal(availableChapter(f.db, f.dataDir, first.id)?.id, first.id);
   } finally { await f.close(); }
 });
 
@@ -191,7 +191,7 @@ test('folder rescans persist completeness transitions and retain incomplete file
     const incomplete = stored(f);
     assert.equal(incomplete.id, first.id);
     assert.equal(incomplete.complete, false);
-    assert.equal(completeChapter(f.db, f.dataDir, first.id), undefined);
+    assert.equal(availableChapter(f.db, f.dataDir, first.id)?.complete, false);
     assert.equal((f.db.prepare('SELECT path FROM chapters WHERE id=?').get(first.id) as { path: string }).path, relative(f.dataDir, f.directory));
     assert.equal((await f.run()).unchanged, 2);
     assert.equal(stored(f).sequence, incomplete.sequence);
@@ -202,7 +202,7 @@ test('folder rescans persist completeness transitions and retain incomplete file
     await writeFile(join(f.directory, 'media.zip'), await zip({ 'a.png': 'image', 'extra.png': 'extra' }));
     assert.equal((await f.run({ full: false })).registered, 1);
     assert.equal(stored(f).complete, true);
-    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+    assert.equal(availableChapter(f.db, f.dataDir, first.id)?.id, first.id);
   } finally { await f.close(); }
 });
 
@@ -248,7 +248,7 @@ test('invalid current files become unavailable and recover without deletion tomb
       if (invalid === 'unfinished') await writeFile(join(f.directory, 'content.html.part'), 'partial');
       else await writeFile(manifestPath, Buffer.alloc(original.length, 33));
       assert.equal((await f.run()).skipped, 1);
-      assert.equal(completeChapter(f.db, f.dataDir, first.id), undefined);
+      assert.equal(availableChapter(f.db, f.dataDir, first.id), undefined);
       assert.equal((f.db.prepare('SELECT path FROM chapters WHERE id=?').get(first.id) as { path: string | null }).path, null);
       assert.throws(() => chapterFileStream(f.db, f.dataDir, first.id, stored(f).revision, 'content.html'), /unavailable/);
       assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapter_tombstones').get() as { n: number }).n, 0);
@@ -256,7 +256,7 @@ test('invalid current files become unavailable and recover without deletion tomb
       if (invalid === 'unfinished') await rm(join(f.directory, 'content.html.part'));
       else await writeFile(manifestPath, original);
       assert.equal((await f.run()).registered, 1);
-      assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+      assert.equal(availableChapter(f.db, f.dataDir, first.id)?.id, first.id);
       assert.deepEqual(await download(f, stored(f), 'manifest.json'), original);
     }
   } finally { await f.close(); }
@@ -462,10 +462,10 @@ test('a noncanonical number cannot displace an indexed canonical chapter folder'
     const duplicate = join(f.directory, '..', '1.0');
     await cp(f.directory, duplicate, { recursive: true });
     assert.equal((await f.run()).skipped, 1);
-    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+    assert.equal(availableChapter(f.db, f.dataDir, first.id)?.id, first.id);
     await rm(duplicate, { recursive: true });
     assert.equal((await f.run()).registered, 0);
-    assert.equal(completeChapter(f.db, f.dataDir, first.id)?.id, first.id);
+    assert.equal(availableChapter(f.db, f.dataDir, first.id)?.id, first.id);
   } finally { await f.close(); }
 });
 

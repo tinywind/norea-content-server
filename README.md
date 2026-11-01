@@ -92,8 +92,9 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `GET /api/v1/catalog/changes?after=0&limit=100` returns lightweight availability
   changes as `{items,cursor,hasMore}`. Each item contains only
   `{identity:{pluginId,novelId,novelPath,chapterPath},complete,deleted,sequence}`. Apply repeated
-  identities in sequence order, including deletions and restorations. Only entries
-  with `complete: true` and `deleted: false` are downloadable. The cursor
+  identities in sequence order, including deletions and restorations. Nondeleted
+  copies with available files are downloadable regardless of `complete`, which
+  reports media completeness only. The cursor
   is the last returned sequence, or `after` when the page is empty. Limits range
   from 1 to 100. Package file inventories are excluded; use the exact chapter
   lookup when a download needs the full manifest.
@@ -102,20 +103,23 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   otherwise it matches an exact plugin ID. `q` matches a literal title substring,
   ignoring ASCII letter case. Results contain `{items,total,hasMore}`, ordered by
   title and ID. Each item has `id`, `sequence`, `identity`, `novel`, `hasCover`, and
-  `chapterCount`, the number of available nondeleted chapter packages. Summaries
+  `chapterCount`, the number of available nondeleted chapter packages, including
+  copies with incomplete media. Summaries
   exclude chapter metadata and package file lists. Metadata-only works remain visible.
 - `GET /api/v1/catalog/sources` returns `{items:[{id,workCount}]}` for sources
   represented by current work metadata, ordered by source ID.
 - `GET /api/v1/catalog/works/:id/chapters?offset=0&limit=100` returns
   `{items,total,hasMore}` with current nondeleted chapter summaries containing
-  `{id,chapterPath,position,name,chapterNumber,page,contentType}`, ordered by chapter position and ID. Package
-  file manifests are excluded. Unknown works return 404; known works without packages return
+  `{id,chapterPath,position,name,chapterNumber,page,contentType,complete}`, ordered by chapter position and ID. Package
+  file manifests are excluded. `complete` is a required boolean status; both
+  complete and incomplete copies are listed. Unknown works return 404; known works without packages return
   an empty page. Both paginated endpoints accept limits from 1 to 100. Concurrent
   writes can shift offset pages; these pages are for browsing, not change tracking.
 - `GET /api/v1/catalog/chapter?pluginId=...&novelPath=...&chapterPath=...` resolves
-  one complete chapter by its exact, URL-encoded identity. Missing, incomplete,
-  or deleted entries return 404. `includeUnavailable=true` exposes the saved
-  record and its `complete` flag for nondeleted unavailable copies. Use its ID
+  one chapter with available original files by its exact, URL-encoded identity.
+  Media completeness does not restrict lookup or downloading. Missing files or
+  deleted entries return 404. `includeUnavailable=true` exposes the saved
+  record for nondeleted copies whose original files are unavailable. Use its ID
   and revision with the chapter-file download route
   with `manifest.layout` set to `chapter-files`.
   Optional numeric `chapterNumber` matches a unique chapter within the exact
@@ -164,7 +168,8 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   be repaired under any policy. Every catalog record includes the inspected
   `complete` flag and `fileBytes`, the sum of original file sizes.
 - `GET /api/v1/chapters/:id/files?revision=<revision>&path=<original-path>` streams
-  one original file from the current copy. A stale revision returns 404.
+  one original file from the current copy, including copies with incomplete media.
+  A stale revision returns 404.
   Its ETag is the quoted revision,
   a colon, and the original path;
   Content-Length is its declared size. The route uses the same read policy as the

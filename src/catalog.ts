@@ -2,7 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { problem } from './db.ts';
 import { authenticate } from './auth.ts';
-import { completeChapter, digest } from './packages.ts';
+import { availableChapter, digest } from './packages.ts';
 import type { CatalogEntry } from './packages.ts';
 import type { NovelMetadataV1, WorkEntry } from './works.ts';
 
@@ -18,8 +18,8 @@ const text = { type: 'string' };
 const nullableText = { type: ['string', 'null'] };
 const identityText = { type: 'string', minLength: 1, maxLength: 4096 };
 const count = { type: 'integer', minimum: 0 };
-const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name', 'chapterNumber', 'page', 'contentType'], properties: {
-  id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf'] },
+const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name', 'chapterNumber', 'page', 'contentType', 'complete'], properties: {
+  id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf'] }, complete: { type: 'boolean' },
 } };
 const chapterChangeSchema = { type: 'object', required: ['identity', 'complete', 'deleted', 'sequence'], properties: {
   identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelId: text, novelPath: text, chapterPath: text } },
@@ -91,7 +91,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
   });
   app.get<{ Querystring: { q?: string; source?: string; offset: number; limit: number } }>('/api/v1/catalog/works', { schema: {
     security,
-    description: 'Browse current indexed work summaries without synchronizing change history. Search matches a literal substring of the title (ASCII case-insensitive); source matches an exact plugin ID. chapterCount counts available nondeleted chapter packages. Ordered by title, then ID. Concurrent changes can shift offset pages.',
+    description: 'Browse current indexed work summaries without synchronizing change history. Search matches a literal substring of the title (ASCII case-insensitive); source matches an exact plugin ID. chapterCount counts available nondeleted chapter packages regardless of media completeness. Ordered by title, then ID. Concurrent changes can shift offset pages.',
     querystring: { type: 'object', additionalProperties: false, properties: { q: { type: 'string', maxLength: 500 }, source: identityText, ...pagination(40) } },
     response: { 200: pageSchema(workSummarySchema) },
   } }, async request => {
@@ -105,7 +105,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const rows = db.prepare(`SELECT w.id,json_extract(w.entry,'$.sequence') AS sequence,
       json_extract(w.entry,'$.metadata.identity') AS identity,json_extract(w.entry,'$.metadata.novel') AS novel,
       json_extract(w.entry,'$.hasCover') AS hasCover,
-      (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL AND json_extract(c.entry,'$.complete')=1) AS chapterCount
+      (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS chapterCount
       FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, limit, offset) as { id: string; sequence: number; identity: string; novel: string; hasCover: number; chapterCount: number }[];
     const items: WorkSummary[] = rows.map(row => ({ ...row, identity: JSON.parse(row.identity), novel: JSON.parse(row.novel), hasCover: Boolean(row.hasCover) }));
     return { items, total, hasMore: offset + items.length < total };
@@ -120,7 +120,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
   });
   app.get<{ Params: { id: string }; Querystring: { offset: number; limit: number } }>('/api/v1/catalog/works/:id/chapters', { schema: {
     security,
-    description: 'Page current nondeleted chapter summaries ordered by position, then ID. Summaries exclude package file manifests. An unknown work returns 404; a known work without packages returns an empty page.',
+    description: 'Page current nondeleted chapter summaries ordered by position, then ID. Summaries include media completeness as status and exclude package file manifests. An unknown work returns 404; a known work without packages returns an empty page.',
     params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
     querystring: { type: 'object', additionalProperties: false, properties: pagination(100) },
     response: { 200: pageSchema(chapterSummarySchema) },
@@ -130,16 +130,16 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const work = db.prepare('SELECT entry FROM works WHERE id=?').get(id) as { entry: string } | undefined;
     if (!work && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
     const titles = work ? (JSON.parse(work.entry) as WorkEntry).metadata.chapters : {};
-    const total = (db.prepare("SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL AND json_extract(entry,'$.complete')=1").get(id) as { n: number }).n;
+    const total = (db.prepare("SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL").get(id) as { n: number }).n;
     const items = db.prepare(`SELECT id,json_extract(entry,'$.manifest.identity.chapterPath') AS chapterPath,
       json_extract(entry,'$.manifest.chapter.position') AS position,json_extract(entry,'$.manifest.chapter.name') AS name,
-      json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType
-      FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL AND json_extract(entry,'$.complete')=1 ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
-    return { items: items.map(item => ({ ...item, name: titles[String(Number(item.chapterNumber))] ?? item.name })), total, hasMore: offset + items.length < total };
+      json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType,json_extract(entry,'$.complete') AS complete
+      FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
+    return { items: items.map(item => ({ ...item, complete: Boolean(item.complete), name: titles[String(Number(item.chapterNumber))] ?? item.name })), total, hasMore: offset + items.length < total };
   });
   app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string; includeUnavailable?: boolean } }>('/api/v1/catalog/chapter', { schema: {
     security,
-    description: 'Resolve a package by exact source identity, then optional chapter number within the same exact work. Missing or deleted chapters return 404; ambiguous folder matches return 409.',
+    description: 'Resolve a package by exact source identity, then optional chapter number within the same exact work. Media completeness does not restrict downloads. Missing files or deleted chapters return 404; ambiguous folder matches return 409.',
     querystring: { type: 'object', additionalProperties: false, required: ['pluginId', 'novelPath', 'chapterPath'], properties: { pluginId: identityText, novelPath: identityText, chapterPath: identityText, includeUnavailable: { type: 'boolean', default: false }, chapterNumber: { type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' } } },
     response: { 200: catalogSchema },
   } }, async request => {
@@ -150,17 +150,17 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     if (row) {
       if (row.deleted_at !== null) throw problem(404, 'Chapter not found');
       if (request.query.includeUnavailable) return JSON.parse(row.entry) as CatalogEntry;
-      const entry = completeChapter(db, dataDir, id);
+      const entry = availableChapter(db, dataDir, id);
       if (!entry) throw problem(404, 'Chapter files are unavailable');
       return entry;
     }
     if (!chapterNumber || pluginId === 'local') throw problem(404, 'Chapter not found');
     const work = digest(JSON.stringify([pluginId, novelPath]));
-    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR (path IS NOT NULL AND json_extract(entry,'$.complete')=1))").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
+    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR (path IS NOT NULL))").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
     if (!matches.length) throw problem(404, 'Chapter not found');
     if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
     if (request.query.includeUnavailable) return JSON.parse(matches[0].entry) as CatalogEntry;
-    const entry = completeChapter(db, dataDir, (JSON.parse(matches[0].entry) as CatalogEntry).id);
+    const entry = availableChapter(db, dataDir, (JSON.parse(matches[0].entry) as CatalogEntry).id);
     if (!entry) throw problem(404, 'Chapter files are unavailable');
     return entry;
   });
