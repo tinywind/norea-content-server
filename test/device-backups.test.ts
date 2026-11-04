@@ -226,3 +226,14 @@ test('backup downloads reject replaced symbolic files without reading outside th
     assert.deepEqual(await readFile(outside), body);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
+
+test('a backup upload that keeps sending is not cut off by the idle timeout', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'norea-backup-slow-'));
+  try {
+    const store = new DeviceBackupStore(dataDir, { timeoutMs: 60 });
+    const parts = Array.from({ length: 6 }, (_, index) => Buffer.from(`part-${index}`));
+    const slow = Readable.from((async function* () { for (const part of parts) { await delay(30); yield part; } })());
+    const saved = await store.put('Phone', slow, hash(Buffer.concat(parts)));
+    assert.equal(saved.size, Buffer.concat(parts).length);
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});

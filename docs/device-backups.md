@@ -29,7 +29,7 @@ private sync-key filter. Existing automatic device admission still applies.
 - `GET /api/v1/device-backups` returns `items`, each with `deviceName`, `updatedAt`
   (milliseconds since Unix epoch), `size` (bytes), and `sha256` (lowercase hex).
 - `PUT /api/v1/device-backups/:name` requires `application/octet-stream` and
-  `X-Backup-Sha256`. The nonempty body is limited to 512 MiB and 120 seconds.
+  `X-Backup-Sha256`. The nonempty body is limited to 512 MiB and fails after 120 seconds without new bytes.
   Response 200 is the saved metadata. Hash/length/name failures return 400,
   excessive size 413, wrong content type 415, and upload timeout 408 when the
   connection remains writable. Disconnected clients cannot receive an error body.

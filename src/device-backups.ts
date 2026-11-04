@@ -10,7 +10,8 @@ import { authenticateDevice } from './auth.ts';
 import { problem } from './db.ts';
 
 export const DEVICE_BACKUP_MAX_BYTES = 512 * 1024 * 1024;
-const UPLOAD_TIMEOUT_MS = 120000;
+/** An upload fails only after this long without receiving bytes, so large backups on slow links can finish. */
+const UPLOAD_IDLE_TIMEOUT_MS = 120000;
 const SHA256 = /^[0-9a-f]{64}$/;
 const REVISION = /^[0-9a-f-]{36}$/;
 
@@ -62,7 +63,7 @@ export class DeviceBackupStore {
     this.blobs = join(root, 'blobs');
     this.staging = join(root, 'staging');
     this.maxBytes = options.maxBytes ?? DEVICE_BACKUP_MAX_BYTES;
-    this.timeoutMs = options.timeoutMs ?? UPLOAD_TIMEOUT_MS;
+    this.timeoutMs = options.timeoutMs ?? UPLOAD_IDLE_TIMEOUT_MS;
     for (const path of [root, this.slots, this.blobs, this.staging]) privateDirectory(path);
   }
 
@@ -143,6 +144,7 @@ export class DeviceBackupStore {
     try {
       file = await open(stage, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
       for await (const chunk of source) {
+        timer.refresh();
         const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         size += bytes.length;
         if (size > this.maxBytes) throw problem(413, 'Device backup exceeds the 512 MiB limit');

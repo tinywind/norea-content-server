@@ -67,7 +67,7 @@ client contract and [design.md](docs/design.md) for the intended product behavio
 - `PUT /api/v1/device-backups/:name` stores one opaque archive with
   `Content-Type: application/octet-stream` and the required `X-Backup-Sha256`
   lowercase hexadecimal digest. URL-encode the device name. Maximum archive size
-  is 512 MiB and uploads time out after 120 seconds. A successful upload atomically
+  is 512 MiB and an upload times out after 120 seconds without new bytes. A successful upload atomically
   replaces the latest backup for that exact name; interrupted or invalid uploads
   retain the previous backup. Uploaded bytes are preserved without extraction.
 - `GET /api/v1/device-backups/:name?sha256=<listed-digest>` streams the archive.

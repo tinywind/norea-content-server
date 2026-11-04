@@ -30,13 +30,16 @@ const cursorSchema = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INT
 
 import { inspectChapterInventory } from './chapter-inventory.ts';
 
-export async function buildApp(options: { dataDir: string; anonymousRead?: boolean; limits?: Partial<Limits>; trashDays?: number }) {
+/** A request may take as long as it needs while bytes keep arriving; a socket idle this long is closed. */
+const SOCKET_IDLE_TIMEOUT_MS = 120000;
+
+export async function buildApp(options: { dataDir: string; anonymousRead?: boolean; limits?: Partial<Limits>; trashDays?: number; socketIdleTimeoutMs?: number }) {
   const dataDir = resolve(options.dataDir);
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
   try { rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
-  const app = Fastify({ bodyLimit: 1024 * 1024, requestTimeout: 120000, logger: false, trustProxy: false });
+  const app = Fastify({ bodyLimit: 1024 * 1024, connectionTimeout: options.socketIdleTimeoutMs ?? SOCKET_IDLE_TIMEOUT_MS, requestTimeout: 0, logger: false, trustProxy: false });
   await app.register(rateLimit, { global: true, max: 6000, timeWindow: '1 minute' });
   let anonymousRead = savedAnonymousRead(db, options.anonymousRead ?? true);
   const changes = createChangeNotifications(db);

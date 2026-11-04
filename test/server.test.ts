@@ -10,12 +10,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { saveWork } from '../src/works.ts';
 import { openDatabase } from '../src/db.ts';
 
-async function setup(anonymousRead = true) {
+async function setup(anonymousRead = true, socketIdleTimeoutMs?: number) {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(join('.tmp', 'test-'));
   const db = openDatabase(dataDir);
   saveWork(db, dataDir, { schemaVersion: 1, identity: { pluginId: 'example', novelId: 'one', novelPath: '/book/one' }, novel: { name: 'Example book', cover: null, author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: false }, cover: null }); db.close();
-  const app = await buildApp({ dataDir, anonymousRead });
+  const app = await buildApp({ dataDir, anonymousRead, socketIdleTimeoutMs });
   return { app, dataDir, device: () => deviceHeaders(app), admin: () => consoleHeaders(app, dataDir), close: async () => { await app.close(); await rm(dataDir, { recursive: true }); } };
 }
 
@@ -235,5 +235,35 @@ test('chapter size and file count limits reject uploads without publication', as
         assert.deepEqual((await app.inject('/api/v1/catalog/changes')).json().items,[]);
       } finally { await app.close(); }
     }
+  } finally { await s.close(); }
+});
+
+test('a slow upload that keeps sending finishes, and a stalled one is closed after the idle timeout', async () => {
+  const s = await setup(true, 150);
+  try {
+    const headers = await s.device();
+    const address = await s.app.listen({ host: '127.0.0.1', port: 0 });
+    assert.equal(s.app.server.requestTimeout, 0, 'no cap on the total request time');
+    const payload = await chapterFiles();
+    const slow = new Promise<number>((resolve, reject) => {
+      const request = httpRequest(`${address}/api/v1/chapter-files`, { method: 'POST', headers: { ...headers, 'content-type': multipartType, 'content-length': payload.length } }, response => { response.resume(); resolve(response.statusCode ?? 0); });
+      request.on('error', reject);
+      void (async () => {
+        const step = Math.ceil(payload.length / 8);
+        for (let offset = 0; offset < payload.length; offset += step) { request.write(payload.subarray(offset, offset + step)); await delay(80); }
+        request.end();
+      })();
+    });
+    const started = Date.now();
+    assert.equal(await slow, 200);
+    assert.ok(Date.now() - started > 450, 'the upload outlasted several idle windows');
+
+    const stalled = await new Promise<string>(resolve => {
+      const request = httpRequest(`${address}/api/v1/chapter-files`, { method: 'POST', headers: { ...headers, 'content-type': multipartType, 'content-length': payload.length } }, response => { response.resume(); resolve(`response ${response.statusCode}`); });
+      request.on('error', () => resolve('closed'));
+      request.on('close', () => resolve('closed'));
+      request.write(payload.subarray(0, 100));
+    });
+    assert.equal(stalled, 'closed');
   } finally { await s.close(); }
 });
