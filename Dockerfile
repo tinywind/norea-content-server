@@ -1,6 +1,6 @@
 FROM node:26-bookworm-slim AS build
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@11.25.0 --activate
+RUN npm install -g pnpm@11.25.0
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY tsconfig.web.json ./
@@ -9,7 +9,7 @@ RUN pnpm build && pnpm prune --prod
 
 FROM node:26-bookworm-slim
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@11.25.0 --activate
+RUN npm install -g pnpm@11.25.0
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/webdist ./webdist
 COPY --from=build /app/web ./web
