@@ -1,3 +1,4 @@
+import { chapterCompositionCatalog, parseChapterComposition, type ChapterCompositionV1 } from './chapter-composition.ts';
 import { randomUUID } from 'node:crypto';
 import { closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
@@ -25,6 +26,7 @@ export interface NovelMetadataV1 {
   };
   cover: { fileName: string; contentType: string | null } | null;
   chapters: Record<string, string>;
+  chapterComposition?: ChapterCompositionV1;
 }
 
 export interface WorkEntry { id: string; sequence: number; metadata: NovelMetadataV1; hasCover: boolean; deleted?: boolean }
@@ -68,6 +70,14 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
       chapters[number] = name as string;
     }
   }
+  const chapterComposition = value.chapterComposition === undefined ? undefined : parseChapterComposition(value.chapterComposition);
+  if (chapterComposition) {
+    const expected = chapterCompositionCatalog(chapterComposition);
+    if (Object.keys(chapters).length !== Object.keys(expected).length ||
+        Object.entries(expected).some(([number, name]) => chapters[number] !== name)) {
+      throw problem(400, 'work metadata: chapter catalog does not match the user composition');
+    }
+  }
   let cover: NovelMetadataV1['cover'] = null;
   if (value.cover != null) {
     const input = record(value.cover);
@@ -88,6 +98,7 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
     },
     cover,
     chapters,
+    ...(chapterComposition ? { chapterComposition } : {}),
   };
 }
 
@@ -158,7 +169,7 @@ export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, 
   if (directory !== workDirectory(db, metadata)) throw problem(409, 'Work folder does not match its source IDs');
   const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, metadataWorkId(metadata));
   if (collision) throw problem(409, 'Work directory is already assigned');
-  metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover), chapters: canonicalWorkChapters(db, metadata.identity, metadata.chapters) };
+  metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover), chapters: metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : canonicalWorkChapters(db, metadata.identity, metadata.chapters) };
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(409, 'Work was deleted from the server');
   if (existing && existing.directory !== directory) throw problem(409, 'Duplicate work identity in different folders');
@@ -234,9 +245,13 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
       stored = parseNovelMetadata(current);
     } catch { throw problem(409, 'Existing work metadata must be valid before it can be replaced'); }
     if (metadataWorkId(stored) !== id || stored.identity.novelId !== metadata.identity.novelId) throw problem(409, 'Work directory belongs to another source identity');
-    metadata.chapters = { ...stored.chapters, ...metadata.chapters };
+    if (stored.chapterComposition && (!metadata.chapterComposition ||
+        stored.chapterComposition.updatedAt >= metadata.chapterComposition.updatedAt)) {
+      metadata.chapterComposition = stored.chapterComposition;
+    }
+    metadata.chapters = metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : { ...stored.chapters, ...metadata.chapters };
   }
-  metadata.chapters = canonicalWorkChapters(db, metadata.identity, metadata.chapters);
+  metadata.chapters = metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : canonicalWorkChapters(db, metadata.identity, metadata.chapters);
   parseNovelMetadata(metadata);
   if (current === undefined || canonicalize(current) !== canonicalize(metadata)) atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
   return cacheWork(db, dataDir, directory, metadata, restore);

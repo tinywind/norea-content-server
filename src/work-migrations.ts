@@ -218,6 +218,7 @@ function validateChapterDecisions(db: DatabaseSync, source: WorkEntry, target: W
     if (paths.has(decision.sourceChapterPath)) conflict('chapter decisions repeat a source path');
     paths.add(decision.sourceChapterPath);
     if (decision.targetChapterPath === null && decision.targetChapterNumber !== null) conflict('deleted chapter decision must not have a target number');
+    if (decision.discardSourceContent !== undefined && (decision.discardSourceContent !== true || decision.targetChapterPath === null)) conflict('invalid source-content discard decision');
     const sourceChapter = decisionChapter(sourceChapters, decision.sourceChapterPath, decision.sourceChapterNumber);
     const sourceNumber = chapterNumber(decision.sourceChapterNumber ?? sourceChapter?.manifest.chapter.chapterNumber);
     if (sourceNumber !== null) {
@@ -244,8 +245,10 @@ function validateChapterDecisions(db: DatabaseSync, source: WorkEntry, target: W
     const decision = sources.get(mapping.sourceChapterId);
     if (!decision) conflict('source package has no explicit chapter decision');
     if (mapping.decision === 'delete-source') {
-      if (decision!.targetChapterPath !== null) conflict('delete-source contradicts the selected chapter target');
+      if (decision!.targetChapterPath !== null && !decision!.discardSourceContent) conflict('delete-source contradicts the selected chapter target');
+      if (decision!.discardSourceContent && (decision!.targetChapterNumber === null || !targetMetadata.has(chapterNumber(decision!.targetChapterNumber)))) conflict('discard target must remain in the final chapter metadata');
     } else {
+      if (decision!.discardSourceContent) conflict('source-content discard contradicts preservation');
       if (decision!.targetChapterPath === null) conflict('chapter preservation contradicts an explicit deletion');
       const selected = decisionChapter(targetChapters, decision!.targetChapterPath!, decision!.targetChapterNumber);
       if (selected?.id !== mapping.targetChapterId) conflict('chapter mapping differs from the selected target');
@@ -444,6 +447,7 @@ export function registerWorkMigrations(app: FastifyInstance, context: { db: Data
             decision: { type: 'string', enum: ['copy-source', 'keep-target', 'delete-source'] }, expectedTargetInventory: inventory } } },
         chapterDecisions: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
           required: ['sourceChapterPath', 'sourceChapterNumber', 'targetChapterPath', 'targetChapterNumber'], properties: {
+            discardSourceContent: { type: 'boolean', const: true },
             sourceChapterPath: { type: 'string', minLength: 1, maxLength: 4096 },
             sourceChapterNumber: { anyOf: [{ type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' }, { type: 'null' }] },
             targetChapterPath: { anyOf: [{ type: 'string', minLength: 1, maxLength: 4096 }, { type: 'null' }] },

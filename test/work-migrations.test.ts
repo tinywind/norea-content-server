@@ -623,3 +623,33 @@ test('all regular source cover formats are fenced while the fresh target metadat
     assert.equal(lineage.targetWork.coverSha256, null);
   } finally { await f.close(); }
 });
+
+for (const hasTargetBody of [false, true]) test('target-primary discards A body but retains its reading-state destination (B body: ' + hasTargetBody + ')', async () => {
+  const f = await fixture();
+  try {
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'A episode' } });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: { '1001': 'B episode' } });
+    const original = await f.upload('source', 1, 'A original body');
+    if (hasTargetBody) await f.upload('target', 1, 'B chosen body');
+    const from = migrationSnapshot(f.db, f.dataDir, sourceId);
+    const to = migrationSnapshot(f.db, f.dataDir, targetId);
+    const payload: FinalizeMigrationRequest = {
+      operationId: randomUUID(),
+      source: { revision: from.work.revision, chapters: [{ id: original.id, revision: original.revision }] },
+      target: { id: targetId, revision: to.work.revision },
+      mappings: [{ sourceChapterId: original.id, decision: 'delete-source' }],
+      chapterDecisions: [{ sourceChapterPath: '/source/1', sourceChapterNumber: '1', targetChapterPath: '/target/1',
+        targetChapterNumber: '1001', discardSourceContent: true }],
+    };
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 200, response.body);
+    const entry = (await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json();
+    assert.equal(entry.chapterDecisions[0].targetChapterPath, '/target/1');
+    assert.equal(entry.chapterDecisions[0].discardSourceContent, true);
+    assert.equal(entry.mappings[0].decision, 'delete-source');
+    const target = migrationSnapshot(f.db, f.dataDir, targetId);
+    assert.equal(target.chapters.length, hasTargetBody ? 1 : 0);
+    if (hasTargetBody) assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'B chosen body');
+    assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 404);
+  } finally { await f.close(); }
+});

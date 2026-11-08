@@ -3,6 +3,7 @@ import { problem } from './db.ts';
 import type { MigrationInventory, MigrationSnapshot } from './work-migrations.ts';
 
 export interface MigrationChapterDecision {
+  discardSourceContent?: true;
   sourceChapterPath: string;
   sourceChapterNumber: string | null;
   targetChapterPath: string | null;
