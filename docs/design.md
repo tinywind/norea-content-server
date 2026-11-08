@@ -677,6 +677,11 @@ the server database. Upload clients register work metadata before chapter packag
 `GET /api/v1/works?after=0&limit=100` provides incremental work changes.
 `GET` and device-authenticated `PUT /api/v1/works/:id` transfer metadata;
 `GET` and `PUT /api/v1/works/:id/cover` transfer image bytes separately, up to 10 MiB.
+A device `DELETE /api/v1/works/:id/cover` with the current migration snapshot
+revision clears local cover formats without changing body files. Metadata-only
+uploads do not imply image deletion. Snapshots include full metadata and an actual
+cover SHA-256 so clients can verify fresh target plugin metadata, including nulls.
+
 The work ID hashes the exact plugin ID and novel path. Metadata and cover changes
 advance the work cursor. Clients retain file fingerprints to preserve pending local
 edits and avoid unchanged uploads. Chapters transfer only their original files.
@@ -694,3 +699,21 @@ dialog, and chapter deletion and restoration actions. Cover requests carry conso
 in headers rather than URLs.
 Work summaries show catalog and available-file counts separately and omit the
 chapter map. The Metadata action fetches the complete work document on demand.
+
+
+## Shared work migration
+
+See [Conditional work migration](work-migration.md) for the exact API contract.
+An explicit server-copy step stages original source files under the selected
+target identity and ordinal with source/target revision checks. Finalization
+requires a full source snapshot and a copy, keep, or explicit deletion decision
+for each server source package. New clients include metadata-only chapter choices.
+
+The retirement transaction records source tombstones, receipt, immutable work
+snapshots, validated choices, and an active lineage event together. Other devices
+consume a coalesced event feed and can follow A-to-B-to-C after intermediate
+works disappear. Explicit restoration appends an inactive event atomically;
+ordinary metadata or payload uploads cannot resurrect the source. Event-specific
+reads let pending clients revalidate before local retirement. Additive tables
+retain the original database checksum and existing state. Older receipts remain
+intact without fabricated target mappings.

@@ -399,3 +399,227 @@ test('body-only kept target accepts verified text markup with null declarations'
     assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), body);
   } finally { await f.close(); }
 });
+
+
+function allDecisions(f: Awaited<ReturnType<typeof fixture>>, request: FinalizeMigrationRequest): NonNullable<FinalizeMigrationRequest['chapterDecisions']> {
+  const source = migrationSnapshot(f.db, f.dataDir, sourceId);
+  const target = migrationSnapshot(f.db, f.dataDir, targetId);
+  return request.mappings.map(mapping => {
+    const from = source.chapters.find(chapter => chapter.id === mapping.sourceChapterId)!;
+    const to = mapping.decision === 'delete-source' ? undefined : target.chapters.find(chapter => chapter.id === mapping.targetChapterId)!;
+    return { sourceChapterPath: from.chapterPath, sourceChapterNumber: from.chapterNumber, targetChapterPath: to?.chapterPath ?? null, targetChapterNumber: to?.chapterNumber ?? null };
+  });
+}
+
+test('lineage preserves full captured metadata, explicit chapter decisions and verified inventories after source retirement', async () => {
+  const f = await fixture();
+  try {
+    saveWork(f.db, f.dataDir, { ...metadata('source'), novel: { ...metadata('source').novel, author: 'Old source author' }, chapters: { '1': 'Episode 1', '2': 'Unread metadata-only episode' } });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), novel: { ...metadata('target').novel, author: 'Fresh target author' }, chapters: { '1001': 'Episode 1' } });
+    await f.upload('source'); const target = await f.upload('target');
+    const payload = f.request();
+    payload.chapterDecisions = [...allDecisions(f, payload),
+      { sourceChapterPath: '/source/2', sourceChapterNumber: '2', targetChapterPath: null, targetChapterNumber: null },
+      { sourceChapterPath: '/local-only/99', sourceChapterNumber: '99', targetChapterPath: null, targetChapterNumber: null }];
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 200, response.body);
+    const feed = await f.app.inject('/api/v1/work-migrations');
+    assert.equal(feed.statusCode, 200, feed.body);
+    assert.equal(feed.headers['cache-control'], 'no-store');
+    const page = feed.json();
+    assert.equal(page.items.length, 1); assert.equal(page.hasMore, false);
+    const entry = page.items[0];
+    assert.equal(entry.sequence, page.cursor); assert.equal(entry.operationId, payload.operationId); assert.equal(entry.active, true);
+    assert.equal(entry.sourceWork.id, sourceId); assert.equal(entry.sourceWork.metadata.novel.author, 'Old source author');
+    assert.equal(entry.targetWork.id, targetId); assert.equal(entry.targetWork.metadata.novel.author, 'Fresh target author');
+    assert.deepEqual(entry.targetWork.metadata.chapters, { '1001': 'Episode 1' });
+    assert.deepEqual(entry.deletedSource, { revision: payload.source.revision, sequence: response.json().deletedWork.sequence });
+    assert.equal(entry.fullDecisionCoverage, true);
+    assert.equal(entry.chapterDecisions.length, 3);
+    assert.equal(entry.chapterDecisions[1].sourceMetadataVerified, true);
+    assert.equal(entry.chapterDecisions[2].sourceMetadataVerified, false);
+    assert.deepEqual(entry.mappings[0].targetInventory, await f.inventory(target));
+    assert.equal(entry.mappings[0].source.chapterPath, '/source/1');
+    assert.equal(entry.mappings[0].target.chapterNumber, '1001');
+    assert.equal(JSON.stringify(entry).includes('synthetic body'), false);
+    assert.deepEqual((await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json(), entry);
+    assert.deepEqual((await f.app.inject('/api/v1/works/' + targetId + '/migration-history')).json().items, [entry]);
+    assert.deepEqual((await f.app.inject('/api/v1/works/' + sourceId + '/migration-history')).json().items, [entry]);
+    assert.deepEqual((await f.app.inject('/api/v1/work-migrations?after=' + page.cursor)).json(), { items: [], cursor: page.cursor, hasMore: false });
+    assert.equal((await f.app.inject('/api/v1/work-migrations?after=' + (page.cursor + 1))).statusCode, 409);
+    assert.equal((await f.app.inject('/api/v1/work-migrations/' + randomUUID())).statusCode, 404);
+  } finally { await f.close(); }
+});
+
+test('explicit delete-source works for an unavailable selected source and does not fabricate a target package', async () => {
+  const f = await fixture();
+  try {
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'Episode 1' } });
+    const source = await f.upload('source');
+    await unlink(join(f.dataDir, 'contents/source/book/1/content.html'));
+    const from = migrationSnapshot(f.db, f.dataDir, sourceId);
+    const to = migrationSnapshot(f.db, f.dataDir, targetId);
+    const payload: FinalizeMigrationRequest = { operationId: randomUUID(), source: { revision: from.work.revision, chapters: [{ id: source.id, revision: source.revision }] }, target: { id: targetId, revision: to.work.revision },
+      mappings: [{ sourceChapterId: source.id, decision: 'delete-source' }],
+      chapterDecisions: [{ sourceChapterPath: '/source/1', sourceChapterNumber: '1', targetChapterPath: null, targetChapterNumber: null }] };
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 200, response.body);
+    const entry = (await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json();
+    assert.deepEqual(entry.mappings[0], { source: { ...from.chapters[0], available: false }, decision: 'delete-source', target: null, targetInventory: null });
+    assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 404);
+    assert.equal(migrationSnapshot(f.db, f.dataDir, targetId).chapters.length, 0);
+  } finally { await f.close(); }
+});
+
+for (const invalid of ['missing-metadata-decision', 'delete-without-decision', 'contradictory-delete', 'contradictory-copy', 'wrong-source-number', 'wrong-target-number'] as const) test('retains original data when full decisions are invalid: ' + invalid, async () => {
+  const f = await fixture();
+  try {
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'Episode 1', '2': 'Metadata only' } });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: { '1001': 'Episode 1' } });
+    await f.upload('source'); await f.upload('target');
+    const payload = f.request();
+    payload.chapterDecisions = [...allDecisions(f, payload), { sourceChapterPath: '/source/2', sourceChapterNumber: '2', targetChapterPath: null, targetChapterNumber: null }];
+    if (invalid === 'missing-metadata-decision') payload.chapterDecisions.pop();
+    if (invalid === 'delete-without-decision') { payload.mappings[0] = { sourceChapterId: payload.mappings[0].sourceChapterId, decision: 'delete-source' }; delete payload.chapterDecisions; }
+    if (invalid === 'contradictory-delete') payload.mappings[0] = { sourceChapterId: payload.mappings[0].sourceChapterId, decision: 'delete-source' };
+    if (invalid === 'contradictory-copy') { payload.chapterDecisions![0].targetChapterPath = null; payload.chapterDecisions![0].targetChapterNumber = null; }
+    if (invalid === 'wrong-source-number') payload.chapterDecisions![0].sourceChapterNumber = '50';
+    if (invalid === 'wrong-target-number') payload.chapterDecisions![0].targetChapterNumber = '50';
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 409, response.body);
+    assert.equal(await f.sourceBody(), 'synthetic body');
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migration_lineage').get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migration_events').get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+test('legacy payload-only finalization is explicitly marked as incomplete decision coverage', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const payload = f.request(); assert.equal((await f.submit(payload)).statusCode, 200);
+    const entry = (await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json();
+    assert.equal(entry.fullDecisionCoverage, false);
+    assert.deepEqual(entry.chapterDecisions, []);
+  } finally { await f.close(); }
+});
+
+test('explicit source restoration appends revocation and coalesces historical active events for new devices', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const payload = f.request(); payload.chapterDecisions = allDecisions(f, payload);
+    assert.equal((await f.submit(payload)).statusCode, 200);
+    const before = (await f.app.inject('/api/v1/work-migrations')).json();
+    const ordinary = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId, headers: f.headers, payload: metadata('source') });
+    assert.equal(ordinary.statusCode, 410);
+    assert.equal((await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json().active, true);
+    f.db.exec("CREATE TRIGGER fail_revocation BEFORE INSERT ON work_migration_events WHEN NEW.active=0 BEGIN SELECT RAISE(ABORT,'synthetic revocation failure'); END");
+    const failedRestore = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') });
+    assert.equal(failedRestore.statusCode, 500);
+    assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 404);
+    assert.equal((await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json().active, true);
+    f.db.exec('DROP TRIGGER fail_revocation');
+    const restored = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') });
+    assert.equal(restored.statusCode, 200, restored.body);
+    const revoked = (await f.app.inject('/api/v1/work-migrations?after=' + before.cursor)).json();
+    assert.equal(revoked.items.length, 1); assert.ok(revoked.cursor > before.cursor);
+    assert.equal(revoked.items[0].active, false); assert.equal(revoked.items[0].operationId, payload.operationId);
+    assert.deepEqual(revoked.items[0].chapterDecisions, before.items[0].chapterDecisions);
+    assert.deepEqual((await f.app.inject('/api/v1/work-migrations')).json().items, revoked.items);
+    assert.deepEqual((await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json(), revoked.items[0]);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migration_events').get() as { n: number }).n, 2);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migration_lineage').get() as { n: number }).n, 1);
+    assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'synthetic body');
+  } finally { await f.close(); }
+});
+
+test('lineage failure rolls back source retirement, chapter tombstones and receipt atomically', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const payload = f.request(); payload.chapterDecisions = allDecisions(f, payload);
+    f.db.exec("CREATE TRIGGER fail_lineage_event BEFORE INSERT ON work_migration_events BEGIN SELECT RAISE(ABORT,'synthetic event failure'); END");
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 500, response.body);
+    assert.equal(await f.sourceBody(), 'synthetic body');
+    for (const table of ['work_migrations', 'work_migration_lineage', 'work_migration_events', 'work_tombstones', 'chapter_tombstones']) assert.equal((f.db.prepare('SELECT count(*) AS n FROM ' + table).get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+test('lineage retains an entire A to B to C chain after intermediate target deletion and restart', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const first = f.request(); first.chapterDecisions = allDecisions(f, first);
+    assert.equal((await f.submit(first)).statusCode, 200);
+    saveWork(f.db, f.dataDir, metadata('third'));
+    const third = await f.upload('third');
+    const middle = migrationSnapshot(f.db, f.dataDir, targetId);
+    const last = migrationSnapshot(f.db, f.dataDir, workId('third'));
+    const second: FinalizeMigrationRequest = { operationId: randomUUID(), source: { revision: middle.work.revision, chapters: middle.chapters.map(({ id, revision }) => ({ id, revision })) },
+      target: { id: last.work.id, revision: last.work.revision }, mappings: [{ sourceChapterId: middle.chapters[0].id, targetChapterId: third.id, targetRevision: third.revision, decision: 'copy-source' }],
+      chapterDecisions: [{ sourceChapterPath: middle.chapters[0].chapterPath, sourceChapterNumber: middle.chapters[0].chapterNumber, targetChapterPath: third.manifest.identity.chapterPath, targetChapterNumber: third.manifest.chapter.chapterNumber! }] };
+    const response = await f.app.inject({ method: 'POST', url: '/api/v1/works/' + targetId + '/finalize-migration', headers: f.headers, payload: second });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal((await f.app.inject('/api/v1/works/' + targetId)).statusCode, 404);
+    await f.app.close();
+    const restarted = await buildApp({ dataDir: f.dataDir, anonymousRead: false });
+    try {
+      assert.equal((await restarted.inject('/api/v1/work-migrations')).statusCode, 401);
+      assert.equal((await restarted.inject('/api/v1/work-migrations/' + first.operationId)).statusCode, 401);
+      const firstPage = await restarted.inject({ url: '/api/v1/works/' + workId('third') + '/migration-history?limit=1', headers: f.headers });
+      assert.equal(firstPage.statusCode, 200);
+      assert.equal(firstPage.json().hasMore, true);
+      const next = await restarted.inject({ url: '/api/v1/works/' + workId('third') + '/migration-history?after=' + firstPage.json().cursor + '&limit=1', headers: f.headers });
+      assert.deepEqual([firstPage.json().items[0].operationId, next.json().items[0].operationId], [first.operationId, second.operationId]);
+      assert.equal(firstPage.json().items[0].active, true); assert.equal(next.json().items[0].active, true);
+      assert.equal(firstPage.json().items[0].targetWork.metadata.identity.pluginId, 'target');
+      assert.equal(next.json().items[0].targetWork.metadata.identity.pluginId, 'third');
+      assert.equal((await restarted.inject({ url: '/api/v1/works/' + sourceId + '/migration-history', headers: f.headers })).json().items.length, 2);
+    } finally { await restarted.close(); }
+  } finally { await f.close(); }
+});
+
+test('additive lineage tables preserve original schema, credentials, data and older receipts without inventing history', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const payload = f.request(); assert.equal((await f.submit(payload)).statusCode, 200);
+    const checksum = f.db.prepare('SELECT checksum FROM schema_state').get();
+    const schemaVersion = f.db.prepare('PRAGMA user_version').get();
+    const works = f.db.prepare('SELECT * FROM works ORDER BY id').all();
+    const receipts = f.db.prepare('SELECT * FROM work_migrations').all();
+    const devices = f.db.prepare('SELECT id,key_hash,device_name,blocked FROM devices').all();
+    f.db.exec('DROP TABLE work_migration_events; DROP TABLE work_migration_lineage');
+    const reopened = openDatabase(f.dataDir);
+    try {
+      assert.deepEqual(reopened.prepare('SELECT checksum FROM schema_state').get(), checksum);
+      assert.deepEqual(reopened.prepare('PRAGMA user_version').get(), schemaVersion);
+      assert.deepEqual(reopened.prepare('SELECT * FROM works ORDER BY id').all(), works);
+      assert.deepEqual(reopened.prepare('SELECT * FROM work_migrations').all(), receipts);
+      assert.deepEqual(reopened.prepare('SELECT id,key_hash,device_name,blocked FROM devices').all(), devices);
+      assert.equal((reopened.prepare('SELECT count(*) AS n FROM work_migration_lineage').get() as { n: number }).n, 0);
+      assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'synthetic body');
+    } finally { reopened.close(); }
+  } finally { await f.close(); }
+});
+
+test('all regular source cover formats are fenced while the fresh target metadata remains authoritative', async () => {
+  const f = await fixture();
+  try {
+    const from = { ...metadata('source'), cover: { fileName: 'cover.jpg', contentType: 'image/jpeg' } };
+    saveWork(f.db, f.dataDir, from);
+    await writeFile(join(f.dataDir, 'contents/source/book/cover.jpg'), 'source selected cover');
+    await writeFile(join(f.dataDir, 'contents/source/book/cover.png'), 'source older cover');
+    await f.upload('source'); await f.upload('target');
+    const payload = f.request(); payload.chapterDecisions = allDecisions(f, payload);
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 200, response.body);
+    const target = (await f.app.inject('/api/v1/works/' + targetId)).json();
+    assert.equal(target.hasCover, false); assert.equal(target.metadata.cover, null);
+    const lineage = (await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json();
+    assert.equal(lineage.sourceWork.coverSha256, digest(Buffer.from('source selected cover')));
+    assert.equal(lineage.targetWork.coverSha256, null);
+  } finally { await f.close(); }
+});

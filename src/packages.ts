@@ -177,7 +177,7 @@ export function uploadCursor(db: DatabaseSync): { catalog: number; works: number
   return db.prepare('SELECT (SELECT coalesce(max(sequence),0) FROM catalog_changes) AS catalog,(SELECT coalesce(max(sequence),0) FROM work_changes) AS works').get() as { catalog: number; works: number };
 }
 
-export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete'): CatalogEntry {
+export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete', verifyCommit?: () => void): CatalogEntry {
   let manifest = canonicalChapterManifest(db, entry.manifest);
   let id = chapterIdentityId(db, manifest.identity);
   if (id !== entry.id || canonicalize(manifest) !== canonicalize(entry.manifest)) {
@@ -193,6 +193,7 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
   let committed = false;
   try {
     const result = transaction(db, () => {
+      verifyCommit?.();
       const known = imported ? undefined : findChapterUploadIdentity(db, manifest);
       if (known && known.id !== id) {
         manifest = { ...manifest, identity: known.manifest.identity,

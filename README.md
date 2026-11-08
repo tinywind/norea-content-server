@@ -214,13 +214,27 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   unblocked devices. The app exposes it in server browsing and the selected
   work's server data page. It preserves device copies and personal reading state;
   deletion records block automatic reuploads until an explicit restore.
-- `GET /api/v1/works/:id/migration-snapshot` returns the work revision and all
-  nondeleted chapter IDs/revisions, including unavailable copies.
+- `GET /api/v1/works/:id/migration-snapshot` returns full current metadata, actual
+  cover SHA-256, work revision, and all nondeleted chapter IDs/revisions, including
+  unavailable copies.
+- `DELETE /api/v1/works/:id/cover` conditionally clears every local cover format
+  with `{revision}` when fresh plugin metadata explicitly has no cover. It
+  preserves chapter bodies and requires a registered device.
+- `POST /api/v1/works/:id/migration-copy` copies one explicitly selected existing
+  server package to the latest target identity and ordinal. Revisions fence both
+  sides; the source remains until finalization.
 - `POST /api/v1/works/:id/finalize-migration` conditionally retires a source work
   after validating the full snapshot and the actual complete target copies.
-  Explicit copy-source and keep-target decisions have separate integrity checks;
-  conflicts preserve the source and exact retries use a durable receipt. See
+  Copy-source and keep-target have separate integrity checks; delete-source
+  requires a matching explicit exclusion. Full choices and immutable source/target
+  snapshots are stored with the receipt. Conflicts preserve the source. See
   [Conditional work migration](docs/work-migration.md) for the request contract.
+- `GET /api/v1/work-migrations?after=0&limit=100` shares the latest event per
+  migration with other devices. Explicit source restoration appends an inactive
+  event. `GET /api/v1/work-migrations/:operationId` rechecks pending work;
+  `GET /api/v1/works/:id/migration-history` retains the connected chain, including
+  deleted intermediate targets. These APIs use normal read authentication and
+  include metadata and hashes without body or media bytes.
 - `GET /api/v1/changes?catalogAfter=0&workAfter=0&waitSeconds=20` returns
   `{catalogCursor,workCursor}`. Both cursors are required. It waits up to 20 seconds
   for catalog or work metadata changes. Disabling anonymous reading also
@@ -233,7 +247,9 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   refreshes only that work from its authoritative `novel.json` and cover.
 
 Capabilities include `authentication: "device-key"`, `personalStateSync: true`,
-`readingStateVersion: 1`, `deviceBackupVersion: 1`, and `workMigrationVersion: 1`.
+`readingStateVersion: 1`, `deviceBackupVersion: 1`, `workMigrationVersion: 1`,
+`workCoverDeletionVersion: 1`, `workMigrationCopyVersion: 1`, and
+`workMigrationLineageVersion: 1`.
 Account sessions and the legacy `/state` endpoints
 are unsupported. The reading-state extension adds its table without changing the
 current database checksum or replacing existing data. This development version

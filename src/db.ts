@@ -50,6 +50,20 @@ const workMigrationSchema = `
       request_hash TEXT NOT NULL,
       result TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS work_migration_lineage (
+      operation_id TEXT PRIMARY KEY,
+      source_work_id TEXT NOT NULL,
+      target_work_id TEXT NOT NULL,
+      entry TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS work_migration_lineage_source ON work_migration_lineage(source_work_id);
+    CREATE INDEX IF NOT EXISTS work_migration_lineage_target ON work_migration_lineage(target_work_id);
+    CREATE TABLE IF NOT EXISTS work_migration_events (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      operation_id TEXT NOT NULL REFERENCES work_migration_lineage(operation_id),
+      active INTEGER NOT NULL CHECK(active IN (0,1))
+    );
+    CREATE INDEX IF NOT EXISTS work_migration_events_operation ON work_migration_events(operation_id,sequence);
 `;
 
 const chapterNumberSchema = `

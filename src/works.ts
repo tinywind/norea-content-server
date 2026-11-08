@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -7,6 +7,7 @@ import { canonicalize } from 'json-canonicalize';
 import { authenticate, authenticateDevice } from './auth.ts';
 import { assertChapterNumberReconciliationReady, canonicalWorkChapters } from './chapter-number-mappings.ts';
 import { problem, transaction } from './db.ts';
+import { deactivateWorkMigrationsForSource } from './work-migration-lineage.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
 
 export interface NovelMetadataV1 {
@@ -137,7 +138,7 @@ const rowFor = (db: DatabaseSync, id: string) => {
   assertChapterNumberReconciliationReady(db, id);
   return db.prepare('SELECT * FROM works WHERE id=?').get(id) as WorkRow | undefined;
 };
-function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer | undefined {
+export function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer | undefined {
   if (!metadata.cover) return undefined;
   const path = join(directory, metadata.cover.fileName);
   try { const bytes = readBytes(path, coverByteLimit); return bytes.length ? bytes : undefined; }
@@ -170,7 +171,10 @@ export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, 
     entry.sequence = Number(sequence); const json = JSON.stringify(entry);
     db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(json, sequence);
     db.prepare('INSERT INTO works(id,directory,entry,fingerprint) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET entry=excluded.entry,fingerprint=excluded.fingerprint').run(id, directory, json, fingerprint);
-    if (restore) db.prepare('UPDATE work_tombstones SET deleted=0 WHERE work_id=?').run(id);
+    if (restore) {
+      db.prepare('UPDATE work_tombstones SET deleted=0 WHERE work_id=?').run(id);
+      deactivateWorkMigrationsForSource(db, id);
+    }
     return entry;
   };
   return db.isTransaction ? persist() : transaction(db, persist);
@@ -293,9 +297,58 @@ export function saveWorkCover(db: DatabaseSync, dataDir: string, id: string, byt
   return cacheWork(db, dataDir, row.directory, metadata);
 }
 
+/** Explicitly clear a freshly observed absent cover without treating ordinary metadata omissions as deletion. */
+export function deleteWorkCover(db: DatabaseSync, dataDir: string, id: string, revision: string): WorkEntry {
+  let retired: string | undefined;
+  const moved: { from: string; to: string }[] = [];
+  let entry: WorkEntry;
+  try {
+    entry = transaction(db, () => {
+      const current = getWork(db, dataDir, id);
+      const row = rowFor(db, id)!;
+      if (row.fingerprint !== revision) throw problem(409, 'Work changed before cover removal');
+      const folder = join(dataDir, row.directory);
+      const file = join(folder, 'novel.json');
+      const metadata = readNovelMetadata(file);
+      const covers = readdirSync(folder, { withFileTypes: true }).filter(item => isCoverFile(item.name)).sort((a, b) => a.name.localeCompare(b.name));
+      if (covers.some(item => !item.isFile() || item.isSymbolicLink())) throw problem(400, 'Cover removal requires regular work files');
+      if (!covers.length && metadata.cover === null) return current;
+      // Keep every original until both metadata and its index commit. A sibling
+      // stays on the content mount and cannot be rediscovered as this work's cover.
+      retired = join(dirname(folder), '.norea-cover-delete-' + randomUUID());
+      mkdirSync(retired);
+      for (const name of covers.map(item => item.name)) {
+        const from = join(folder, name); const to = join(retired, name);
+        renameSync(from, to); moved.push({ from, to });
+      }
+      const backup = join(retired, 'novel.json');
+      copyFileSync(file, backup, constants.COPYFILE_EXCL); moved.push({ from: file, to: backup });
+      // Keep novel.json continuously present; a process interruption cannot
+      // orphan the work's chapter index while its cover files are staged.
+      metadata.cover = null;
+      atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
+      return cacheWork(db, dataDir, row.directory, metadata);
+    });
+  } catch (error) {
+    const failures: unknown[] = [];
+    for (const file of moved.reverse()) {
+      try { renameSync(file.to, file.from); } catch (restoreError) { failures.push(restoreError); }
+    }
+    if (failures.length) throw new AggregateError([error, ...failures], 'Cover removal failed and staged originals could not be fully restored');
+    if (retired) rmSync(retired, { recursive: true, force: true });
+    throw error;
+  }
+  if (retired) {
+    try { rmSync(retired, { recursive: true, force: true }); }
+    catch { console.warn('Deferred removal of a retired work cover copy'); }
+  }
+  return entry;
+}
+
 export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; notify: () => void }): void {
   const { db, dataDir, requireRead, notify } = context;
   const uploadCursors = new WeakMap<FastifyRequest, number>();
+  const coverUploadRevisions = new WeakMap<FastifyRequest, string>();
   const params = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
   app.addContentTypeParser(/^image\/[a-zA-Z0-9.+-]+$/, { parseAs: 'buffer', bodyLimit: coverByteLimit }, (_request, body, done) => done(null, body));
   app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: coverByteLimit }, (_request, body, done) => done(null, body));
@@ -329,11 +382,23 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
   app.put<{ Params: { id: string }; Body: Buffer }>('/api/v1/works/:id/cover', { bodyLimit: coverByteLimit, onRequest: async request => {
     authenticateDevice(db, request);
     uploadCursors.set(request, (db.prepare('SELECT coalesce(max(sequence),0) AS n FROM work_changes').get() as { n: number }).n);
+    getWork(db, dataDir, request.params.id);
+    coverUploadRevisions.set(request, rowFor(db, request.params.id)!.fingerprint);
   }, schema: { params, security: [{ bearerAuth: [] }] } }, async request => {
     if (!Buffer.isBuffer(request.body)) throw problem(415, 'Raw image bytes are required');
     const deletion = db.prepare('SELECT sequence FROM work_tombstones WHERE work_id=?').get(request.params.id) as { sequence: number } | undefined;
     if ((deletion?.sequence ?? 0) > uploadCursors.get(request)!) throw problem(410, 'Work was deleted during upload');
+    getWork(db, dataDir, request.params.id);
+    if (rowFor(db, request.params.id)!.fingerprint !== coverUploadRevisions.get(request)) throw problem(409, 'Work changed during cover upload');
     const entry = saveWorkCover(db, dataDir, request.params.id, request.body); notify(); return entry;
+  });
+  app.delete<{ Params: { id: string }; Body: { revision: string } }>('/api/v1/works/:id/cover', { schema: {
+    params, security: [{ bearerAuth: [] }],
+    body: { type: 'object', additionalProperties: false, required: ['revision'], properties: { revision: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
+    description: 'Conditionally remove every local cover image when fresh source metadata explicitly has no cover. Requires the current work migration-snapshot revision and preserves all chapters and other metadata.',
+  } }, async request => {
+    authenticateDevice(db, request);
+    const entry = deleteWorkCover(db, dataDir, request.params.id, request.body.revision); notify(); return entry;
   });
   for (const prefix of ['/api/v1/works', '/api/v1/admin/works']) {
     app.get<{ Params: { id: string } }>(`${prefix}/:id/cover`, { schema: { params } }, async (request, reply) => {
