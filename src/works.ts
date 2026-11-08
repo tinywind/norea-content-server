@@ -5,6 +5,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { canonicalize } from 'json-canonicalize';
 import { authenticate, authenticateDevice } from './auth.ts';
+import { assertChapterNumberReconciliationReady, canonicalWorkChapters } from './chapter-number-mappings.ts';
 import { problem, transaction } from './db.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
 
@@ -132,7 +133,10 @@ function atomicWrite(path: string, bytes: string | Buffer): void {
     renameSync(temporary, path);
   } finally { if (descriptor !== undefined) closeSync(descriptor); rmSync(temporary, { force: true }); }
 }
-const rowFor = (db: DatabaseSync, id: string) => db.prepare('SELECT * FROM works WHERE id=?').get(id) as WorkRow | undefined;
+const rowFor = (db: DatabaseSync, id: string) => {
+  assertChapterNumberReconciliationReady(db, id);
+  return db.prepare('SELECT * FROM works WHERE id=?').get(id) as WorkRow | undefined;
+};
 function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer | undefined {
   if (!metadata.cover) return undefined;
   const path = join(directory, metadata.cover.fileName);
@@ -153,14 +157,14 @@ export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, 
   if (directory !== workDirectory(db, metadata)) throw problem(409, 'Work folder does not match its source IDs');
   const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, metadataWorkId(metadata));
   if (collision) throw problem(409, 'Work directory is already assigned');
-  metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover) };
+  metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover), chapters: canonicalWorkChapters(db, metadata.identity, metadata.chapters) };
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(409, 'Work was deleted from the server');
   if (existing && existing.directory !== directory) throw problem(409, 'Duplicate work identity in different folders');
   const cover = coverBytes(join(dataDir, directory), metadata);
   const fingerprint = digest(canonicalize(metadata) + '\n' + (cover ? digest(cover) : ''));
   if (existing?.fingerprint === fingerprint) return JSON.parse(existing.entry) as WorkEntry;
-  return transaction(db, () => {
+  const persist = () => {
     const entry: WorkEntry = { id, sequence: 0, metadata, hasCover: cover !== undefined };
     const sequence = db.prepare('INSERT INTO work_changes(work_id,entry) VALUES(?,?)').run(id, '{}').lastInsertRowid;
     entry.sequence = Number(sequence); const json = JSON.stringify(entry);
@@ -168,7 +172,8 @@ export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, 
     db.prepare('INSERT INTO works(id,directory,entry,fingerprint) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET entry=excluded.entry,fingerprint=excluded.fingerprint').run(id, directory, json, fingerprint);
     if (restore) db.prepare('UPDATE work_tombstones SET deleted=0 WHERE work_id=?').run(id);
     return entry;
-  });
+  };
+  return db.isTransaction ? persist() : transaction(db, persist);
 }
 
 export function rebuildWorkIndex(db: DatabaseSync, dataDir: string): void {
@@ -227,6 +232,7 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
     if (metadataWorkId(stored) !== id || stored.identity.novelId !== metadata.identity.novelId) throw problem(409, 'Work directory belongs to another source identity');
     metadata.chapters = { ...stored.chapters, ...metadata.chapters };
   }
+  metadata.chapters = canonicalWorkChapters(db, metadata.identity, metadata.chapters);
   parseNovelMetadata(metadata);
   if (current === undefined || canonicalize(current) !== canonicalize(metadata)) atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
   return cacheWork(db, dataDir, directory, metadata, restore);

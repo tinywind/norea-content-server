@@ -52,6 +52,30 @@ const workMigrationSchema = `
     );
 `;
 
+const chapterNumberSchema = `
+    CREATE TABLE IF NOT EXISTS chapter_number_reconciliations (
+      operation_id TEXT PRIMARY KEY,
+      work_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('prepared','committed')),
+      journal TEXT,
+      result TEXT
+    );
+    CREATE TABLE IF NOT EXISTS chapter_number_aliases (
+      work_id TEXT NOT NULL,
+      from_number TEXT NOT NULL,
+      to_number TEXT NOT NULL,
+      chapter_path TEXT NOT NULL,
+      source_chapter_path TEXT NOT NULL,
+      chapter_id TEXT NOT NULL,
+      operation_id TEXT NOT NULL,
+      PRIMARY KEY(work_id, from_number),
+      UNIQUE(work_id, to_number),
+      UNIQUE(work_id, chapter_path),
+      UNIQUE(work_id, chapter_id)
+    );
+`;
+
 export function openDatabase(dataDir: string): DatabaseSync {
   mkdirSync(resolve(dataDir), { recursive: true });
   const db = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
@@ -66,7 +90,7 @@ export function openDatabase(dataDir: string): DatabaseSync {
       transaction(db, () => { db.exec(schema); db.prepare('INSERT INTO schema_state VALUES(?)').run(checksum); });
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
-    transaction(db, () => { db.exec(readingStateSchema); db.exec(workMigrationSchema); });
+    transaction(db, () => { db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); });
     return db;
   } catch (error) { db.close(); throw error; }
 }

@@ -1,3 +1,4 @@
+import { canonicalReadingIdentity } from './chapter-number-mappings.ts';
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance } from 'fastify';
@@ -37,8 +38,8 @@ const entrySchema = {
   },
 };
 
-function normalizeEntry(entry: ReadingStateEntry): ReadingStateEntry {
-  return {
+export function normalizeReadingState(db: DatabaseSync, entry: ReadingStateEntry): ReadingStateEntry {
+  const normalized: ReadingStateEntry = {
     pluginId: entry.pluginId,
     sourceNovelId: entry.sourceNovelId?.trim().toLowerCase() ?? null,
     novelPath: entry.novelPath,
@@ -50,10 +51,11 @@ function normalizeEntry(entry: ReadingStateEntry): ReadingStateEntry {
     bookmark: entry.bookmark,
     readAt: entry.readAt,
   };
+  return { ...normalized, ...canonicalReadingIdentity(db, normalized) };
 }
 
 /** Tagged identity parts prevent source IDs/numbers colliding with paths. */
-function entryKey(entry: ReadingStateEntry): string {
+export function readingStateKey(entry: ReadingStateEntry): string {
   const identity = [
     entry.pluginId,
     entry.sourceNovelId === null ? ['path', entry.novelPath] : ['source', entry.sourceNovelId],
@@ -62,7 +64,7 @@ function entryKey(entry: ReadingStateEntry): string {
   return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
 }
 
-function mergeEntry(previous: ReadingStateEntry, incoming: ReadingStateEntry): ReadingStateEntry {
+export function mergeReadingState(previous: ReadingStateEntry, incoming: ReadingStateEntry): ReadingStateEntry {
   // Keep the identity descriptors from the newest reading event. State itself
   // is monotonic, so an older or repeatedly sent device cannot erase reading.
   const identity = (incoming.readAt ?? -1) >= (previous.readAt ?? -1) ? incoming : previous;
@@ -95,7 +97,7 @@ export function registerReadingState(app: FastifyInstance, db: DatabaseSync): vo
   }, async request => {
     const profileHash = tokenDigest(request.body.syncKey);
     const { offset, limit } = request.body;
-    // Rows only append; updates retain their sequence and do not reorder pages.
+    // Ordinary merges retain sequence; a reconciliation may consolidate aliases.
     const rows = db.prepare('SELECT entry FROM reading_state_entries WHERE profile_hash=? ORDER BY sequence LIMIT ? OFFSET ?').all(profileHash, limit, offset) as { entry: string }[];
     const total = countEntries(db, profileHash);
     const nextOffset = offset + rows.length;
@@ -120,10 +122,10 @@ export function registerReadingState(app: FastifyInstance, db: DatabaseSync): vo
       const save = db.prepare('INSERT INTO reading_state_entries(profile_hash,entry_key,entry) VALUES(?,?,?) ON CONFLICT(profile_hash,entry_key) DO UPDATE SET entry=excluded.entry');
       let updated = 0;
       for (const raw of request.body.entries) {
-        const incoming = normalizeEntry(raw);
-        const key = entryKey(incoming);
+        const incoming = normalizeReadingState(db, raw);
+        const key = readingStateKey(incoming);
         const previous = lookup.get(profileHash, key) as { entry: string } | undefined;
-        const merged = previous ? mergeEntry(JSON.parse(previous.entry) as ReadingStateEntry, incoming) : incoming;
+        const merged = previous ? mergeReadingState(normalizeReadingState(db, JSON.parse(previous.entry) as ReadingStateEntry), incoming) : incoming;
         const serialized = JSON.stringify(merged);
         if (previous?.entry === serialized) continue;
         save.run(profileHash, key, serialized);

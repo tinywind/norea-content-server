@@ -4,6 +4,7 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { problem, transaction } from './db.ts';
+import { assertChapterNumberReconciliationReady, canonicalChapterManifest, canonicalChapterNumber, chapterIdentityId } from './chapter-number-mappings.ts';
 
 export interface PackageManifest {
   packageVersion: 1;
@@ -147,12 +148,13 @@ function folderChapterNumber(path: string): string | undefined {
 }
 
 export function findChapterUploadIdentity(db: DatabaseSync, manifest: PackageManifest): CatalogEntry | undefined {
+  manifest = canonicalChapterManifest(db, manifest);
   const storedWork = db.prepare('SELECT entry FROM works WHERE id=?').get(workId(manifest.identity)) as { entry: string } | undefined;
   if (storedWork && JSON.parse(storedWork.entry).metadata.identity.novelId !== manifest.identity.novelId) throw problem(409, 'Chapter source novel ID does not match its registered work');
   const recovered = folderChapterNumber(manifest.identity.chapterPath);
   const declared = normalizedChapterNumber(manifest.chapter.chapterNumber);
   if (recovered !== undefined && manifest.chapter.chapterNumber != null && recovered !== declared) throw problem(400, 'Folder chapter identity does not match its chapter number');
-  const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
+  const id = chapterIdentityId(db, manifest.identity);
   const exact = db.prepare('SELECT entry FROM chapters WHERE id=?').get(id) as { entry: string } | undefined;
   if (exact) return JSON.parse(exact.entry) as CatalogEntry;
   // Only recovered folder identities can adopt an existing source identity.
@@ -176,7 +178,14 @@ export function uploadCursor(db: DatabaseSync): { catalog: number; works: number
 }
 
 export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete'): CatalogEntry {
-  let { id, manifest } = entry;
+  let manifest = canonicalChapterManifest(db, entry.manifest);
+  let id = chapterIdentityId(db, manifest.identity);
+  if (id !== entry.id || canonicalize(manifest) !== canonicalize(entry.manifest)) {
+    entry = { ...entry, id, manifest, revision: digest(canonicalize(manifest)) };
+  }
+  if (imported && canonicalChapterNumber(db, manifest.identity, basename(source)) !== basename(source)) {
+    throw problem(409, 'Chapter number reconciliation conflict: old chapter folders must not be reimported');
+  }
   let backup: { from: string; to: string } | undefined;
   let publishedPath: string | undefined;
   const addedFiles: string[] = [];
@@ -254,7 +263,9 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
 export function chapterRow(db: DatabaseSync, id: string) {
   const row = db.prepare('SELECT entry,directory,path,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; directory: string; path: string | null; deleted_at: number | null } | undefined;
   if (!row) throw problem(404, 'Chapter not found');
-  return { ...row, catalog: JSON.parse(row.entry) as CatalogEntry };
+  const catalog = JSON.parse(row.entry) as CatalogEntry;
+  assertChapterNumberReconciliationReady(db, workId(catalog.manifest.identity));
+  return { ...row, catalog };
 }
 
 export function deleteChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry {

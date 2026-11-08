@@ -1,3 +1,4 @@
+import { chapterIdentityId } from './chapter-number-mappings.ts';
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -224,7 +225,7 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
       for (const [entry, expected] of [[sourceEntry, source.entry.metadata.identity], [targetEntry, target.entry.metadata.identity]] as const) {
         const identity = entry.manifest.identity;
         if (identity.pluginId !== expected.pluginId || identity.novelId !== expected.novelId || identity.novelPath !== expected.novelPath
-          || entry.id !== digest(JSON.stringify([identity.pluginId, identity.novelPath, identity.chapterPath]))) conflict('chapter does not belong to the expected work');
+          || entry.id !== chapterIdentityId(db, identity)) conflict('chapter does not belong to the expected work');
       }
       const sourceFence = chapterFence(db, dataDir, mapping.sourceChapterId);
       const targetFence = chapterFence(db, dataDir, mapping.targetChapterId);

@@ -1,3 +1,4 @@
+import { canonicalChapterNumber, chapterIdentityId } from './chapter-number-mappings.ts';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { problem } from './db.ts';
@@ -145,7 +146,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
   } }, async request => {
     requireRead(request);
     const { pluginId, novelPath, chapterPath, chapterNumber } = request.query;
-    const id = digest(JSON.stringify([pluginId, novelPath, chapterPath]));
+    const id = chapterIdentityId(db, { pluginId, novelPath, chapterPath });
     const row = db.prepare('SELECT entry,deleted_at FROM chapters WHERE id=?').get(id) as { entry: string; deleted_at: number | null } | undefined;
     if (row) {
       if (row.deleted_at !== null) throw problem(404, 'Chapter not found');
@@ -156,7 +157,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     }
     if (!chapterNumber || pluginId === 'local') throw problem(404, 'Chapter not found');
     const work = digest(JSON.stringify([pluginId, novelPath]));
-    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR (path IS NOT NULL))").all(work, chapterNumber, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
+    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR (path IS NOT NULL))").all(work, canonicalChapterNumber(db, { pluginId, novelPath }, chapterNumber), request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
     if (!matches.length) throw problem(404, 'Chapter not found');
     if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
     if (request.query.includeUnavailable) return JSON.parse(matches[0].entry) as CatalogEntry;

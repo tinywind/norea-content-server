@@ -1,3 +1,4 @@
+import { chapterIdentityId } from './chapter-number-mappings.ts';
 import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream, existsSync, lstatSync } from 'node:fs';
 import { mkdir, readFile, rm } from 'node:fs/promises';
@@ -106,7 +107,7 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
     }
     if (!manifest || received.size !== manifest.files.length) throw problem(400, 'Chapter files are incomplete');
     const complete = await validateMedia(stage, manifest, limits);
-    const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
+    const id = chapterIdentityId(db, manifest.identity);
     const entry: CatalogEntry = { id, revision: digest(canonicalize(manifest)), manifest, complete, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
     return publishChapter(db, dataDir, stage, entry, startedAt, false, conflictPolicy);
   } catch (error) {

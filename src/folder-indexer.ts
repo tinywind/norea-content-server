@@ -1,3 +1,4 @@
+import { assertChapterNumberReconciliationReady, chapterIdentityId } from './chapter-number-mappings.ts';
 import { lstat, mkdir, readdir } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
@@ -97,6 +98,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
   const seen = new Set<string>();
   const remember = (path: string, key: string, item: FolderIndexItem) => options.db.prepare('INSERT INTO scan_checkpoints(path,signature,entry) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,entry=excluded.entry').run(path, key, JSON.stringify(item));
   const unavailable = (row: IndexedChapter, removed = false) => transaction(options.db, () => {
+    assertChapterNumberReconciliationReady(options.db, row.work_id);
     const pathCondition = removed ? "(path=directory OR path IS NULL) AND json_extract(entry,'$.deleted')=0" : 'path=directory';
     const result = options.db.prepare(`UPDATE chapters SET path=NULL WHERE id=? AND ${pathCondition} AND deleted_at IS NULL AND entry=?`).run(row.id, row.entry);
     if (!result.changes) return false;
@@ -132,7 +134,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         before = after;
       }
       aborted(options.signal);
-      const id = digest(JSON.stringify([manifest.identity.pluginId, manifest.identity.novelPath, manifest.identity.chapterPath]));
+      const id = chapterIdentityId(options.db, manifest.identity);
       const previous = options.db.prepare("SELECT path,json_extract(entry,'$.revision') AS revision FROM chapters WHERE id=?").get(id) as { path: string | null; revision: string } | undefined;
       const entry: CatalogEntry = { id, revision: digest(canonicalize([manifest, before])), manifest, complete, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
       const current = publishChapter(options.db, dataDir, path, entry, startedAt, true);
@@ -265,6 +267,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       const path = join(dataDir, row.directory);
       if (!selected(path) || !await missing(path)) continue;
       const removed = transaction(options.db, () => {
+        assertChapterNumberReconciliationReady(options.db, row.id);
         if (!options.db.prepare('DELETE FROM works WHERE id=? AND entry=?').run(row.id, row.entry).changes) return false;
         options.db.prepare('DELETE FROM chapters WHERE work_id=?').run(row.id);
         const sequence = Number(options.db.prepare('INSERT INTO work_changes(work_id,entry) VALUES(?,?)').run(row.id, '{}').lastInsertRowid);

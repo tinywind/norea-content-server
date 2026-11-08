@@ -16,6 +16,7 @@ import { readChapterMediaAsset } from './chapter-media.ts';
 import { registerReadingState } from './reading-state.ts';
 import { registerDeviceBackups } from './device-backups.ts';
 import { registerWorkMigrations } from './work-migrations.ts';
+import { recoverChapterNumberReconciliations, registerChapterNumberReconciliation } from './chapter-number-reconciliation.ts';
 
 const string = { type: 'string' };
 const idParams = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
@@ -38,7 +39,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const dataDir = resolve(options.dataDir);
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
-  try { rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
+  try { recoverChapterNumberReconciliations(db, dataDir); rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
   const app = Fastify({ bodyLimit: 1024 * 1024, connectionTimeout: options.socketIdleTimeoutMs ?? SOCKET_IDLE_TIMEOUT_MS, requestTimeout: 0, logger: false, trustProxy: false });
   await app.register(rateLimit, { global: true, max: 6000, timeWindow: '1 minute' });
@@ -51,10 +52,11 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const requireRead = (request: Parameters<typeof authenticate>[1]) => { if (!anonymousRead || request.headers.authorization !== undefined) authenticate(db, request); };
   registerWorks(app, { db, dataDir, requireRead, notify: () => changes.notify() });
   registerWorkMigrations(app, { db, dataDir, limits, requireRead, notify: () => changes.notify() });
+  registerChapterNumberReconciliation(app, { db, dataDir, notify: () => changes.notify() });
   registerCatalog(app, { db, dataDir, requireRead, catalogSchema });
   registerReadingState(app, db);
   await registerDeviceBackups(app, db, dataDir);
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, anonymousRead }));
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, chapterNumberReconciliationVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
