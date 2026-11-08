@@ -232,7 +232,7 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
   return cacheWork(db, dataDir, directory, metadata, restore);
 }
 
-export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkEntry {
+export function deleteWork(db: DatabaseSync, dataDir: string, id: string, recordDeletion?: (entry: WorkEntry) => void, verifyDeletion?: (retiredDirectory: string) => void): WorkEntry {
   const row = rowFor(db, id);
   if (!row) throw problem(404, 'Work not found');
   const folder = resolve(dataDir, row.directory);
@@ -246,6 +246,8 @@ export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkE
   let entry: WorkEntry;
   try {
     entry = transaction(db, () => {
+      // Only conditional migration supplies this guard; ordinary deletion is unchanged.
+      verifyDeletion?.(moved ? retired : folder);
       for (const chapter of db.prepare('SELECT entry FROM chapters WHERE work_id=?').all(id) as { entry: string }[]) {
         const deleted = recordEntry(db, { ...JSON.parse(chapter.entry) as CatalogEntry, deleted: true });
         db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(deleted.id, deleted.sequence);
@@ -258,6 +260,7 @@ export function deleteWork(db: DatabaseSync, dataDir: string, id: string): WorkE
       db.prepare('DELETE FROM chapters WHERE work_id=?').run(id);
       db.prepare('DELETE FROM works WHERE id=?').run(id);
       db.prepare("DELETE FROM scan_checkpoints WHERE path=? OR substr(path,1,?)=?").run(folder, folder.length + 1, folder + sep);
+      recordDeletion?.(deleted);
       return deleted;
     });
   } catch (error) { if (moved) renameSync(retired, folder); throw error; }

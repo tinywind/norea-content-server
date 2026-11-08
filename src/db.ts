@@ -43,6 +43,15 @@ const readingStateSchema = `
     CREATE INDEX IF NOT EXISTS reading_state_profile_sequence ON reading_state_entries(profile_hash, sequence);
 `;
 
+const workMigrationSchema = `
+    CREATE TABLE IF NOT EXISTS work_migrations (
+      operation_id TEXT PRIMARY KEY,
+      source_work_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      result TEXT NOT NULL
+    );
+`;
+
 export function openDatabase(dataDir: string): DatabaseSync {
   mkdirSync(resolve(dataDir), { recursive: true });
   const db = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
@@ -57,7 +66,7 @@ export function openDatabase(dataDir: string): DatabaseSync {
       transaction(db, () => { db.exec(schema); db.prepare('INSERT INTO schema_state VALUES(?)').run(checksum); });
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
-    transaction(db, () => db.exec(readingStateSchema));
+    transaction(db, () => { db.exec(readingStateSchema); db.exec(workMigrationSchema); });
     return db;
   } catch (error) { db.close(); throw error; }
 }

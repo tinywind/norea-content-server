@@ -214,6 +214,13 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   unblocked devices. The app exposes it in server browsing and the selected
   work's server data page. It preserves device copies and personal reading state;
   deletion records block automatic reuploads until an explicit restore.
+- `GET /api/v1/works/:id/migration-snapshot` returns the work revision and all
+  nondeleted chapter IDs/revisions, including unavailable copies.
+- `POST /api/v1/works/:id/finalize-migration` conditionally retires a source work
+  after validating the full snapshot and the actual complete target copies.
+  Explicit copy-source and keep-target decisions have separate integrity checks;
+  conflicts preserve the source and exact retries use a durable receipt. See
+  [Conditional work migration](docs/work-migration.md) for the request contract.
 - `GET /api/v1/changes?catalogAfter=0&workAfter=0&waitSeconds=20` returns
   `{catalogCursor,workCursor}`. Both cursors are required. It waits up to 20 seconds
   for catalog or work metadata changes. Disabling anonymous reading also
@@ -226,7 +233,8 @@ client contract and [design.md](docs/design.md) for the intended product behavio
   refreshes only that work from its authoritative `novel.json` and cover.
 
 Capabilities include `authentication: "device-key"`, `personalStateSync: true`,
-`readingStateVersion: 1`, and `deviceBackupVersion: 1`. Account sessions and the legacy `/state` endpoints
+`readingStateVersion: 1`, `deviceBackupVersion: 1`, and `workMigrationVersion: 1`.
+Account sessions and the legacy `/state` endpoints
 are unsupported. The reading-state extension adds its table without changing the
 current database checksum or replacing existing data. This development version
 otherwise supports only the current database and original-file protocol. There
