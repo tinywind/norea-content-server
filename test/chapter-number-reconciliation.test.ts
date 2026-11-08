@@ -27,13 +27,13 @@ const mappings = (): ChapterNumberMapping[] => [
   { chapterPath: '/episode/9001', from: '9001', to: '1' },
   { chapterPath: '/episode/9007', from: '9007', to: '2' },
 ];
-async function fixture(chapters?: Record<string, string>) {
+async function fixture(chapters?: Record<string, string>, anonymousRead = true) {
   await mkdir('.tmp', { recursive: true });
   const dataDir = await mkdtemp(resolve('.tmp/chapter-number-'));
   const db = openDatabase(dataDir);
   saveWork(db, dataDir, metadata(chapters));
   const root = join(dataDir, 'contents', identity.pluginId, identity.novelId);
-  const app = await buildApp({ dataDir, anonymousRead: true });
+  const app = await buildApp({ dataDir, anonymousRead });
   const headers = await deviceHeaders(app);
   const uploadResponse = async (number = '9001', path = '/episode/' + number, body = 'Synthetic chapter bytes', otherIdentity = identity) => {
     const bytes = Buffer.from(body);
@@ -461,3 +461,114 @@ test('direct reconciliation rechecks authorization after moving files and rolls 
     assert.deepEqual((await readdir(f.root)).sort(), ['9001', 'novel.json']);
   } finally { await f.close(); }
 });
+
+test('mapping reads return the current work and an empty list without creating a reconciliation', async () => {
+  const f = await fixture();
+  try {
+    const url = '/api/v1/works/' + workId + '/chapter-number-mappings';
+    const before = f.count('work_changes');
+    const response = await f.app.inject(url);
+    assert.equal(response.statusCode, 200, response.body); assert.equal(response.headers['cache-control'], 'no-store');
+    const result = response.json();
+    assert.deepEqual(result.mappings, []);
+    const work = (await f.app.inject('/api/v1/works/' + workId)).json();
+    assert.deepEqual(result.work, { ...work, revision: migrationSnapshot(f.db, f.dataDir, workId).work.revision });
+    assert.deepEqual((await f.app.inject(url)).json(), result);
+    assert.equal(f.count('chapter_number_reconciliations'), 0); assert.equal(f.count('chapter_number_aliases'), 0);
+    assert.equal(f.count('work_changes'), before);
+    assert.equal((await f.app.inject('/api/v1/capabilities')).json().chapterNumberMappingsVersion, 1);
+    assert.equal((await f.app.inject('/api/v1/works/' + '0'.repeat(64) + '/chapter-number-mappings')).statusCode, 404);
+    assert.equal((await f.app.inject({ url, headers: { authorization: 'Bearer invalid' } })).statusCode, 401);
+  } finally { await f.close(); }
+});
+
+test('mapping reads include all 346 aliases, including undownloaded chapters, in deterministic order with the current revision', async () => {
+  const expected = Array.from({ length: 346 }, (_value, index) => ({ chapterPath: '/episode/' + (900001 + index), from: String(900001 + index), to: String(index + 1) }));
+  const chapters = Object.fromEntries(expected.map(mapping => [mapping.from, 'Synthetic chapter ' + mapping.to]));
+  const f = await fixture(chapters);
+  try {
+    const original = await f.upload('900001', 'norea-folder:900001');
+    const applied = await f.submit(f.request([...expected].reverse()));
+    assert.equal(applied.statusCode, 200, applied.body); assert.equal(f.count('chapters'), 1);
+    const url = '/api/v1/works/' + workId + '/chapter-number-mappings';
+    const response = await f.app.inject(url);
+    assert.equal(response.statusCode, 200, response.body);
+    const result = response.json();
+    assert.deepEqual(result.mappings, expected);
+    assert.equal(Object.keys(result.work.metadata.chapters).length, 346);
+    assert.equal(result.work.revision, migrationSnapshot(f.db, f.dataDir, workId).work.revision);
+    assert.equal(f.entry(original.id).manifest.identity.chapterPath, expected[0].chapterPath);
+    assert.equal(f.db.prepare("SELECT 1 FROM chapters WHERE json_extract(entry,'$.manifest.chapter.chapterNumber')='346'").get(), undefined);
+    const before = { works: f.count('work_changes'), aliases: f.count('chapter_number_aliases'), receipts: f.count('chapter_number_reconciliations') };
+    assert.deepEqual((await f.app.inject(url)).json(), result);
+    assert.deepEqual({ works: f.count('work_changes'), aliases: f.count('chapter_number_aliases'), receipts: f.count('chapter_number_reconciliations') }, before);
+    saveWork(f.db, f.dataDir, { ...result.work.metadata, novel: { ...result.work.metadata.novel, name: 'Current renamed work' } });
+    const updated = await f.app.inject(url);
+    assert.equal(updated.statusCode, 200, updated.body);
+    assert.deepEqual(updated.json().mappings, expected);
+    assert.equal(updated.json().work.metadata.novel.name, 'Current renamed work');
+    assert.ok(updated.json().work.sequence > result.work.sequence);
+    assert.notEqual(updated.json().work.revision, result.work.revision);
+    assert.equal(updated.json().work.revision, migrationSnapshot(f.db, f.dataDir, workId).work.revision);
+  } finally { await f.close(); }
+});
+
+test('mapping reads use the existing authenticated read policy and reject blocked devices', async () => {
+  const f = await fixture(undefined, false);
+  try {
+    const url = '/api/v1/works/' + workId + '/chapter-number-mappings';
+    assert.equal((await f.app.inject(url)).statusCode, 401);
+    assert.equal((await f.app.inject({ url, headers: f.headers })).statusCode, 200);
+    assert.equal((await f.app.inject({ url, headers: await consoleHeaders(f.app, f.dataDir) })).statusCode, 200);
+    f.db.prepare('UPDATE devices SET blocked=1').run();
+    assert.equal((await f.app.inject({ url, headers: f.headers })).statusCode, 403);
+  } finally { await f.close(); }
+});
+
+test('mapping reads isolate exact work identity even when different works reuse the same numbers', async () => {
+  const f = await fixture({ '9001': 'First work' });
+  try {
+    const first = await f.submit(f.request(mappings().slice(0, 1))); assert.equal(first.statusCode, 200, first.body);
+    const otherIdentity = { ...identity, novelId: 'other-work', novelPath: '/other-work' };
+    const otherId = digest(JSON.stringify([otherIdentity.pluginId, otherIdentity.novelPath]));
+    saveWork(f.db, f.dataDir, { ...metadata({ '9001': 'Other work' }), identity: otherIdentity });
+    const otherMappings = [{ chapterPath: '/other-work/episode', from: '9001', to: '1' }];
+    reconcileChapterNumbers(f.db, f.dataDir, otherId, { operationId: randomUUID(), expectedWorkRevision: migrationSnapshot(f.db, f.dataDir, otherId).work.revision, mappings: otherMappings });
+    const firstRead = await f.app.inject('/api/v1/works/' + workId + '/chapter-number-mappings');
+    const otherRead = await f.app.inject('/api/v1/works/' + otherId + '/chapter-number-mappings');
+    assert.equal(firstRead.statusCode, 200, firstRead.body); assert.equal(otherRead.statusCode, 200, otherRead.body);
+    assert.deepEqual(firstRead.json().mappings, mappings().slice(0, 1)); assert.deepEqual(firstRead.json().work.metadata.identity, identity);
+    assert.deepEqual(otherRead.json().mappings, otherMappings); assert.deepEqual(otherRead.json().work.metadata.identity, otherIdentity);
+  } finally { await f.close(); }
+});
+
+for (const invalid of ['missing-operation', 'other-work-operation', 'prepared-operation', 'missing-metadata-target', 'wrong-current-number', 'invalid-alias-number'] as const) {
+  test('mapping reads fail closed for invalid persisted proof: ' + invalid, async () => {
+    const f = await fixture({ '9001': 'Chapter' });
+    try {
+      const chapter = await f.upload();
+      const applied = await f.submit(f.request(mappings().slice(0, 1))); assert.equal(applied.statusCode, 200, applied.body);
+      if (invalid === 'missing-operation') f.db.prepare('UPDATE chapter_number_aliases SET operation_id=?').run(randomUUID());
+      if (invalid === 'other-work-operation') {
+        const operationId = randomUUID();
+        f.db.prepare("INSERT INTO chapter_number_reconciliations(operation_id,work_id,request_hash,state,result) VALUES(?,?,?,'committed','{}')").run(operationId, 'a'.repeat(64), 'b'.repeat(64));
+        f.db.prepare('UPDATE chapter_number_aliases SET operation_id=?').run(operationId);
+      }
+      if (invalid === 'prepared-operation') f.db.prepare("UPDATE chapter_number_reconciliations SET state='prepared'").run();
+      if (invalid === 'missing-metadata-target') {
+        const raw = JSON.parse(await readFile(join(f.root, 'novel.json'), 'utf8')); raw.chapters = {};
+        await writeFile(join(f.root, 'novel.json'), JSON.stringify(raw));
+      }
+      if (invalid === 'wrong-current-number') {
+        const current = f.entry(chapter.id); current.manifest.chapter.chapterNumber = '88';
+        f.db.prepare('UPDATE chapters SET entry=? WHERE id=?').run(JSON.stringify(current), chapter.id);
+      }
+      if (invalid === 'invalid-alias-number') f.db.prepare("UPDATE chapter_number_aliases SET from_number='0'").run();
+      const before = f.count('work_changes');
+      const response = await f.app.inject('/api/v1/works/' + workId + '/chapter-number-mappings');
+      assert.equal(response.statusCode, 409, response.body); assert.match(response.json().message, /^Chapter number reconciliation conflict: /);
+      assert.equal(f.count('work_changes'), before);
+      assert.equal(await readFile(join(f.root, '1/content.html'), 'utf8'), 'Synthetic chapter bytes');
+    } finally { await f.close(); }
+  });
+}

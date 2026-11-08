@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { canonicalize } from 'json-canonicalize';
 import { authenticateDevice } from './auth.ts';
 import { canonicalWorkChapters, chapterNumberAliases, type ChapterNumberAlias } from './chapter-number-mappings.ts';
@@ -15,6 +15,10 @@ export interface ChapterNumberMapping { chapterPath: string; from: string; to: s
 export interface ReconcileChapterNumbersRequest {
   operationId: string;
   expectedWorkRevision: string;
+  mappings: ChapterNumberMapping[];
+}
+export interface ChapterNumberMappingsResult {
+  work: WorkEntry & { revision: string };
   mappings: ChapterNumberMapping[];
 }
 export interface ReconcileChapterNumbersResult {
@@ -183,6 +187,33 @@ function assertApplied(db: DatabaseSync, dataDir: string, work: WorkEntry, workR
   }
   if (present(chapterStoragePath(dataDir, join(workRow.directory, mapping.from)))) conflict('an old-number folder appeared after reconciliation; scan and resolve it before retrying');
 }
+/** A complete, revision-consistent read for clients importing already reconciled works. */
+export function chapterNumberMappingsSnapshot(db: DatabaseSync, dataDir: string, workId: string): ChapterNumberMappingsResult {
+  return transaction(db, () => {
+    const work = getWork(db, dataDir, workId);
+    const row = db.prepare('SELECT directory,entry,fingerprint FROM works WHERE id=?').get(workId) as unknown as WorkRow;
+    const aliases = chapterNumberAliases(db, work.metadata.identity);
+    const mappings: ChapterNumberMapping[] = [];
+    const oldNumbers = new Set<string>(); const newNumbers = new Set<string>(); const paths = new Set<string>();
+    if (aliases.length && (work.deleted || work.metadata.novel.isLocal || work.metadata.identity.pluginId === 'local' ||
+      row.directory !== join('contents', work.metadata.identity.pluginId, work.metadata.identity.novelId))) conflict('registered mappings require their original remote work');
+    for (const alias of aliases) {
+      const mapping = { chapterPath: alias.chapter_path, from: alias.from_number, to: alias.to_number };
+      if (!positiveNumber(mapping.from) || !positiveNumber(mapping.to) || typeof mapping.chapterPath !== 'string' ||
+        !mapping.chapterPath.trim() || !mapping.chapterPath.isWellFormed() || mapping.chapterPath.length > 4096 ||
+        /^(?:norea|local)-folder:/.test(mapping.chapterPath) || oldNumbers.has(mapping.from) || newNumbers.has(mapping.to) || paths.has(mapping.chapterPath)) {
+        conflict('registered mapping has an invalid number or source path');
+      }
+      oldNumbers.add(mapping.from); newNumbers.add(mapping.to); paths.add(mapping.chapterPath);
+      assertApplied(db, dataDir, work, row, mapping, alias);
+      mappings.push(mapping);
+    }
+    if ([...oldNumbers].some(number => newNumbers.has(number))) conflict('registered mapping number sets overlap');
+    mappings.sort((left, right) => Number(left.to) - Number(right.to));
+    return { work: { ...work, revision: row.fingerprint }, mappings };
+  });
+}
+
 function planMappings(db: DatabaseSync, dataDir: string, work: WorkEntry, workRow: WorkRow, mappings: ChapterNumberMapping[], operationId: string): { plans: PlannedMapping[]; moves: FolderMove[] } {
   const identity = work.metadata.identity;
   const rows = db.prepare('SELECT * FROM chapters WHERE work_id=?').all(work.id) as unknown as ChapterRow[];
@@ -329,8 +360,17 @@ export function reconcileChapterNumbers(db: DatabaseSync, dataDir: string, workI
   }
 }
 
-export function registerChapterNumberReconciliation(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; notify: () => void }): void {
-  const { db, dataDir, notify } = context;
+export function registerChapterNumberReconciliation(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; notify: () => void }): void {
+  const { db, dataDir, requireRead, notify } = context;
+  app.get<{ Params: { id: string } }>('/api/v1/works/:id/chapter-number-mappings', {
+    schema: { security: [{ bearerAuth: [] }, {}],
+      description: 'Read every proven chapter-number mapping for this work, including metadata-only chapters, with its current metadata and migration-snapshot revision. Clients reconcile local storage before importing the returned work. An unreconciled work returns an empty mapping list.',
+      params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
+    },
+  }, async (request, reply) => {
+    requireRead(request); reply.header('Cache-Control', 'no-store');
+    return chapterNumberMappingsSnapshot(db, dataDir, request.params.id);
+  });
   const number = { type: 'string', pattern: '^[1-9][0-9]*$', maxLength: 16 };
   app.post<{ Params: { id: string }; Body: ReconcileChapterNumbersRequest }>('/api/v1/works/:id/reconcile-chapter-numbers', {
     bodyLimit: metadataByteLimit,

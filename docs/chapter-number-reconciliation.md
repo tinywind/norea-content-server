@@ -56,6 +56,22 @@ Registered aliases also normalize subsequent stale input:
 
 Aliases and operation receipts must be included in database backups. Do not remove them after an apparently successful repair; they prevent later devices or copied metadata from restoring obsolete number keys.
 
+## Reading already applied mappings before import
+
+The server also advertises `chapterNumberMappingsVersion: 1`. An updated client that imports an already reconciled work first reads:
+
+```http
+GET /api/v1/works/:id/chapter-number-mappings
+```
+
+The response is `{ work: { ...WorkEntry, revision }, mappings: [{ chapterPath, from, to }] }`. It includes **every registered mapping**, including chapters represented only in `novel.json` without downloaded payloads. Mappings are ordered by their numeric target ordinal. An unreconciled work returns its current work entry and an empty array.
+
+The work metadata, sequence, revision, committed-operation proof, aliases, and current canonical chapter identities are checked in one database transaction. The revision is exactly the existing migration snapshot fingerprint: SHA-256 of `canonicalize(metadata) + '\n' + (coverBytes ? SHA256(coverBytes) : '')`. It is not the app's local work-cache fingerprint. Responses use `Cache-Control: no-store` and the same anonymous/authenticated read policy as `GET /works/:id`.
+
+Before merging incoming metadata, the client verifies the work identity and complete mapping coverage, then uses its existing durable local reconciliation journal to update local payload directories, chapter rows, and exclusions. It must not create a new server mutation job for mappings already committed remotely. When incoming and local numbering differ, a missing read capability or conflicting mapping proof keeps the incoming import pending instead of inferring ordinal mappings from titles or silently merging different numbering schemes.
+
+This endpoint adds no client-version gate to existing read APIs. Older clients continue to receive canonical server metadata through those APIs.
+
 ## Durable storage and recovery
 
 Before touching chapter folders, the server commits a prepared SQLite journal. It contains the original and replacement `novel.json` bytes and hashes, the exact folder moves, and each original directory's device/inode identity.
