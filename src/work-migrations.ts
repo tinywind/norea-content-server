@@ -1,4 +1,4 @@
-import { lstatSync, readdirSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -7,6 +7,7 @@ import { authenticateDevice } from './auth.ts';
 import { inspectChapterInventory } from './chapter-inventory.ts';
 import { chapterFileStream } from './chapter-files.ts';
 import { problem } from './db.ts';
+import { isMigrationTextBody } from './migration-text-body.ts';
 import { availableChapter, chapterRow, chapterStoragePath, digest, type CatalogEntry, type Limits } from './packages.ts';
 import { deleteWork, getWork, metadataByteLimit, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
@@ -143,6 +144,15 @@ function completeInventory(entry: CatalogEntry, inventory: MigrationInventory): 
   const stored = new Map(inventory.storedAssets.map(asset => [asset.key, asset]));
   return inventory.expectedAssetKeys.every(key => stored.has(key));
 }
+function verifyBodyOnlyTarget(db: DatabaseSync, dataDir: string, entry: CatalogEntry, inventory: MigrationInventory): void {
+  if (entry.manifest.chapter.contentType === 'pdf') return;
+  if (inventory.expectedAssetKeys !== null && inventory.expectedAssetKeys.length > 0) return;
+  const path = chapterFileStream(db, dataDir, entry.id, entry.revision, entry.manifest.bodyPath).path;
+  if (lstatSync(path).size > 16 * 1024 ** 2) conflict('body-only text exceeds the verification limit');
+  const bytes = readFileSync(path);
+  if (bytes.length > 16 * 1024 ** 2 || !sameDigest(inventory.body, { sha256: digest(bytes), bytes: bytes.length })
+    || !isMigrationTextBody(bytes, entry.manifest.chapter.contentType)) conflict('body-only target contains media or unsupported resource references');
+}
 function containsSource(source: MigrationInventory, target: MigrationInventory): boolean {
   if (!sameDigest(source.body, target.body)) return false;
   if (source.expectedAssetKeys !== null && (target.expectedAssetKeys === null
@@ -199,6 +209,7 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
       fences.push(sourceFence, targetFence);
       const inspectedTarget = await inspectChapterInventory(db, dataDir, mapping.targetChapterId, mapping.targetRevision, limits);
       if (!completeInventory(targetEntry, inspectedTarget.inventory)) conflict('target chapter is not a verified complete copy');
+      verifyBodyOnlyTarget(db, dataDir, targetEntry, inspectedTarget.inventory);
       if (mapping.decision === 'copy-source') {
         const inspectedSource = await inspectChapterInventory(db, dataDir, mapping.sourceChapterId, sourceEntry.revision, limits);
         const hasSourceMedia = sourceEntry.manifest.files.some(file => file.path === 'manifest.json' || file.path === 'media.zip');

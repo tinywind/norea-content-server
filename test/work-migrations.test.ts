@@ -312,3 +312,34 @@ test('final integrity guards hold the SQLite write lock used by deletion and the
     assert.equal(result.deletedWork.deleted, true);
   } finally { contender.close(); await f.close(); }
 });
+
+for (const decision of ['copy-source', 'keep-target'] as const) test('body-only media cannot authorize source deletion with ' + decision, async () => {
+  const f = await fixture();
+  try {
+    const body = '<p>Body.</p><img src="https://fixture.invalid/missing.png">';
+    await f.upload('source', 1, decision === 'copy-source' ? body : 'old source body');
+    const target = await f.upload('target', 1, body);
+    const payload = f.request(); payload.mappings[0].decision = decision;
+    if (decision === 'keep-target') payload.mappings[0].expectedTargetInventory = await f.inventory(target);
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 409, response.body);
+    assert.match(response.json().message, /body-only target/);
+    assert.equal(await f.sourceBody(), decision === 'copy-source' ? body : 'old source body');
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migrations').get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+test('body-only kept target accepts verified text markup with null declarations', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source', 1, 'old source body');
+    const body = '<p style="color:#333">New synthetic paragraph.</p><p>Another paragraph.</p>';
+    const target = await f.upload('target', 1, body);
+    const payload = f.request(); payload.mappings[0].decision = 'keep-target';
+    payload.mappings[0].expectedTargetInventory = await f.inventory(target);
+    assert.equal(payload.mappings[0].expectedTargetInventory.expectedAssetKeys, null);
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), body);
+  } finally { await f.close(); }
+});

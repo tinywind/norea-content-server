@@ -145,7 +145,13 @@ A body-only text/HTML/PDF copy without a media manifest or archive is verified
 by its nonempty body SHA-256 and length; its inventory has
 `expectedAssetKeys: null` and `storedAssets: []`. A copy with a media manifest
 or archive requires valid declarations and every declared asset. Invalid or
-missing declarations are not treated as a text-only copy.
+missing declarations are not treated as a text-only copy. A non-PDF body with
+null or empty asset declarations also needs a matching actual body digest and
+conservative text-only verification. It must be UTF-8, at most 16 MiB, and free
+of media elements/attributes, executable content, and CSS resource references,
+escapes, or comments. Unsupported markup returns 409 rather than authorizing
+source deletion. PDF copies retain the self-contained single-body contract;
+this HTML check does not rewrite any stored content.
 
 ## Commit, conflicts, and retries
 
