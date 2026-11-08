@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 
@@ -90,6 +90,30 @@ const chapterNumberSchema = `
     );
 `;
 
+
+const userStateSchema = `
+    CREATE TABLE IF NOT EXISTS user_state_meta (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1), workspace_id TEXT NOT NULL, epoch TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS user_state_records (
+      entity_key TEXT PRIMARY KEY, kind TEXT NOT NULL, category_name TEXT, category_deleted INTEGER,
+      revision INTEGER NOT NULL, record TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS user_state_record_kinds ON user_state_records(kind);
+    CREATE UNIQUE INDEX IF NOT EXISTS user_state_active_category_names
+      ON user_state_records(category_name) WHERE kind='category' AND category_deleted=0;
+    CREATE TABLE IF NOT EXISTS user_state_changes (
+      revision INTEGER PRIMARY KEY AUTOINCREMENT, entity_key TEXT NOT NULL, record TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS user_state_operations (
+      device_id TEXT NOT NULL, operation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, result TEXT NOT NULL,
+      PRIMARY KEY(operation_id)
+    );
+    CREATE TABLE IF NOT EXISTS user_state_category_aliases (
+      alias_id TEXT PRIMARY KEY, canonical_id TEXT NOT NULL
+    );
+`;
+
 export function openDatabase(dataDir: string): DatabaseSync {
   mkdirSync(resolve(dataDir), { recursive: true });
   const db = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
@@ -104,7 +128,10 @@ export function openDatabase(dataDir: string): DatabaseSync {
       transaction(db, () => { db.exec(schema); db.prepare('INSERT INTO schema_state VALUES(?)').run(checksum); });
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
-    transaction(db, () => { db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); });
+    transaction(db, () => {
+      db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(userStateSchema);
+      db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
+    });
     return db;
   } catch (error) { db.close(); throw error; }
 }

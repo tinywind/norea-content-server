@@ -1,4 +1,4 @@
-import { chapterCompositionCatalog, parseChapterComposition, type ChapterCompositionV1 } from './chapter-composition.ts';
+import { chapterCompositionCatalog, parseChapterComposition, type ChapterCompositionV1, type ChapterCompositionEntry, type ChapterSourceSnapshot } from './chapter-composition.ts';
 import { randomUUID } from 'node:crypto';
 import { closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
@@ -9,6 +9,8 @@ import { authenticate, authenticateDevice } from './auth.ts';
 import { assertChapterNumberReconciliationReady, canonicalWorkChapters } from './chapter-number-mappings.ts';
 import { problem, transaction } from './db.ts';
 import { deactivateWorkMigrationsForSource } from './work-migration-lineage.ts';
+import { readUserStateComposition } from './user-state.ts';
+import { mergeUserStateComposition } from './user-state-composition.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
 
 export interface NovelMetadataV1 {
@@ -229,8 +231,64 @@ function workDirectory(db: DatabaseSync, metadata: NovelMetadataV1): string {
   if (chapter && dirname(chapter.directory) !== directory) throw problem(409, 'Stored chapters belong to another work directory');
   return directory;
 }
+const foldSourceId = (value: string) => value.replace(/[A-Z]/g, character => character.toLowerCase());
+function sameCompositionPrimary(left: ChapterSourceSnapshot, right: ChapterSourceSnapshot): boolean {
+  return left.pluginId === right.pluginId && foldSourceId(left.novelId) === foldSourceId(right.novelId) &&
+    (left.sourceChapterId !== undefined && right.sourceChapterId !== undefined
+      ? left.sourceChapterId === right.sourceChapterId : left.chapterPath === right.chapterPath);
+}
+function ordinaryProviderPath(path: string): boolean {
+  return !/^(?:norea-(?:composed|source|folder)|local-folder):/.test(path);
+}
+/** Metadata must not relabel a body's physical folder as another source or synthetic entry. */
+function assertSharedCompositionStorage(
+  db: DatabaseSync, dataDir: string, directory: string, identity: NovelMetadataV1['identity'],
+  previous: ChapterCompositionV1 | undefined, next: ChapterCompositionV1,
+): void {
+  const byId = new Map(previous?.entries.map(entry => [entry.id, entry]) ?? []);
+  const byPath = new Map(previous?.entries.map(entry => [entry.path, entry]) ?? []);
+  const byStorage = new Map(previous?.entries.map(entry => [entry.storageChapterNumber, entry]) ?? []);
+  const presence = new Map<string, boolean>();
+  const hasData = (number: string) => {
+    let found = presence.get(number);
+    if (found === undefined) {
+      const folder = join(dataDir, directory, number);
+      noLinks(folder);
+      found = existsSync(folder) && (!lstatSync(folder).isDirectory() || readdirSync(folder).length > 0);
+      presence.set(number, found);
+    }
+    return found;
+  };
+  const conflict = () => { throw problem(409, 'Shared composition conflicts with stored chapter ownership; retain local data and resolve the pending composition'); };
+  const primary = (entry: ChapterCompositionEntry) => entry.sources[entry.primarySource];
+  const ownedProvider = (source: ChapterSourceSnapshot) => source.pluginId === identity.pluginId && foldSourceId(source.novelId) === foldSourceId(identity.novelId);
+  for (const entry of next.entries) {
+    const old = byId.get(entry.id) ?? byPath.get(entry.path) ?? byStorage.get(entry.storageChapterNumber);
+    if (!hasData(entry.storageChapterNumber) && (!old || !hasData(old.storageChapterNumber))) continue;
+    if (old) {
+      if (old.path !== entry.path || old.storageChapterNumber !== entry.storageChapterNumber || !sameCompositionPrimary(primary(old), primary(entry))) conflict();
+      if (old.id === entry.id) continue;
+      // Independently imported provider rows may have different UUIDs. Synthetic
+      // paths and foreign-source copies still require the exact retained ID.
+      if (ordinaryProviderPath(entry.path) && ownedProvider(primary(old)) && ownedProvider(primary(entry))) continue;
+      conflict();
+    }
+    // Before the first composition, only an exact indexed target-provider path
+    // can prove ownership. A matching directory number alone proves nothing.
+    const row = db.prepare('SELECT entry FROM chapters WHERE work_id=? AND directory=?')
+      .get(digest(JSON.stringify([identity.pluginId, identity.novelPath])), join(directory, entry.storageChapterNumber)) as { entry: string } | undefined;
+    if (!row || !ordinaryProviderPath(entry.path) || !ownedProvider(primary(entry))) conflict();
+    const existing = (JSON.parse(row!.entry) as CatalogEntry).manifest.identity;
+    if (existing.pluginId !== identity.pluginId || foldSourceId(existing.novelId) !== foldSourceId(identity.novelId) ||
+        existing.chapterPath !== entry.path || primary(entry).chapterPath !== existing.chapterPath) conflict();
+  }
+}
+
 export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false): WorkEntry {
   const metadata = parseNovelMetadata(value); const id = metadataWorkId(metadata);
+  const incomingComposition = metadata.chapterComposition;
+  const sharedComposition = readUserStateComposition(db, metadata.identity);
+  let storedMetadata: NovelMetadataV1 | undefined;
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(410, 'Work was deleted from the server');
   if (expectedId !== undefined && expectedId !== id) throw problem(400, 'Work identity does not match requested ID');
   const directory = workDirectory(db, metadata);
@@ -243,6 +301,7 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
     try {
       current = JSON.parse(readBytes(file, metadataByteLimit).toString('utf8'));
       stored = parseNovelMetadata(current);
+      storedMetadata = stored;
     } catch { throw problem(409, 'Existing work metadata must be valid before it can be replaced'); }
     if (metadataWorkId(stored) !== id || stored.identity.novelId !== metadata.identity.novelId) throw problem(409, 'Work directory belongs to another source identity');
     if (stored.chapterComposition && (!metadata.chapterComposition ||
@@ -250,6 +309,22 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
       metadata.chapterComposition = stored.chapterComposition;
     }
     metadata.chapters = metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : { ...stored.chapters, ...metadata.chapters };
+  }
+  if (sharedComposition) {
+    try {
+      let combined = sharedComposition;
+      const snapshots = [storedMetadata?.chapterComposition, incomingComposition]
+        .filter((document): document is ChapterCompositionV1 => document !== undefined)
+        .sort((left, right) => left.updatedAt - right.updatedAt);
+      for (const snapshot of snapshots) {
+        combined = mergeUserStateComposition(combined, snapshot, { pluginId: metadata.identity.pluginId, sourceNovelId: metadata.identity.novelId });
+      }
+      assertSharedCompositionStorage(db, dataDir, directory, metadata.identity, storedMetadata?.chapterComposition, combined);
+      metadata.chapterComposition = combined;
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode) throw error;
+      throw problem(409, 'Shared composition cannot safely overlay this metadata: ' + (error as Error).message);
+    }
   }
   metadata.chapters = metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : canonicalWorkChapters(db, metadata.identity, metadata.chapters);
   parseNovelMetadata(metadata);
