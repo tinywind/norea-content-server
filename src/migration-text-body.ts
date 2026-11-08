@@ -15,7 +15,7 @@ function decodeAttribute(value: string): string {
   });
 }
 function unsafeCss(value: string): boolean {
-  return /\\|\/\*|@import|(?:url|image|image-set|expression)\s*\(/i.test(value);
+  return /[<>]|\\|\/\*|@import|(?:url|image|image-set|expression)\s*\(/i.test(value);
 }
 function safeAttributes(value: string): boolean {
   let remaining = value;
@@ -58,7 +58,7 @@ export function isMigrationTextBody(bytes: Uint8Array, contentType = 'html'): bo
     if (start < 0) return true;
     if (text.startsWith('<!--', start)) {
       const end = text.indexOf('-->', start + 4);
-      if (end < 0) return false;
+      if (end < 0 || /[<>]/.test(text.slice(start + 4, end))) return false;
       offset = end + 3; continue;
     }
     const declaration = /^<!doctype\s+html\s*>/i.exec(text.slice(start));

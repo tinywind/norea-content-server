@@ -6,7 +6,7 @@ for (const body of [
   'Plain synthetic text',
   '<p style="color:#333" title="a > b">Text &lt;img src="example"&gt;</p><br><p>Next paragraph.</p>',
   '<!doctype html><html><body><style>p { color: red; }</style><p>Body.</p></body></html>',
-  '<p>Body.</p><!-- <img src="not-rendered"> -->',
+  '<p>Body.</p><!-- Plain note. -->',
 ]) test('accepts self-contained text markup: ' + body.slice(0, 30), () => {
   assert.equal(isMigrationTextBody(Buffer.from(body)), true);
 });
@@ -27,6 +27,8 @@ for (const body of [
   '<p onclick="createImage()">Body.</p>',
   '<iframe srcdoc="image"></iframe>',
   '<p title="unterminated>Body.',
+  '<!-- --!><img src="missing.png"> -->',
+  '<style></style x><img src="missing.png"></style>',
 ]) test('rejects unknown body-only resource coverage: ' + body.slice(0, 45), () => {
   assert.equal(isMigrationTextBody(Buffer.from(body)), false);
 });
