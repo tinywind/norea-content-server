@@ -93,7 +93,7 @@ function assertChapterFence(db: DatabaseSync, fence: ChapterFence, sourceRoot: s
   if (JSON.stringify(readdirSync(relocatedPath(fence.files[0].path, sourceRoot, retiredRoot)).sort()) !== fence.names) conflict('chapter files changed during verification');
 }
 
-function sourceFolderFence(dataDir: string, work: WorkRecord, rows: ChapterRecord[]): { root: FileFence; names: string } {
+function sourceFolderFence(dataDir: string, work: WorkRecord, rows: ChapterRecord[]): { root: FileFence; names: string; metadataFiles: FileFence[] } {
   const folder = chapterStoragePath(dataDir, work.directory);
   const metadata = (JSON.parse(work.entry) as WorkEntry).metadata;
   const allowed = new Set(['novel.json', ...(metadata.cover ? [metadata.cover.fileName] : [])]);
@@ -104,8 +104,30 @@ function sourceFolderFence(dataDir: string, work: WorkRecord, rows: ChapterRecor
     allowed.add(directory.slice(prefix.length));
   }
   const names = readdirSync(folder).sort();
-  if (names.some(name => !allowed.has(name))) conflict('source work contains unindexed files or chapters');
-  return { root: fileFence(folder), names: JSON.stringify(names) };
+  const extras = names.filter(name => !allowed.has(name));
+  const metadataFiles: FileFence[] = [];
+  if (extras.length) {
+    if (extras.some(name => !/^novel-[A-Za-z0-9][A-Za-z0-9._-]*-safeBackup-\d{4}\.json$/.test(name))) conflict('source work contains unindexed files or chapters');
+    const originalPath = join(folder, 'novel.json');
+    const originalFence = fileFence(originalPath);
+    const originalStat = lstatSync(originalPath);
+    if (!originalStat.isFile() || originalStat.size > metadataByteLimit) conflict('source metadata cannot be verified');
+    const originalBytes = readFileSync(originalPath);
+    assertFileFence(originalFence);
+    metadataFiles.push(originalFence);
+    for (const name of extras) {
+      const path = join(folder, name);
+      const fence = fileFence(path);
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.size !== originalBytes.length) conflict('source metadata backup is not an identical regular copy');
+      if (!readFileSync(path).equals(originalBytes)) conflict('source metadata backup is not an identical regular copy');
+      assertFileFence(fence);
+      metadataFiles.push(fence);
+    }
+    // Keep the comparison's original fences through the final locked guard.
+    assertFileFence(originalFence);
+  }
+  return { root: fileFence(folder), names: JSON.stringify(names), metadataFiles };
 }
 
 function checkedWork(db: DatabaseSync, dataDir: string, id: string, revision: string) {
@@ -192,7 +214,7 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
     const rows = checkedSourceRows(db, sourceId, request.source.chapters);
     validateMappings(rows, request);
     const folder = sourceFolderFence(dataDir, source.row, rows);
-    const workFiles = [...workFileFences(dataDir, source), ...workFileFences(dataDir, target)];
+    const workFiles = [...workFileFences(dataDir, source), ...workFileFences(dataDir, target), ...folder.metadataFiles];
     const fences: ChapterFence[] = [];
     for (const mapping of request.mappings) {
       const sourceEntry = chapterRow(db, mapping.sourceChapterId).catalog;

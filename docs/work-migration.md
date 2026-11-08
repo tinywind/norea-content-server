@@ -164,6 +164,13 @@ during these checks; a failed guard rolls back and restores that folder. No
 await occurs in this section, and other SQLite writers cannot change the
 verified records before the tombstones and receipt commit.
 
+Unknown source files and chapter folders block finalization. A regular file named
+`novel-<device>-safeBackup-<four digits>.json` is covered only when its raw bytes
+exactly equal the current `novel.json`. Both files are fenced before comparison
+and rechecked under the final deletion lock. Modified backups, other filenames,
+symlinks, and unindexed chapter folders still return 409. This does not change
+the source snapshot or the client's persisted finalization request.
+
 The deletion transaction records the usual work/chapter tombstones and an
 idempotency receipt together. Receipt storage is an additive table; the original
 schema checksum and existing catalogs, devices, settings, and files are retained.

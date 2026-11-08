@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
@@ -189,6 +190,61 @@ test('snapshot includes unavailable and unmapped server chapters instead of sile
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().chapters.length, 2);
     assert.equal(response.json().chapters.filter((row: { available: boolean }) => !row.available).length, 1);
+  } finally { await f.close(); }
+});
+
+test('covers an exact regular safeBackup metadata copy without changing the persisted migration request', async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const root = join(f.dataDir, 'contents/source/book');
+    await writeFile(join(root, 'novel-tinywind-SER-safeBackup-0001.json'), await readFile(join(root, 'novel.json')));
+    const payload = f.request();
+    const before = structuredClone(payload);
+    const response = await f.submit(payload);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(payload, before);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migrations').get() as { n: number }).n, 1);
+    assert.deepEqual(await readdir(join(f.dataDir, 'contents/source')), []);
+    assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'synthetic body');
+  } finally { await f.close(); }
+});
+
+for (const mismatch of ['different-bytes', 'other-name', 'symlink', 'orphan-chapter'] as const) test('retains source on unproven metadata coverage: ' + mismatch, async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const root = join(f.dataDir, 'contents/source/book');
+    const bytes = await readFile(join(root, 'novel.json'));
+    const name = mismatch === 'other-name' ? 'novel-copy.json' : 'novel-tinywind-SER-safeBackup-0001.json';
+    if (mismatch === 'orphan-chapter') await mkdir(join(root, '47'));
+    else if (mismatch === 'symlink') await symlink('novel.json', join(root, name));
+    else await writeFile(join(root, name), mismatch === 'different-bytes' ? Buffer.concat([bytes, Buffer.from(' ')]) : bytes);
+    const response = await f.submit(f.request());
+    assert.equal(response.statusCode, 409, response.body);
+    assert.equal(await f.sourceBody(), 'synthetic body');
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migrations').get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_tombstones').get() as { n: number }).n, 0);
+  } finally { await f.close(); }
+});
+
+for (const name of ['novel.json', 'novel-tinywind-SER-safeBackup-0001.json']) test('keeps the compared metadata file fenced through commit: ' + name, async () => {
+  const f = await fixture();
+  try {
+    await f.upload('source'); await f.upload('target');
+    const root = join(f.dataDir, 'contents/source/book');
+    const bytes = await readFile(join(root, 'novel.json'));
+    await writeFile(join(root, 'novel-tinywind-SER-safeBackup-0001.json'), bytes);
+    const pending = finalizeMigration(f.db, f.dataDir, sourceId, f.request(), defaultLimits);
+    const changed = Buffer.concat([bytes, Buffer.from(' ')]);
+    writeFileSync(join(root, name), changed);
+    await assert.rejects(pending, (error: { statusCode?: number; message?: string }) =>
+      error.statusCode === 409 && !!error.message?.includes('files changed during verification'));
+    assert.deepEqual(await readFile(join(root, name)), changed);
+    assert.equal(await f.sourceBody(), 'synthetic body');
+    assert.deepEqual(await readdir(join(f.dataDir, 'contents/source')), ['book']);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migrations').get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_tombstones').get() as { n: number }).n, 0);
   } finally { await f.close(); }
 });
 
