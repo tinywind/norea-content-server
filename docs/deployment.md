@@ -7,17 +7,22 @@ renamed to `0.2`; it is not a second release branch.
 ## Automatic image publication
 
 [docker-publish.yml](../.github/workflows/docker-publish.yml) runs on pull
-requests, pushes to branches, and manual **Run workflow** dispatches. It uses
-GitHub-hosted Ubuntu runners, Node.js 24, and pnpm 11.25.0 with a frozen lockfile.
+requests, pushes to branches other than `dependabot/**`, and manual **Run
+workflow** dispatches. Dependabot changes are validated by the pull-request
+event, without a duplicate push run that mistakes their slash-containing branch
+name for a publishing tag. Manual runs on Dependabot branches also validate only.
+The workflow uses GitHub-hosted Ubuntu runners, Node.js 24, and pnpm 11.25.0 with a
+frozen lockfile.
 The first job runs type checks, the complete server test suite, and the console
 build. It then builds one `linux/amd64` image from the exact Git commit, loads
 that image, and starts a disposable container with temporary empty storage.
 Smoke checks cover protocol/reading-state capabilities, the console HTML, and
 the compiled console JavaScript. Production data is never mounted in CI.
 
-Pull requests only validate. They receive no Docker Hub credential and publish
-no image. For a branch push or manual branch run, the tested image is transferred
-to a separate publishing job as an artifact. That job verifies the archive hash,
+Pull requests and Dependabot branches only validate. They receive no Docker Hub
+credential and publish no image. For other branch pushes or manual branch runs,
+the tested image is transferred to a separate publishing job as an artifact. That
+job verifies the archive hash,
 platform, and full source-revision label before authenticating to Docker Hub.
 It pushes the same image, without rebuilding it, and verifies that the registry
 manifest's image-config digest matches the configuration bytes exported from

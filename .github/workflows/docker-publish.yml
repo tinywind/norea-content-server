@@ -3,8 +3,8 @@ name: Validate and publish Docker image
 on:
   pull_request:
   push:
-    branches:
-      - "**"
+    branches-ignore:
+      - "dependabot/**"
   workflow_dispatch:
 
 permissions:
@@ -32,7 +32,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate a publishing branch name
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
         env:
           SOURCE_BRANCH: ${{ github.ref_name }}
         run: |
@@ -128,7 +128,7 @@ jobs:
           NODE
 
       - name: Export the exact smoke-tested image
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
         id: image_archive
         run: |
           set -euo pipefail
@@ -151,7 +151,7 @@ jobs:
           echo "sha256=$(sha256sum "$RUNNER_TEMP/norea-image.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Transfer the tested image to the publishing job
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
         id: image_artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -164,7 +164,7 @@ jobs:
   publish:
     name: Publish branch and latest tags
     needs: validate
-    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     concurrency:
