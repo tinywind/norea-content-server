@@ -230,9 +230,11 @@ test('backup downloads reject replaced symbolic files without reading outside th
 test('a backup upload that keeps sending is not cut off by the idle timeout', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'norea-backup-slow-'));
   try {
-    const store = new DeviceBackupStore(dataDir, { timeoutMs: 60 });
+    // The whole transfer exceeds the idle limit, while each arriving chunk has
+    // enough scheduling headroom for parallel CI processes and filesystem I/O.
+    const store = new DeviceBackupStore(dataDir, { timeoutMs: 500 });
     const parts = Array.from({ length: 6 }, (_, index) => Buffer.from(`part-${index}`));
-    const slow = Readable.from((async function* () { for (const part of parts) { await delay(30); yield part; } })());
+    const slow = Readable.from((async function* () { for (const part of parts) { await delay(100); yield part; } })());
     const saved = await store.put('Phone', slow, hash(Buffer.concat(parts)));
     assert.equal(saved.size, Buffer.concat(parts).length);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
