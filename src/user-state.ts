@@ -7,7 +7,7 @@ import { parseChapterComposition, type ChapterCompositionV1 } from './chapter-co
 import { mirrorDeltaRecordToCurrent } from './user-state-current-store.ts';
 import { problem, transaction } from './db.ts';
 import {
-  USER_STATE_MAX_BYTES, USER_STATE_MAX_BATCH,
+  USER_STATE_MAX_BYTES,
   parseUserStateOperation as parseOperation, userStateEntityKey,
   type UserStateEntity, type UserStateValue, type UserStateOperation,
   type UserStateRecord, type UserStateMergeResult,
@@ -15,7 +15,6 @@ import {
 export { USER_STATE_MAX_BYTES, userStateEntityKey, parseUserStateEntity, parseUserStateValue } from './user-state-protocol.ts';
 export type { UserStateEntity, UserStateValue, UserStateOperation, UserStateRecord, UserStateMergeResult } from './user-state-protocol.ts';
 
-export const USER_STATE_MAX_ITEMS = USER_STATE_MAX_BATCH;
 const RESPONSE_RESERVE = 4096;
 interface Namespace { workspaceId: string; epoch: string }
 interface Actor { id: string; name: string }
@@ -173,12 +172,13 @@ export function registerUserState(app: FastifyInstance, db: DatabaseSync): void 
     actor(db, request);
     const scope = assertNamespace(db, body), head = headRevision(db);
     const after = integer(body.after), through = body.through === undefined ? head : integer(body.through);
-    const limit = body.limit === undefined ? USER_STATE_MAX_ITEMS : integer(body.limit, 1);
-    if (limit > USER_STATE_MAX_ITEMS) throw problem(400, 'User state: page limit exceeds 200');
+    const limit = body.limit === undefined ? null : integer(body.limit, 1);
     if (after > through || through > head) throw problem(409, 'User state: cursor is ahead of the requested history');
     const records: UserStateRecord[] = [];
     let bytes = RESPONSE_RESERVE, cursor = after;
-    const rows = db.prepare('SELECT revision,record FROM user_state_changes WHERE revision>? AND revision<=? ORDER BY revision LIMIT ?').iterate(after, through, limit);
+    const rows = limit === null
+      ? db.prepare('SELECT revision,record FROM user_state_changes WHERE revision>? AND revision<=? ORDER BY revision').iterate(after, through)
+      : db.prepare('SELECT revision,record FROM user_state_changes WHERE revision>? AND revision<=? ORDER BY revision LIMIT ?').iterate(after, through, limit);
     for (const row of rows) {
       const serialized = row.record as string, size = Buffer.byteLength(serialized) + 1;
       if (bytes + size > USER_STATE_MAX_BYTES) break;
@@ -191,7 +191,7 @@ export function registerUserState(app: FastifyInstance, db: DatabaseSync): void 
   app.post('/api/v1/user-state/merge', { onRequest, bodyLimit: USER_STATE_MAX_BYTES, schema: { security: [{ bearerAuth: [] }], body: { type: 'object' }, description: 'Apply immutable idempotent user edits with per-entity revisions. A soft seed never replaces existing state; conflicting edits remain explicit.' } }, async request => {
     const body = object(request.body, ['workspaceId', 'epoch', 'operations']);
     const scope = assertNamespace(db, body);
-    if (!Array.isArray(body.operations) || body.operations.length > USER_STATE_MAX_ITEMS) throw problem(400, 'User state: expected at most 200 operations');
+    if (!Array.isArray(body.operations)) throw problem(400, 'User state: expected an operations array');
     // Parse every operation before entering the write transaction, including those after a valid edit.
     const operations = body.operations.map(parseOperation);
     const writer = actor(db, request); // Recheck blocking after the request body has arrived.

@@ -67,6 +67,7 @@ test('user state has one stable namespace shared by admitted devices, not their 
     assert.notEqual(f.workspace.workspaceId, f.workspace.epoch);
     const capabilities = (await f.app.inject('/api/v1/capabilities')).json();
     assert.equal(capabilities.userStateVersion, 1);
+    assert.equal(capabilities.userStateBulkVersion, 1);
     assert.equal(capabilities.readingStateVersion, 1);
     assert.equal(capabilities.deviceBackupVersion, 1);
     const a = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 123 })]));
@@ -294,7 +295,7 @@ test('bounded revision paging freezes a boundary and does not miss updates made 
     assert.equal((await f.read(5)).statusCode, 409);
     assert.equal((await f.read(0, 5)).statusCode, 409);
     assert.equal((await f.read(3, 2)).statusCode, 409);
-    assert.equal((await f.read(0, undefined, 201)).statusCode, 400);
+    assert.equal((await f.read(0, undefined, 201)).statusCode, 200);
   } finally { await f.close(); }
 });
 
@@ -313,12 +314,16 @@ test('malformed batches, wrong value groups and arbitrary device state cannot pa
       assert.equal((await f.merge([valid, invalid])).statusCode, 400);
       assert.equal(page(await f.read()).headRevision, 0);
     }
-    assert.equal((await f.merge(Array.from({ length: 201 }, (_, index) => operation(library(String(index)), { inLibrary: true, addedAt: null })))).statusCode, 400);
-    const max = await f.merge(Array.from({ length: 200 }, (_, index) => operation(library(String(index)), { inLibrary: true, addedAt: null })));
-    assert.equal(parseUserStateMergeResponse(max.json()).results.length, 200);
-    const records = page(await f.read()).records;
-    assert.equal(records.length, 200);
-    assert(records.every(record => Object.keys(record).sort().join(',') === 'deviceId,deviceName,entity,operationId,revision,updatedAt,value'));
+    const operations = Array.from({ length: 1681 }, (_, index) =>
+      operation(library(String(index)), { inLibrary: true, addedAt: null }));
+    const bulk = await f.merge(operations);
+    assert.equal(bulk.statusCode, 200, bulk.body);
+    assert.equal(parseUserStateMergeResponse(bulk.json()).results.length, 1681);
+    const all = page(await f.read(0, undefined, 20_000));
+    assert.equal(all.records.length, 1681); assert.equal(all.hasMore, false);
+    assert(all.records.every(record => Object.keys(record).sort().join(',') === 'deviceId,deviceName,entity,operationId,revision,updatedAt,value'));
+    const legacy = page(await f.read(0, all.through, 200));
+    assert.equal(legacy.records.length, 200); assert.equal(legacy.hasMore, true);
   } finally { await f.close(); }
 });
 
