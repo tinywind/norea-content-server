@@ -81,6 +81,20 @@ membership records to false, preventing stale offline inclusion from resurrectin
 it. Composition values retain their complete provenance, storage identities,
 manual order, labels, and exclusions.
 
+## Opaque identity retention
+
+The userStateOpaqueIdentityVersion 1 capability means the delta ledger also accepts
+state whose content identity is not fully resolved yet. A work may have a null
+source ID and remain keyed by its plugin plus source path. Recovered norea-folder
+and local-folder chapter references may also be retained verbatim.
+
+These records are durable user data, not trusted content matches. New clients keep
+them in the shared ledger even when they cannot safely project them into a local
+chapter. The temporary current-snapshot v2 compatibility view omits identities it
+cannot represent; this never removes the delta record. When a later edit has a
+fully resolved identity it is stored as a newer normal delta record, while the
+older opaque record remains available as recovery history.
+
 ## Portable identities and privacy
 
 Works use plugin ID plus provider-owned work ID. Chapters use their exact provider
