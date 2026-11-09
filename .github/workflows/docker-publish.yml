@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     outputs:
+      publish_requested: ${{ steps.publication.outputs.publish }}
       artifact_id: ${{ steps.image_artifact.outputs.artifact-id }}
       archive_sha256: ${{ steps.image_archive.outputs.sha256 }}
       image_config_digest: ${{ steps.image_archive.outputs.image_config_digest }}
@@ -31,14 +32,17 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Validate a publishing branch name
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
+      - name: Select release-branch publication
+        id: publication
+        if: needs.validate.outputs.publish_requested == 'true'
         env:
           SOURCE_BRANCH: ${{ github.ref_name }}
         run: |
-          if [[ ! "$SOURCE_BRANCH" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || [[ "$SOURCE_BRANCH" == latest ]]; then
-            echo '::error::A publishing branch must be an exact Docker-compatible tag (for example 0.2 or 0.3), and cannot be named latest. Branch names are never silently rewritten.'
-            exit 1
+          if [[ "$SOURCE_BRANCH" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            echo "Validation only: $SOURCE_BRANCH is not a version branch such as 0.2." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Install pnpm
@@ -128,7 +132,7 @@ jobs:
           NODE
 
       - name: Export the exact smoke-tested image
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
+        if: steps.publication.outputs.publish == 'true'
         id: image_archive
         run: |
           set -euo pipefail
@@ -151,7 +155,7 @@ jobs:
           echo "sha256=$(sha256sum "$RUNNER_TEMP/norea-image.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Transfer the tested image to the publishing job
-        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
+        if: steps.publication.outputs.publish == 'true'
         id: image_artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
