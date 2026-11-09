@@ -1,7 +1,7 @@
 import { chapterIdentityId } from './chapter-number-mappings.ts';
 import { randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, lstatSync } from 'node:fs';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -11,6 +11,7 @@ import { canonicalize } from 'json-canonicalize';
 import yauzl from 'yauzl';
 import { problem } from './db.ts';
 import { chapterRow, chapterStoragePath, digest, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type ChapterConflictPolicy, type Limits, type PackageManifest } from './packages.ts';
+import { openVerifiedRegularFile, openVerifiedRegularFileSync, readVerifiedRegularFile } from './secure-files.ts';
 
 export function validateFiles(value: unknown, limits: Limits): asserts value is PackageManifest {
   validateManifest(value);
@@ -31,8 +32,10 @@ export async function validateMedia(directory: string, manifest: PackageManifest
   signal?.throwIfAborted();
   if (!manifest.files.some(file => file.path === 'manifest.json')) return true;
   let media: { version?: number; media?: { files?: { fileName: string; path: string }[] } };
-  try { media = JSON.parse(await readFile(join(directory, 'manifest.json'), { encoding: 'utf8', signal })); }
-  catch { signal?.throwIfAborted(); throw problem(400, 'Invalid media manifest JSON'); }
+  try {
+    signal?.throwIfAborted();
+    media = JSON.parse((await readVerifiedRegularFile(join(directory, 'manifest.json'), 16 * 1024 ** 2)).bytes.toString('utf8'));
+  } catch { signal?.throwIfAborted(); throw problem(400, 'Invalid media manifest JSON'); }
   if (media?.version !== 1 || !Array.isArray(media.media?.files)) throw problem(400, 'Invalid chapter media manifest');
   if (media.media.files.length > limits.files) throw problem(413, 'Media file count limit exceeded');
   const expected = new Set<string>();
@@ -45,14 +48,20 @@ export async function validateMedia(directory: string, manifest: PackageManifest
     names.add(name.toLowerCase()); expected.add(name);
   }
   if (!manifest.files.some(file => file.path === 'media.zip')) return expected.size === 0;
-  const zip = await new Promise<yauzl.ZipFile>((accept, reject) => yauzl.open(join(directory, 'media.zip'), { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true }, (error, value) => error ? reject(problem(400, 'Invalid chapter media archive')) : accept(value!)));
+  const archiveFile = (() => {
+    try { return openVerifiedRegularFileSync(join(directory, 'media.zip'), limits.zipBytes); }
+    catch { throw problem(400, 'Invalid chapter media archive'); }
+  })();
+  let zip: yauzl.ZipFile | undefined;
   const found = new Set<string>();
   const entries = new Set<string>();
   try {
+    zip = await new Promise<yauzl.ZipFile>((accept, reject) => yauzl.fromFd(archiveFile.descriptor, { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true }, (error, value) => error ? reject(problem(400, 'Invalid chapter media archive')) : accept(value!)));
+    const openedZip = zip;
     await new Promise<void>((accept, reject) => {
-      zip.on('error', () => reject(problem(400, 'Invalid chapter media archive')));
-      zip.on('end', accept);
-      zip.on('entry', (entry: yauzl.Entry) => {
+      openedZip.on('error', () => reject(problem(400, 'Invalid chapter media archive')));
+      openedZip.on('end', accept);
+      openedZip.on('entry', (entry: yauzl.Entry) => {
         if (signal?.aborted) { reject(signal.reason); return; }
         const type = (entry.externalFileAttributes >>> 16) & 0xf000;
         const directory = entry.fileName.endsWith('/') || type === 0x4000 || (entry.externalFileAttributes & 0x10) !== 0;
@@ -65,12 +74,14 @@ export async function validateMedia(directory: string, manifest: PackageManifest
         expanded += entry.uncompressedSize;
         if (expanded > limits.expandedBytes) { reject(problem(413, 'Expanded media limit exceeded')); return; }
         if (!directory) found.add(entry.fileName);
-        zip.readEntry();
+        openedZip.readEntry();
       });
-      zip.readEntry();
+      openedZip.readEntry();
     });
-    return [...expected].every(name => found.has(name));
-  } finally { zip.close(); }
+    const valid = [...expected].every(name => found.has(name));
+    archiveFile.verify();
+    return valid;
+  } finally { if (zip) zip.close(); else archiveFile.close(); }
 }
 
 export async function publishChapterFiles(db: DatabaseSync, dataDir: string, parts: AsyncIterableIterator<Multipart>, limits: Limits, conflictPolicy: ChapterConflictPolicy = 'prefer-complete'): Promise<CatalogEntry> {
@@ -125,8 +136,28 @@ export function chapterFileStream(db: DatabaseSync, dataDir: string, id: string,
   if (!file) throw problem(404, 'Chapter file not found');
   if (!chapter.path) throw problem(410, 'Chapter file is unavailable');
   const target = chapterStoragePath(dataDir, join(chapter.path, file.path));
-  if (!existsSync(target)) throw problem(410, 'Chapter file is unavailable');
-  const stat = lstatSync(target);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== file.size) throw problem(410, 'Chapter file is unavailable');
-  return { file, path: target, open: () => createReadStream(target) };
+  const probe = (() => {
+    try { return openVerifiedRegularFileSync(target, file.size); }
+    catch { throw problem(410, 'Chapter file is unavailable'); }
+  })();
+  try { if (probe.snapshot.size !== file.size) throw problem(410, 'Chapter file is unavailable'); }
+  finally { probe.close(); }
+  return {
+    file,
+    path: target,
+    open: () => {
+      const opened = (() => {
+        try { return openVerifiedRegularFileSync(target, file.size); }
+        catch { throw problem(410, 'Chapter file is unavailable'); }
+      })();
+      if (opened.snapshot.size !== file.size) { opened.close(); throw problem(410, 'Chapter file is unavailable'); }
+      const stream = createReadStream('', { fd: opened.descriptor, autoClose: false });
+      let closed = false;
+      const close = () => { if (!closed) { closed = true; opened.close(); } };
+      stream.once('end', () => { try { opened.verify(); } catch (error) { stream.destroy(error as Error); } finally { close(); } });
+      stream.once('error', close);
+      stream.once('close', close);
+      return stream;
+    },
+  };
 }

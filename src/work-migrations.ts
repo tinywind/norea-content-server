@@ -1,5 +1,5 @@
 import { chapterIdentityId } from './chapter-number-mappings.ts';
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -12,6 +12,7 @@ import { assertMigrationNotRevoked, readWorkMigrations, readWorkMigration, recor
 import { isMigrationTextBody } from './migration-text-body.ts';
 import { availableChapter, chapterRow, chapterStoragePath, digest, type CatalogEntry, type Limits } from './packages.ts';
 import { coverBytes, deleteWork, getWork, isCoverFile, metadataByteLimit, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { readVerifiedRegularFileSync, regularFileSignature } from './secure-files.ts';
 
 type Digest = { sha256: string; bytes: number };
 export type MigrationInventory = { body: Digest | null; expectedAssetKeys: string[] | null; storedAssets: (Digest & { key: string })[] };
@@ -42,6 +43,10 @@ interface ChapterFence { id: string; entry: string; path: string | null; directo
 const MAX_CHAPTERS = 10000;
 const conflict = (message: string): never => { throw problem(409, 'Work migration: ' + message); };
 const liveRows = (db: DatabaseSync, id: string) => db.prepare('SELECT id,entry,directory,path,deleted_at FROM chapters WHERE work_id=? AND deleted_at IS NULL ORDER BY id').all(id) as unknown as ChapterRecord[];
+function verifiedBytes(path: string, limit: number, message: string): ReturnType<typeof readVerifiedRegularFileSync> {
+  try { return readVerifiedRegularFileSync(path, limit); }
+  catch { return conflict(message); }
+}
 
 function refreshWork(db: DatabaseSync, dataDir: string, id: string): { row: WorkRecord; entry: WorkEntry } {
   const entry = getWork(db, dataDir, id);
@@ -51,7 +56,9 @@ function refreshWork(db: DatabaseSync, dataDir: string, id: string): { row: Work
 
 function workSnapshot(dataDir: string, id: string, work: { row: WorkRecord; entry: WorkEntry }): MigrationSnapshot['work'] {
   const { row, entry } = work;
-  const bytes = coverBytes(join(dataDir, row.directory), entry.metadata);
+  let bytes: Buffer | undefined;
+  try { bytes = coverBytes(join(dataDir, row.directory), entry.metadata); }
+  catch { return conflict('cover changed during snapshot'); }
   const coverSha256 = bytes ? digest(bytes) : null;
   if (digest(canonicalize(entry.metadata) + '\n' + (coverSha256 ?? '')) !== row.fingerprint) conflict('cover changed during snapshot');
   return { id, revision: row.fingerprint, identity: entry.metadata.identity, metadata: entry.metadata, coverSha256 };
@@ -62,7 +69,13 @@ function chapterSnapshot(chapter: CatalogEntry, available: boolean): MigrationSn
     name: chapter.manifest.chapter.name, complete: chapter.complete, available };
 }
 export function migrationSnapshot(db: DatabaseSync, dataDir: string, id: string): MigrationSnapshot {
-  const work = workSnapshot(dataDir, id, refreshWork(db, dataDir, id));
+  let work: MigrationSnapshot['work'];
+  try { work = workSnapshot(dataDir, id, refreshWork(db, dataDir, id)); }
+  catch (error) {
+    if ((error as { statusCode?: number }).statusCode === 400 && /file changed while reading/i.test((error as Error).message))
+      return conflict('cover changed during snapshot');
+    throw error;
+  }
   const chapters = liveRows(db, id);
   if (chapters.length > MAX_CHAPTERS) conflict('work exceeds the migration chapter limit');
   return { work, chapters: chapters.map(row => chapterSnapshot(JSON.parse(row.entry) as CatalogEntry, !!availableChapter(db, dataDir, row.id))) };
@@ -135,18 +148,16 @@ function sourceFolderFence(dataDir: string, work: WorkRecord, rows: ChapterRecor
   if (extras.length) {
     if (extras.some(name => !/^novel-[A-Za-z0-9][A-Za-z0-9._-]*-safeBackup-\d{4}\.json$/.test(name))) conflict('source work contains unindexed files or chapters');
     const originalPath = join(folder, 'novel.json');
-    const originalFence = fileFence(originalPath);
-    const originalStat = lstatSync(originalPath);
-    if (!originalStat.isFile() || originalStat.size > metadataByteLimit) conflict('source metadata cannot be verified');
-    const originalBytes = readFileSync(originalPath);
+    const original = verifiedBytes(originalPath, metadataByteLimit, 'source metadata cannot be verified');
+    const originalFence = { path: originalPath, signature: regularFileSignature(original.snapshot) };
+    const originalBytes = original.bytes;
     assertFileFence(originalFence);
     metadataFiles.push(originalFence);
     for (const name of extras) {
       const path = join(folder, name);
-      const fence = fileFence(path);
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.size !== originalBytes.length) conflict('source metadata backup is not an identical regular copy');
-      if (!readFileSync(path).equals(originalBytes)) conflict('source metadata backup is not an identical regular copy');
+      const backup = verifiedBytes(path, metadataByteLimit, 'source metadata backup is not an identical regular copy');
+      const fence = { path, signature: regularFileSignature(backup.snapshot) };
+      if (backup.bytes.length !== originalBytes.length || !backup.bytes.equals(originalBytes)) conflict('source metadata backup is not an identical regular copy');
       assertFileFence(fence);
       metadataFiles.push(fence);
     }
@@ -279,8 +290,7 @@ function verifyBodyOnlyTarget(db: DatabaseSync, dataDir: string, entry: CatalogE
   if (entry.manifest.chapter.contentType === 'pdf') return;
   if (inventory.expectedAssetKeys !== null && inventory.expectedAssetKeys.length > 0) return;
   const path = chapterFileStream(db, dataDir, entry.id, entry.revision, entry.manifest.bodyPath).path;
-  if (lstatSync(path).size > 16 * 1024 ** 2) conflict('body-only text exceeds the verification limit');
-  const bytes = readFileSync(path);
+  const bytes = verifiedBytes(path, 16 * 1024 ** 2, 'body-only text exceeds the verification limit').bytes;
   if (bytes.length > 16 * 1024 ** 2 || !sameDigest(inventory.body, { sha256: digest(bytes), bytes: bytes.length })
     || !isMigrationTextBody(bytes, entry.manifest.chapter.contentType)) conflict('body-only target contains media or unsupported resource references');
 }

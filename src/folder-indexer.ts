@@ -33,6 +33,7 @@ interface IndexedChapter { id: string; work_id: string; directory: string; path:
 interface IndexedWork { id: string; directory: string; entry: string }
 class UnsupportedChapterError extends Error {}
 const fail = (message: string): never => { throw new Error(message); };
+const changedWhileReading = (error: unknown) => /changed while (?:opening|reading)|descriptor was closed during reading/i.test((error as Error).message);
 function aborted(signal?: AbortSignal): void { signal?.throwIfAborted(); }
 async function noLinks(path: string): Promise<void> {
   let current = resolve(path);
@@ -127,7 +128,13 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       let complete: boolean;
       for (let attempt = 0; ; attempt++) {
         aborted(options.signal);
-        ({ manifest, complete } = await chapterManifest(path, metadata, options));
+        try { ({ manifest, complete } = await chapterManifest(path, metadata, options)); }
+        catch (error) {
+          if (!changedWhileReading(error)) throw error;
+          if (attempt === 1) fail('Source changed during indexing; retry after download completes');
+          before = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
+          continue;
+        }
         const after = canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
         if (before === after) break;
         if (attempt === 1) fail('Source changed during indexing; retry after download completes');
@@ -176,7 +183,12 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         for (let attempt = 0; ; attempt++) {
           aborted(options.signal);
           const original = await signature(metadataPath);
-          value = readNovelMetadata(metadataPath);
+          try { value = readNovelMetadata(metadataPath); }
+          catch (error) {
+            if (!changedWhileReading(error)) throw error;
+            if (attempt === 1) fail('Work metadata changed during indexing');
+            continue;
+          }
           if (value.identity.pluginId !== sourceId || value.identity.novelId !== directory.split(sep).at(-1)) fail('Work metadata IDs do not match its folder');
           before = await workSignature();
           if (original === await signature(metadataPath)) break;

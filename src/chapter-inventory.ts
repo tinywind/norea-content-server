@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat } from 'node:fs/promises';
 import { crc32 } from 'node:zlib';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 import yauzl from 'yauzl';
@@ -8,6 +8,7 @@ import { problem } from './db.ts';
 import { chapterFileStream } from './chapter-files.ts';
 import { chapterRow, safeArchivePath, type Limits } from './packages.ts';
 import type { DatabaseSync } from 'node:sqlite';
+import { openVerifiedRegularFileSync, readVerifiedRegularFile } from './secure-files.ts';
 
 type Asset = { key: string; sha256: string; bytes: number };
 type Inventory = { body: { sha256: string; bytes: number } | null; expectedAssetKeys: string[] | null; storedAssets: Asset[] };
@@ -25,16 +26,18 @@ async function inspect(input: Input): Promise<{ inventory: Inventory; fingerprin
   const before = await Promise.all(paths.map(fingerprint));
   const bodyHash = createHash('sha256');
   let bodyBytes = 0;
-  for await (const chunk of createReadStream(input.body)) {
-    const bytes = Buffer.from(chunk); bodyBytes += bytes.length;
-    if (bodyBytes > input.limits.expandedBytes) throw new Error('Body exceeds limit');
-    bodyHash.update(bytes);
-  }
+  const bodyFile = openVerifiedRegularFileSync(input.body, input.limits.expandedBytes);
+  try {
+    for await (const chunk of createReadStream('', { fd: bodyFile.descriptor, autoClose: false })) {
+      const bytes = Buffer.from(chunk); bodyBytes += bytes.length;
+      if (bodyBytes > input.limits.expandedBytes) throw new Error('Body exceeds limit');
+      bodyHash.update(bytes);
+    }
+    bodyFile.verify();
+  } finally { bodyFile.close(); }
   let expectedAssetKeys: string[] | null = null;
   if (input.manifest) {
-    const stat = await lstat(input.manifest);
-    if (stat.size > 16 * 1024 ** 2) throw new Error('Manifest exceeds limit');
-    const text = await readFile(input.manifest, 'utf8');
+    const text = (await readVerifiedRegularFile(input.manifest, 16 * 1024 ** 2)).bytes.toString('utf8');
     try {
       const manifest = JSON.parse(text);
       if (manifest?.version !== 1 || typeof manifest.complete !== 'boolean' || !Number.isSafeInteger(manifest.updatedAt) || manifest.updatedAt < 0 || !Array.isArray(manifest.media?.files) || manifest.media.files.length > input.limits.files) throw new Error('Invalid manifest');
@@ -49,35 +52,41 @@ async function inspect(input: Input): Promise<{ inventory: Inventory; fingerprin
   }
   const storedAssets: Asset[] = [];
   if (input.archive) {
-    if ((await lstat(input.archive)).size > input.limits.zipBytes) throw new Error('Archive exceeds limit');
-    const zip = await new Promise<yauzl.ZipFile>((resolve, reject) => yauzl.open(input.archive!, { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true }, (error, value) => error ? reject(error) : resolve(value!)));
+    const archiveFile = openVerifiedRegularFileSync(input.archive, input.limits.zipBytes);
+    let zip: yauzl.ZipFile | undefined;
     try {
+      const openedZip = await new Promise<yauzl.ZipFile>((resolve, reject) => yauzl.fromFd(archiveFile.descriptor, { lazyEntries: true, autoClose: false, strictFileNames: true, validateEntrySizes: true }, (error, value) => error ? reject(error) : resolve(value!)));
+      zip = openedZip;
       await new Promise<void>((resolve, reject) => {
         const names = new Set<string>(); let expanded = 0;
-        zip.on('error', reject);
-        zip.on('end', resolve);
-        zip.on('entry', (entry: yauzl.Entry) => {
+        openedZip.on('error', reject);
+        openedZip.on('end', resolve);
+        openedZip.on('entry', (entry: yauzl.Entry) => {
           const type = (entry.externalFileAttributes >>> 16) & 0xf000;
           const directory = entry.fileName.endsWith('/') || type === 0x4000 || (entry.externalFileAttributes & 0x10) !== 0;
           const name = entry.fileName.endsWith('/') ? entry.fileName.slice(0, -1) : entry.fileName;
           if (!safeArchivePath(name) || names.has(name.toLowerCase()) || (type !== 0 && type !== (directory ? 0x4000 : 0x8000)) || (entry.generalPurposeBitFlag & 1)) { reject(new Error('Unsafe archive')); return; }
           names.add(name.toLowerCase()); expanded += entry.uncompressedSize;
           if (names.size > input.limits.files || expanded + bodyBytes > input.limits.expandedBytes) { reject(new Error('Archive exceeds limits')); return; }
-          if (directory || !/^[A-Za-z0-9._-]+$/.test(name) || entry.uncompressedSize <= 0 || entry.uncompressedSize > 256 * 1024 ** 2) { zip.readEntry(); return; }
-          zip.openReadStream(entry, (error, stream) => {
-            if (error || !stream) { zip.readEntry(); return; }
+          if (directory || !/^[A-Za-z0-9._-]+$/.test(name) || entry.uncompressedSize <= 0 || entry.uncompressedSize > 256 * 1024 ** 2) { openedZip.readEntry(); return; }
+          openedZip.openReadStream(entry, (error, stream) => {
+            if (error || !stream) { openedZip.readEntry(); return; }
             const hash = createHash('sha256'); let size = 0; let checksum = 0; let failed = false;
             stream.on('data', (chunk: Buffer) => { size += chunk.length; hash.update(chunk); checksum = crc32(chunk, checksum); });
-            stream.on('error', () => { failed = true; zip.readEntry(); });
+            stream.on('error', () => { failed = true; openedZip.readEntry(); });
             stream.on('end', () => {
               if (!failed && size === entry.uncompressedSize && checksum === entry.crc32) storedAssets.push({ key: `media/${name}`, sha256: hash.digest('hex'), bytes: size });
-              zip.readEntry();
+              openedZip.readEntry();
             });
           });
         });
-        zip.readEntry();
+        openedZip.readEntry();
       });
-    } finally { zip.close(); }
+      archiveFile.verify();
+    } finally {
+      if (zip) zip.close();
+      else archiveFile.close();
+    }
   }
   const after = await Promise.all(paths.map(fingerprint));
   if (before.some((value, index) => value !== after[index])) throw new Error('Files changed during inspection');

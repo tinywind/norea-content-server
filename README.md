@@ -46,8 +46,11 @@ Requests are limited by the direct client IP: 6,000 requests per minute per rout
 Excess requests return HTTP 429 with `Retry-After`. Forwarded IP headers are not
 trusted; clients behind a reverse proxy share that proxy's limits.
 
-Secret and work-file reads reject symbolic links and read through the validated
-file descriptor. Keep storage directories writable only by trusted operators.
+Secret, metadata, body, archive, cover, and media reads reject symbolic links and
+continue through the same validated file descriptor from inspection through the
+last byte. The server verifies the descriptor and pathname again after reading,
+so replacing a file during validation fails rather than redirecting the read.
+Keep storage directories writable only by trusted operators.
 
 ## API
 
