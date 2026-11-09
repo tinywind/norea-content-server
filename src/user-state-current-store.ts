@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import {
-  canonicalUserStateJson, userStateEntityKey, type UserStateEntity, type UserStateRecord, type UserStateValue, type UserStateValueMap,
+  canonicalUserStateJson, UserStateProtocolError, userStateEntityKey, type UserStateEntity, type UserStateRecord, type UserStateValue, type UserStateValueMap,
 } from './user-state-protocol.ts';
 import { mergeUserStateComposition } from './user-state-composition.ts';
 import { currentStateMigrationProjection } from './user-state-current-projection.ts';
@@ -285,7 +285,13 @@ export function mirrorDeltaRecordToCurrent(db: DatabaseSync, entity: UserStateEn
   }
   const present = positiveLegacy({ entity, value });
   if (!present) { deleteCurrentRecord(db, currentEntity); return; }
-  const item = parseUserStateCurrentItem({ entity: currentEntity, value });
+  let item: UserStateCurrentItem;
+  try {
+    item = parseUserStateCurrentItem({ entity: currentEntity, value });
+  } catch (error) {
+    if (error instanceof UserStateProtocolError) return;
+    throw error;
+  }
   const key = userStateEntityKey(item.entity);
   db.prepare(`INSERT INTO user_state_current_records(entity_key,kind,item) VALUES(?,?,?)
     ON CONFLICT(entity_key) DO UPDATE SET kind=excluded.kind,item=excluded.item WHERE item<>excluded.item`)

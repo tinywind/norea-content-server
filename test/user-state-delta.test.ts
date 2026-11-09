@@ -68,6 +68,7 @@ test('user state has one stable namespace shared by admitted devices, not their 
     const capabilities = (await f.app.inject('/api/v1/capabilities')).json();
     assert.equal(capabilities.userStateVersion, 1);
     assert.equal(capabilities.userStateBulkVersion, 1);
+    assert.equal(capabilities.userStateOpaqueIdentityVersion, 1);
     assert.equal(capabilities.readingStateVersion, 1);
     assert.equal(capabilities.deviceBackupVersion, 1);
     const a = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 123 })]));
@@ -114,9 +115,20 @@ test('portable identity ignores names/local row IDs, folds only ASCII source IDs
     assert.equal(result(await f.merge([operation({ kind: 'library', work: renamed }, { inLibrary: true, addedAt: null })])).status, 'unchanged');
     assert.equal(result(await f.merge([operation(reading('other-work'), { progress: 70, unread: false, readAt: 50 })])).status, 'applied');
     assert.equal(first.current!.revision, 1);
+    const opaqueWork: UserStateEntity = { kind: 'library', work: { ...work(), sourceNovelId: null } };
+    const opaqueChapter: UserStateEntity = { kind: 'reading', work: work(), chapter: { chapterPath: 'norea-folder:1' } };
+    assert.equal(result(await f.merge([operation(opaqueWork, { inLibrary: true, addedAt: 9 })])).status, 'applied');
+    assert.equal(result(await f.merge([operation(opaqueChapter, { progress: 33, unread: false, readAt: 9 })])).status, 'applied');
+    const opaqueRecords = page(await f.read()).records;
+    assert(opaqueRecords.some(record => record.entity.kind === 'library' && record.entity.work.sourceNovelId === null));
+    assert(opaqueRecords.some(record => record.entity.kind === 'reading' && record.entity.chapter.chapterPath === 'norea-folder:1'));
+    const currentReply = await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers });
+    assert.equal(currentReply.statusCode, 200, currentReply.body);
+    const currentItems = currentReply.json().items as { entity: UserStateEntity }[];
+    assert(!currentItems.some(item => 'work' in item.entity && item.entity.work.sourceNovelId === null));
+    assert(!currentItems.some(item => (item.entity.kind === 'reading' || item.entity.kind === 'bookmark') &&
+      item.entity.chapter.chapterPath === 'norea-folder:1'));
     for (const bad of [
-      { ...operation(library(), { inLibrary: false, addedAt: null }), entity: { kind: 'library', work: { ...work(), sourceNovelId: null } } },
-      { ...operation(reading(), { progress: 0, unread: true, readAt: null }), entity: { kind: 'reading', work: work(), chapter: { chapterPath: 'norea-folder:1' } } },
       { ...operation(library(), { inLibrary: true, addedAt: null }), localDatabaseId: 1 },
       { ...operation(library(), { inLibrary: true, addedAt: null }), entity: { kind: 'library', work: { ...work(), localId: 1 } } },
     ]) assert.equal((await f.merge([bad])).statusCode, 400);
@@ -339,8 +351,11 @@ test('resume accepts portable anchors and rejects pixel/local-ID fields, and cha
       { chapter: chapter(), anchor: { ...anchor, novelId: 1 }, openedAt: null },
       { chapter: chapter(), anchor: { ...anchor, offset: 20 }, openedAt: null },
       { chapter: chapter(), anchor: { ...anchor, segmentIndex: 3 }, openedAt: null },
-      { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: null },
     ]) assert.equal((await f.merge([{ ...operation(entity, { chapter: null, anchor: null, openedAt: null }), value }])).statusCode, 400);
+    const opaqueResume = result(await f.merge([operation(entity,
+      { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: 1700000000001 }, saved.current!.revision)]));
+    assert.equal(opaqueResume.status, 'applied');
+    assert.deepEqual(opaqueResume.current!.value, { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: 1700000000001 });
     const owned: UserStateEntity = { kind: 'reading', work: work(), chapter: { ...chapter(), compositionEntryId: 'entry-a' } };
     const first = result(await f.merge([operation(owned, { progress: 10, unread: false, readAt: null })]));
     const mismatch = result(await f.merge([operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision)]));
