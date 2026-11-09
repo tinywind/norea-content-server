@@ -34,7 +34,7 @@ jobs:
 
       - name: Select release-branch publication
         id: publication
-        if: needs.validate.outputs.publish_requested == 'true'
+        if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
         env:
           SOURCE_BRANCH: ${{ github.ref_name }}
         run: |
@@ -168,7 +168,7 @@ jobs:
   publish:
     name: Publish branch and latest tags
     needs: validate
-    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/') && !startsWith(github.ref, 'refs/heads/dependabot/')
+    if: needs.validate.outputs.publish_requested == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     concurrency:
