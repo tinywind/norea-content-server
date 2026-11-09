@@ -4,6 +4,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { canonicalize } from 'json-canonicalize';
 import { authenticate } from './auth.ts';
 import { parseChapterComposition, type ChapterCompositionV1 } from './chapter-composition.ts';
+import { mirrorDeltaRecordToCurrent } from './user-state-current-store.ts';
 import { problem, transaction } from './db.ts';
 import {
   USER_STATE_MAX_BYTES, USER_STATE_MAX_BATCH,
@@ -91,9 +92,17 @@ function publish(db: DatabaseSync, operation: UserStateOperation, entity: UserSt
   const record: UserStateRecord = { entity, value: operation.value, revision, operationId: operation.operationId, updatedAt: Date.now(), deviceId: writer.id, deviceName: writer.name };
   const serialized = JSON.stringify(record);
   const category = entity.kind === 'category' ? operation.value as CategoryValue : null;
-  db.prepare('INSERT INTO user_state_records(entity_key,kind,category_name,category_deleted,revision,record) VALUES(?,?,?,?,?,?) ON CONFLICT(entity_key) DO UPDATE SET kind=excluded.kind,category_name=excluded.category_name,category_deleted=excluded.category_deleted,revision=excluded.revision,record=excluded.record')
-    .run(key, entity.kind, category?.name ?? null, category ? Number(category.deleted) : null, revision, serialized);
+  const membership = entity.kind === 'membership' ? operation.value as { included: boolean } : null;
+  db.prepare(`INSERT INTO user_state_records(
+    entity_key,kind,category_name,category_deleted,membership_category_id,membership_included,revision,record
+  ) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(entity_key) DO UPDATE SET
+    kind=excluded.kind,category_name=excluded.category_name,category_deleted=excluded.category_deleted,
+    membership_category_id=excluded.membership_category_id,membership_included=excluded.membership_included,
+    revision=excluded.revision,record=excluded.record`)
+    .run(key, entity.kind, category?.name ?? null, category ? Number(category.deleted) : null,
+      entity.kind === 'membership' ? entity.categoryId : null, membership ? Number(membership.included) : null, revision, serialized);
   db.prepare('UPDATE user_state_changes SET record=? WHERE revision=?').run(serialized, revision);
+  mirrorDeltaRecordToCurrent(db, record.entity, record.value);
   return record;
 }
 function ownershipConflict(current: UserStateRecord | null, entity: UserStateEntity): boolean {
@@ -105,7 +114,7 @@ function ownershipConflict(current: UserStateRecord | null, entity: UserStateEnt
 function excludeDeletedCategoryMemberships(db: DatabaseSync, category: string, deletion: UserStateOperation, writer: Actor): void {
   // Advance each known membership's revision. Without this, restoring a category
   // could acknowledge an old true value as unchanged and resurrect stale intent.
-  const keys = db.prepare("SELECT entity_key FROM user_state_records WHERE kind='membership' AND json_extract(record,'$.entity.categoryId')=? AND json_extract(record,'$.value.included')=1 ORDER BY entity_key")
+  const keys = db.prepare("SELECT entity_key FROM user_state_records WHERE kind='membership' AND membership_category_id=? AND membership_included=1 ORDER BY entity_key")
     .all(category) as { entity_key: string }[];
   const lookup = db.prepare('SELECT record FROM user_state_records WHERE entity_key=?');
   for (const { entity_key: key } of keys) {

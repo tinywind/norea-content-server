@@ -19,7 +19,4 @@ export function registerUserStateCurrent(app: FastifyInstance, db: DatabaseSync)
     authorize(request); // A device can be blocked while its complete snapshot arrives.
     return transaction(db, () => mergeCurrentUserState(db, current));
   });
-  const upgrade = async () => { throw problem(426, 'Upgrade Norea to exchange current SQLite state. Legacy edit-history synchronization is no longer accepted.'); };
-  app.get('/api/v1/user-state', { onRequest, schema: { security } }, upgrade);
-  for (const path of ['read', 'merge']) app.post('/api/v1/user-state/' + path, { onRequest, bodyLimit: USER_STATE_CURRENT_MAX_BYTES, schema: { security } }, upgrade);
 }

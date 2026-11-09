@@ -10,7 +10,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { buildApp } from '../src/app.ts';
 import { currentCategoryId } from '../src/user-state-current-store.ts';
 import { parseUserStateCurrentSnapshot, USER_STATE_CURRENT_MAX_BYTES, type UserStateCurrentItem } from '../src/user-state-current-protocol.ts';
-import { userStateEntityKey, type UserStateEntity, type UserStateValue } from '../src/user-state-protocol.ts';
+import {
+  parseUserStateMergeResponse, parseUserStateReadResponse, parseUserStateWorkspace, userStateEntityKey,
+  type UserStateEntity, type UserStateOperation, type UserStateValue,
+} from '../src/user-state-protocol.ts';
 import type { ChapterCompositionV1 } from '../src/chapter-composition.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
@@ -44,20 +47,138 @@ function result(response: { statusCode: number; body: string; json: () => unknow
 }
 const find = (items: UserStateCurrentItem[], entity: UserStateEntity) => items.find(value => userStateEntityKey(value.entity) === userStateEntityKey(entity))!;
 
-test('one stable current workspace joins devices, preserves absence and rejects obsolete history clients', async () => {
+test('one workspace bridges current clients into indexed delta history during upgrade', async () => {
   const f = await fixture();
   try {
     assert.deepEqual(result(await f.get(f.second)), f.initial); assert.notEqual(f.scope.workspaceId, f.scope.epoch);
     const caps = (await f.app.inject('/api/v1/capabilities')).json();
-    assert.equal(caps.userStateVersion, 2); assert.equal(caps.userStateCurrentVersion, 2); assert.equal(caps.readingStateVersion, 1);
+    assert.equal(caps.userStateVersion, 1); assert.equal(caps.userStateCurrentVersion, 2); assert.equal(caps.readingStateVersion, 1);
     assert.equal((await f.get()).headers['cache-control'], 'no-store');
-    for (const suffix of ['', '/read', '/merge']) assert.equal((await f.app.inject({ method: suffix ? 'POST' : 'GET', url: '/api/v1/user-state' + suffix, headers: f.headers, ...(suffix ? { payload: {} } : {}) })).statusCode, 426);
+    const workspaceReply = await f.app.inject({ url: '/api/v1/user-state', headers: f.headers });
+    assert.equal(workspaceReply.statusCode, 200, workspaceReply.body);
+    const workspace = parseUserStateWorkspace(workspaceReply.json());
+    assert.equal(workspace.workspaceId, f.scope.workspaceId); assert.equal(workspace.epoch, f.scope.epoch);
+
     result(await f.post([item(library(), { inLibrary: true, addedAt: 20 })]));
-    const b = result(await f.post([item(bookmark(), { bookmarked: true })], f.second));
-    assert.equal(b.items.length, 2); assert.deepEqual(result(await f.post([], f.second)), b); assert.deepEqual(result(await f.post(b.items)), b);
+    const staleCurrent = result(await f.post([item(bookmark(), { bookmarked: true })], f.second));
+    assert.equal(staleCurrent.items.length, 2); assert.deepEqual(result(await f.post([], f.second)), staleCurrent);
+    const readReply = await f.app.inject({ method: 'POST', url: '/api/v1/user-state/read', headers: f.headers,
+      payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, after: 0, limit: 200 } });
+    assert.equal(readReply.statusCode, 200, readReply.body);
+    const page = parseUserStateReadResponse(readReply.json());
+    assert.equal(page.records.length, 2);
+    const savedBookmark = page.records.find(record => record.entity.kind === 'bookmark')!;
+    const removal: UserStateOperation = { operationId: randomUUID(), entity: savedBookmark.entity,
+      baseRevision: savedBookmark.revision, value: { bookmarked: false } };
+    const mergeReply = await f.app.inject({ method: 'POST', url: '/api/v1/user-state/merge', headers: f.headers,
+      payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, operations: [removal] } });
+    assert.equal(mergeReply.statusCode, 200, mergeReply.body);
+    assert.equal(parseUserStateMergeResponse(mergeReply.json()).results[0].status, 'applied');
+    assert.equal(find(result(await f.get()).items, bookmark()), undefined);
+    // A stale full-snapshot client cannot resurrect a tombstone written by a delta client.
+    assert.equal(find(result(await f.post(staleCurrent.items, f.second)).items, bookmark()), undefined);
+
     const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    try { for (const table of ['user_state_operations', 'user_state_changes', 'user_state_records']) assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n, 0); } finally { db.close(); }
+    try {
+      assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_operations').get()?.n, 1);
+      assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_changes').get()?.n, 3);
+      assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_records').get()?.n, 2);
+    } finally { db.close(); }
   } finally { await f.close(); }
+});
+
+test('delta category renames move compatibility memberships and stale snapshots cannot rename them back', async () => {
+  const f = await fixture();
+  try {
+    const workspaceReply = await f.app.inject({ url: '/api/v1/user-state', headers: f.headers });
+    assert.equal(workspaceReply.statusCode, 200, workspaceReply.body);
+    const workspace = parseUserStateWorkspace(workspaceReply.json());
+    const merge = async (operations: UserStateOperation[]) => {
+      const response = await f.app.inject({ method: 'POST', url: '/api/v1/user-state/merge', headers: f.headers,
+        payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, operations } });
+      assert.equal(response.statusCode, 200, response.body);
+      return parseUserStateMergeResponse(response.json());
+    };
+    const stableCategory = category('stable-category');
+    const created = await merge([{ operationId: randomUUID(), entity: stableCategory, baseRevision: 0,
+      value: { name: 'Old name', sort: 0, deleted: false } }]);
+    assert.equal(created.results[0].status, 'applied');
+    await merge([{ operationId: randomUUID(), entity: membership('stable-category'), baseRevision: 0,
+      value: { included: true } }]);
+    const stale = result(await f.get(f.second));
+    const oldCurrentId = currentCategoryId('Old name');
+    assert(find(stale.items, category(oldCurrentId))); assert(find(stale.items, membership(oldCurrentId)));
+
+    const renamed = await merge([{ operationId: randomUUID(), entity: stableCategory,
+      baseRevision: created.results[0].current!.revision, value: { name: 'New name', sort: 0, deleted: false } }]);
+    assert.equal(renamed.results[0].status, 'applied');
+    const newCurrentId = currentCategoryId('New name');
+    let current = result(await f.get());
+    assert.equal(find(current.items, category(oldCurrentId)), undefined);
+    assert.equal(find(current.items, membership(oldCurrentId)), undefined);
+    assert.deepEqual(find(current.items, category(newCurrentId)).value, { name: 'New name', sort: 0, deleted: false });
+    assert(find(current.items, membership(newCurrentId)));
+
+    current = result(await f.post(stale.items, f.second));
+    assert.equal(find(current.items, category(oldCurrentId)), undefined);
+    assert.equal(find(current.items, membership(oldCurrentId)), undefined);
+    assert.deepEqual(find(current.items, category(newCurrentId)).value, { name: 'New name', sort: 0, deleted: false });
+    assert(find(current.items, membership(newCurrentId)));
+
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    try {
+      const saved = JSON.parse(String(db.prepare("SELECT record FROM user_state_records WHERE kind='category' AND entity_key=?")
+        .get(userStateEntityKey(stableCategory))?.record));
+      assert.deepEqual(saved.value, { name: 'New name', sort: 0, deleted: false });
+      assert.deepEqual({ ...(db.prepare(`SELECT current_category_id AS currentId FROM user_state_delta_current_categories
+        WHERE delta_category_id=?`).get('stable-category') as { currentId: string }) }, { currentId: newCurrentId });
+      assert.deepEqual(db.prepare(`SELECT current_category_id AS currentId,delta_category_id AS deltaId
+        FROM user_state_delta_current_category_aliases WHERE current_category_id IN (?,?) ORDER BY current_category_id`).all(oldCurrentId, newCurrentId)
+        .map(row => ({ ...(row as { currentId: string; deltaId: string }) })), [
+          { currentId: [oldCurrentId, newCurrentId].sort()[0], deltaId: 'stable-category' },
+          { currentId: [oldCurrentId, newCurrentId].sort()[1], deltaId: 'stable-category' },
+        ]);
+    } finally { db.close(); }
+  } finally { await f.close(); }
+});
+
+test('startup imports deployed current rows into delta tables exactly once', async () => {
+  const f = await fixture();
+  let restarted: Awaited<ReturnType<typeof buildApp>> | undefined;
+  const migrated = item(library('migrated-current'), { inLibrary: true, addedAt: 7 });
+  const readDelta = async (app: Awaited<ReturnType<typeof buildApp>>) => {
+    const workspaceReply = await app.inject({ url: '/api/v1/user-state', headers: f.headers });
+    assert.equal(workspaceReply.statusCode, 200, workspaceReply.body);
+    const workspace = parseUserStateWorkspace(workspaceReply.json());
+    const pageReply = await app.inject({ method: 'POST', url: '/api/v1/user-state/read', headers: f.headers,
+      payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, after: 0, limit: 200 } });
+    assert.equal(pageReply.statusCode, 200, pageReply.body);
+    return parseUserStateReadResponse(pageReply.json());
+  };
+  try {
+    await f.app.close();
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    try {
+      db.exec('DELETE FROM user_state_delta_bridge_meta; DELETE FROM user_state_changes; DELETE FROM user_state_records; DELETE FROM user_state_operations');
+      db.prepare('INSERT INTO user_state_current_records(entity_key,kind,item) VALUES(?,?,?)')
+        .run(userStateEntityKey(migrated.entity), migrated.entity.kind, JSON.stringify(migrated));
+    } finally { db.close(); }
+
+    restarted = await buildApp({ dataDir: f.dataDir });
+    let page = await readDelta(restarted);
+    assert.equal(page.records.length, 1); assert.deepEqual(page.records[0].value, migrated.value);
+    await restarted.close(); restarted = undefined;
+
+    const changed = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    try {
+      assert.equal(changed.prepare('SELECT count(*) AS n FROM user_state_delta_bridge_meta').get()?.n, 1);
+      changed.prepare('UPDATE user_state_current_records SET item=? WHERE entity_key=?')
+        .run(JSON.stringify({ ...migrated, value: { inLibrary: true, addedAt: 99 } }), userStateEntityKey(migrated.entity));
+    } finally { changed.close(); }
+    restarted = await buildApp({ dataDir: f.dataDir });
+    page = await readDelta(restarted);
+    assert.equal(page.records.length, 1); assert.deepEqual(page.records[0].value, migrated.value);
+  } finally { await restarted?.close(); await f.close(); }
 });
 
 test('anonymous, console, blocked and wrong-workspace access cannot read or write current state', async () => {
@@ -151,12 +272,12 @@ test('composition retains excluded provenance and selects the newest current man
   } finally { await f.close(); }
 });
 
-test('a single bulk transaction accepts 5505 rows without growing legacy operation history', async () => {
+test('a current-client bulk exchange bridges 5505 rows into indexed delta records without operation receipts', async () => {
   const f = await fixture();
   try {
     const items = Array.from({ length: 5505 }, (_, i) => item(reading('book-' + i), { progress: i % 101, unread: false, readAt: i + 1 }));
     const saved = result(await f.post(items)); assert.equal(saved.items.length, 5505); assert.deepEqual(result(await f.post(items, f.second)), saved);
-    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite')); try { assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_current_records').get()?.n, 5505); assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_operations').get()?.n, 0); } finally { db.close(); }
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite')); try { assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_current_records').get()?.n, 5505); assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_records').get()?.n, 5505); assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_changes').get()?.n, 5505); assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_operations').get()?.n, 0); } finally { db.close(); }
     assert.equal((await f.post([{ entity: library(), value: { inLibrary: true, addedAt: 1 }, operationId: randomUUID() }])).statusCode, 400);
   } finally { await f.close(); }
 });
