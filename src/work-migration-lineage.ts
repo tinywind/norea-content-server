@@ -27,6 +27,8 @@ export type MigrationLineageMapping = {
 export interface WorkMigrationLineage {
   sequence: number;
   operationId: string;
+  /** Exact completed legacy receipt repaired by this new, independently verified operation. */
+  legacyOperationId?: string;
   sourceWork: MigrationSnapshot['work'];
   targetWork: MigrationSnapshot['work'];
   deletedSource: { revision: string; sequence: number };
@@ -47,11 +49,39 @@ export function recordWorkMigrationLineage(db: DatabaseSync, entry: StoredWorkMi
 }
 
 /** Explicit restoration revokes migration exclusions without reversing migrated user data. */
-export function deactivateWorkMigrationsForSource(db: DatabaseSync, sourceId: string): void {
+export function deactivateWorkMigrationsForSource(db: DatabaseSync, sourceId: string, confirmedOperationId?: string): void {
   if (!db.isTransaction) throw new Error('Migration revocation must commit with source restoration');
   const rows = db.prepare('SELECT l.operation_id FROM work_migration_lineage l JOIN work_migration_events e ON e.operation_id=l.operation_id WHERE l.source_work_id=? AND e.active=1 AND e.sequence=(SELECT max(sequence) FROM work_migration_events WHERE operation_id=l.operation_id)')
     .all(sourceId) as { operation_id: string }[];
   for (const row of rows) db.prepare('INSERT INTO work_migration_events(operation_id,active) VALUES(?,0)').run(row.operation_id);
+  if (confirmedOperationId) {
+    const record = db.prepare('INSERT OR IGNORE INTO work_migration_restorations(operation_id,source_work_id) VALUES(?,?)');
+    record.run(confirmedOperationId, sourceId);
+    const lineage = db.prepare('SELECT entry FROM work_migration_lineage WHERE operation_id=? AND source_work_id=?')
+      .get(confirmedOperationId, sourceId) as { entry: string } | undefined;
+    const legacyId = lineage ? (JSON.parse(lineage.entry) as StoredWorkMigrationLineage).legacyOperationId : undefined;
+    if (legacyId) record.run(legacyId, sourceId);
+  }
+}
+
+/** A metadata upload cannot implicitly undo an already verified source retirement. */
+export function assertExplicitMigrationRestore(db: DatabaseSync, sourceId: string, supplied?: string): void {
+  const active = db.prepare('SELECT l.operation_id FROM work_migration_lineage l JOIN work_migration_events e ON e.operation_id=l.operation_id WHERE l.source_work_id=? AND e.active=1 AND e.sequence=(SELECT max(sequence) FROM work_migration_events WHERE operation_id=l.operation_id) ORDER BY e.sequence DESC LIMIT 1')
+    .get(sourceId) as { operation_id: string } | undefined;
+  // Older servers saved the exact retirement receipt but had no lineage table.
+  const legacy = db.prepare("SELECT m.operation_id FROM work_migrations m JOIN work_tombstones t ON t.work_id=m.source_work_id WHERE m.source_work_id=? AND t.deleted=1 AND json_extract(m.result,'$.deletedWork.sequence')=t.sequence AND json_extract(m.result,'$.deletedWork.deleted')=1 LIMIT 1")
+    .get(sourceId) as { operation_id: string } | undefined;
+  const expected = active?.operation_id ?? legacy?.operation_id;
+  if (expected && supplied !== expected) throw problem(409, 'Migrated source restoration requires its exact restoreMigrationOperationId and an explicit user restore action');
+  if (supplied && !expected) throw problem(409, 'Migration restoration confirmation is stale or does not name the current retired source');
+}
+
+export function assertMigrationNotRevoked(db: DatabaseSync, sourceId: string, legacyOperationId: string): void {
+  if (db.prepare('SELECT 1 FROM work_migration_restorations WHERE operation_id=? AND source_work_id=?').get(legacyOperationId, sourceId)
+    || db.prepare("SELECT 1 FROM work_migration_lineage l JOIN work_migration_events e ON e.operation_id=l.operation_id WHERE l.source_work_id=? AND (l.operation_id=? OR json_extract(l.entry,'$.legacyOperationId')=?) AND e.active=0 LIMIT 1")
+      .get(sourceId, legacyOperationId, legacyOperationId)) {
+    throw problem(409, 'This migration was explicitly restored; automatic reconciliation is revoked');
+  }
 }
 
 /**

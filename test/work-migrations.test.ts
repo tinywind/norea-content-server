@@ -107,7 +107,7 @@ test('finalizes body-only folder aliases, persists the receipt, and rejects reus
       const retry = await restarted.inject({ method: 'POST', url: '/api/v1/works/' + sourceId + '/finalize-migration', headers: f.headers, payload });
       assert.equal(retry.statusCode, 200); assert.deepEqual(retry.json(), result.json());
       assert.equal((await restarted.inject('/api/v1/chapters/' + target.id + '/storage-inventory?revision=' + target.revision)).statusCode, 200);
-      const restored = await restarted.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') });
+      const restored = await restarted.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true&restoreMigrationOperationId=' + payload.operationId, headers: f.headers, payload: metadata('source') });
       assert.equal(restored.statusCode, 200, restored.body);
       assert.equal((await restarted.inject({ method: 'POST', url: '/api/v1/works/' + sourceId + '/finalize-migration', headers: f.headers, payload })).statusCode, 409);
     } finally { await restarted.close(); }
@@ -515,12 +515,12 @@ test('explicit source restoration appends revocation and coalesces historical ac
     assert.equal(ordinary.statusCode, 410);
     assert.equal((await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json().active, true);
     f.db.exec("CREATE TRIGGER fail_revocation BEFORE INSERT ON work_migration_events WHEN NEW.active=0 BEGIN SELECT RAISE(ABORT,'synthetic revocation failure'); END");
-    const failedRestore = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') });
+    const failedRestore = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true&restoreMigrationOperationId=' + payload.operationId, headers: f.headers, payload: metadata('source') });
     assert.equal(failedRestore.statusCode, 500);
     assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 404);
     assert.equal((await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json().active, true);
     f.db.exec('DROP TRIGGER fail_revocation');
-    const restored = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') });
+    const restored = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true&restoreMigrationOperationId=' + payload.operationId, headers: f.headers, payload: metadata('source') });
     assert.equal(restored.statusCode, 200, restored.body);
     const revoked = (await f.app.inject('/api/v1/work-migrations?after=' + before.cursor)).json();
     assert.equal(revoked.items.length, 1); assert.ok(revoked.cursor > before.cursor);
@@ -651,5 +651,151 @@ for (const hasTargetBody of [false, true]) test('target-primary discards A body 
     assert.equal(target.chapters.length, hasTargetBody ? 1 : 0);
     if (hasTargetBody) assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'B chosen body');
     assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 404);
+  } finally { await f.close(); }
+});
+
+async function legacyCompletedFixture(keepTarget = false, resurrected = true) {
+  const f = await fixture();
+  saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'Source episode' } });
+  saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: { '1001': 'Target episode' } });
+  await f.upload('source'); const target = await f.upload('target', 1, keepTarget ? 'chosen target body' : 'synthetic body');
+  const legacy = f.request();
+  if (keepTarget) { legacy.mappings[0].decision = 'keep-target'; legacy.mappings[0].expectedTargetInventory = await f.inventory(target); }
+  assert.equal((await f.submit(legacy)).statusCode, 200);
+  // Reproduce the old server: only its immutable successful receipt existed.
+  f.db.exec('DELETE FROM work_migration_events; DELETE FROM work_migration_lineage');
+  if (resurrected) {
+    f.db.prepare('UPDATE work_tombstones SET deleted=0 WHERE work_id=?').run(sourceId);
+    for (const row of legacy.source.chapters) f.db.prepare('DELETE FROM chapter_tombstones WHERE chapter_id=?').run(row.id);
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'Source episode' } }); await f.upload('source');
+  }
+  const reconcile = (current: FinalizeMigrationRequest, exact = legacy, headers = f.headers, reviewedCurrentState?: true) => f.app.inject({ method: 'POST', url: '/api/v1/works/' + sourceId + '/migration-reconcile', headers,
+    payload: { legacyOperationId: legacy.operationId, legacyRequest: exact, current, ...(reviewedCurrentState ? { reviewedCurrentState } : {}) } });
+  const current = () => { const request = f.request(); if (keepTarget) { request.mappings[0].decision = 'keep-target'; request.mappings[0].expectedTargetInventory = legacy.mappings[0].expectedTargetInventory; } request.chapterDecisions = allDecisions(f, request); return request; };
+  return { ...f, legacy, reconcile, current };
+}
+
+test('reconciliation verifies a legacy receipt and fresh bodies, records exact binding and replays its own receipt', async () => {
+  const f = await legacyCompletedFixture();
+  try {
+    const beforeLegacy = f.db.prepare('SELECT * FROM work_migrations WHERE operation_id=?').get(f.legacy.operationId);
+    const current = f.current(); const response = await f.reconcile(current);
+    assert.equal(response.statusCode, 200, response.body); assert.equal(response.json().operationId, current.operationId);
+    assert.deepEqual((await f.reconcile(current)).json(), response.json());
+    assert.deepEqual(f.db.prepare('SELECT * FROM work_migrations WHERE operation_id=?').get(f.legacy.operationId), beforeLegacy);
+    const lineage = (await f.app.inject('/api/v1/work-migrations/' + current.operationId)).json();
+    assert.equal(lineage.legacyOperationId, f.legacy.operationId); assert.equal(lineage.fullDecisionCoverage, true);
+    assert.equal(lineage.mappings[0].target.chapterNumber, '1001'); assert.equal(lineage.chapterDecisions[0].targetChapterNumber, '1001');
+    assert.equal((await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') })).statusCode, 409);
+    const restored = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true&restoreMigrationOperationId=' + current.operationId, headers: f.headers, payload: metadata('source') });
+    assert.equal(restored.statusCode, 200, restored.body);
+    const revoked = (await f.app.inject('/api/v1/work-migrations/' + current.operationId)).json(); assert.equal(revoked.active, false); assert.equal(revoked.legacyOperationId, f.legacy.operationId);
+    assert.equal((await f.reconcile(current)).statusCode, 409); assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'synthetic body');
+  } finally { await f.close(); }
+});
+
+for (const invalid of ['changed-proof', 'missing-full-decisions', 'new-source', 'changed-source-body', 'stale-target-number', 'different-decision'] as const) test('legacy reconciliation keeps source on ' + invalid, async () => {
+  const f = await legacyCompletedFixture();
+  try {
+    if (invalid === 'new-source') { await f.upload('source', 2); await f.upload('target', 2); }
+    if (invalid === 'changed-source-body') await f.upload('source', 1, 'new body must remain');
+    const current = f.current(), exact = structuredClone(f.legacy);
+    if (invalid === 'changed-proof') exact.source.revision = '0'.repeat(64);
+    if (invalid === 'missing-full-decisions') delete current.chapterDecisions;
+    if (invalid === 'stale-target-number') current.chapterDecisions![0].targetChapterNumber = '346378';
+    if (invalid === 'different-decision') current.mappings[0] = { sourceChapterId: current.mappings[0].sourceChapterId, decision: 'delete-source' };
+    const before = await f.sourceBody(); const response = await f.reconcile(current, exact);
+    assert.equal(response.statusCode, 409, response.body); assert.equal(await f.sourceBody(), before);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM work_migration_lineage').get()?.n, 0);
+  } finally { await f.close(); }
+});
+
+test('a legacy keep-target decision preserves the selected copy but cannot discard a newly changed source', async () => {
+  const f = await legacyCompletedFixture(true);
+  try {
+    await f.upload('source', 1, 'a newer source body');
+    const response = await f.reconcile(f.current()); assert.equal(response.statusCode, 409, response.body);
+    assert.equal(await f.sourceBody(), 'a newer source body');
+  } finally { await f.close(); }
+  const unchanged = await legacyCompletedFixture(true);
+  try { const response = await unchanged.reconcile(unchanged.current()); assert.equal(response.statusCode, 200, response.body); assert.equal(await readFile(join(unchanged.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'chosen target body'); }
+  finally { await unchanged.close(); }
+});
+
+test('legacy receipt-only retirement blocks automatic restore and remembers deliberate restoration without inventing lineage', async () => {
+  const f = await legacyCompletedFixture(false, false);
+  try {
+    assert.equal((await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true', headers: f.headers, payload: metadata('source') })).statusCode, 409);
+    const restored = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true&restoreMigrationOperationId=' + f.legacy.operationId, headers: f.headers, payload: metadata('source') });
+    assert.equal(restored.statusCode, 200, restored.body);
+    for (const chapter of f.legacy.source.chapters) f.db.prepare('DELETE FROM chapter_tombstones WHERE chapter_id=?').run(chapter.id);
+    await f.upload('source');
+    assert.equal((await f.reconcile(f.current())).statusCode, 409);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM work_migration_restorations').get()?.n, 1);
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM work_migration_lineage').get()?.n, 0);
+  } finally { await f.close(); }
+});
+
+test('active lineage projects old positive work and exact chapter state into its target without transplanting A composition', async () => {
+  const f = await fixture();
+  try {
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'Source', '2': 'Excluded metadata-only chapter' } });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: { '1001': 'Target' } });
+    await f.upload('source'); await f.upload('target');
+    const scope = (await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers })).json();
+    const work = (side: string) => ({ pluginId: side, sourceNovelId: 'book', novelPath: '/book', name: 'Shared fixture' });
+    const sourceWork = work('source'), targetWork = work('target');
+    const oldComposition = { version: 1, updatedAt: 100, entries: [{ id: 'old-source-entry', path: '/source/1', storageChapterNumber: '1', primarySource: 0,
+      sources: [{ ...metadata('source').identity, chapterPath: '/source/1', sourceChapterId: 'source-stable', chapterNumber: '1', name: 'A title', position: 1, page: '1', contentType: 'text', releaseTime: null }],
+      user: { included: true, order: 1, name: 'Old A user title', chapterNumber: '1' } }] };
+    const oldItems = [
+      { entity: { kind: 'library', work: sourceWork }, value: { inLibrary: true, addedAt: 1 } },
+      { entity: { kind: 'reading', work: sourceWork, chapter: { chapterPath: '/source/1' } }, value: { progress: 90, unread: false, readAt: 10 } },
+      { entity: { kind: 'bookmark', work: sourceWork, chapter: { chapterPath: '/source/1' } }, value: { bookmarked: true } },
+      { entity: { kind: 'reading', work: sourceWork, chapter: { chapterPath: '/source/2' } }, value: { progress: 20, unread: false, readAt: 2 } },
+      { entity: { kind: 'resume', work: sourceWork }, value: { chapter: { chapterPath: '/source/1' }, anchor: null, openedAt: 10 } },
+      { entity: { kind: 'composition', work: sourceWork }, value: { composition: oldComposition } },
+    ];
+    const publish = (items: unknown[]) => f.app.inject({ method: 'POST', url: '/api/v1/user-state/current', headers: f.headers, payload: { ...scope, items } });
+    assert.equal((await publish([...oldItems, { entity: { kind: 'reading', work: targetWork, chapter: { chapterPath: '/target/1' } }, value: { progress: 60, unread: false, readAt: 20 } }])).statusCode, 200);
+    const migration = f.request(); migration.chapterDecisions = [...allDecisions(f, migration), { sourceChapterPath: '/source/2', sourceChapterNumber: '2', targetChapterPath: null, targetChapterNumber: null }];
+    assert.equal((await f.submit(migration)).statusCode, 200);
+    const view = (await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers })).json();
+    assert.equal(view.items.length, 4); assert(view.items.every((row: any) => row.entity.work.pluginId === 'target'));
+    assert.deepEqual(view.items.find((row: any) => row.entity.kind === 'reading').value, { progress: 60, unread: false, readAt: 20 });
+    assert.equal(view.items.find((row: any) => row.entity.kind === 'resume').value.chapter.chapterPath, '/target/1');
+    const replay = await publish(oldItems); assert.equal(replay.statusCode, 200, replay.body);
+    assert(replay.json().items.every((row: any) => row.entity.work.pluginId === 'target')); assert.equal(replay.json().items.some((row: any) => row.entity.kind === 'composition'), false);
+    assert.equal(f.db.prepare("SELECT count(*) AS n FROM user_state_current_records WHERE kind='library' AND json_extract(item,'$.entity.work.pluginId')='source'").get()?.n, 0);
+    // Omitted old composition and unresolvable/excluded values are retained privately, never deleted or assigned to B.
+    assert.equal(f.db.prepare("SELECT count(*) AS n FROM user_state_current_records WHERE kind='composition' AND json_extract(item,'$.entity.work.pluginId')='source'").get()?.n, 1);
+  } finally { await f.close(); }
+});
+
+test('an explicit newly reviewed decision can consolidate reindexed source IDs while automatic repair stays blocked', async () => {
+  const f = await legacyCompletedFixture();
+  try {
+    f.db.prepare('DELETE FROM chapters WHERE id=?').run(f.legacy.source.chapters[0].id);
+    await rm(join(f.dataDir, 'contents/source/book/1'), { recursive: true });
+    await f.upload('source', 1, 'synthetic body', undefined, 'norea-folder:1');
+    const current = f.current(); assert.notEqual(current.mappings[0].sourceChapterId, f.legacy.mappings[0].sourceChapterId);
+    assert.equal((await f.reconcile(current)).statusCode, 409);
+    const response = await f.reconcile(current, f.legacy, f.headers, true); assert.equal(response.statusCode, 200, response.body);
+    const lineage = (await f.app.inject('/api/v1/work-migrations/' + current.operationId)).json();
+    assert.equal(lineage.legacyOperationId, f.legacy.operationId); assert.equal(lineage.mappings[0].source.chapterPath, 'norea-folder:1');
+    assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'synthetic body');
+  } finally { await f.close(); }
+});
+
+test('reviewed current decisions require the fresh target inventory and still respect durable restoration revocation', async () => {
+  const f = await legacyCompletedFixture(true);
+  try {
+    await f.upload('source', 1, 'a newer explicitly reviewed source');
+    const current = f.current(), corrupt = structuredClone(current); corrupt.mappings[0].expectedTargetInventory!.body!.sha256 = '0'.repeat(64);
+    assert.equal((await f.reconcile(corrupt, f.legacy, f.headers, true)).statusCode, 409); assert.equal(await f.sourceBody(), 'a newer explicitly reviewed source');
+    assert.equal((await f.reconcile(current)).statusCode, 409);
+    const response = await f.reconcile(current, f.legacy, f.headers, true); assert.equal(response.statusCode, 200, response.body);
+    const restored = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + sourceId + '?restore=true&restoreMigrationOperationId=' + current.operationId, headers: f.headers, payload: metadata('source') }); assert.equal(restored.statusCode, 200);
+    assert.equal((await f.reconcile(current, f.legacy, f.headers, true)).statusCode, 409);
   } finally { await f.close(); }
 });

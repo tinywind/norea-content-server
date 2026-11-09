@@ -7,401 +7,186 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.ts';
-import { openDatabase } from '../src/db.ts';
+import { currentCategoryId } from '../src/user-state-current-store.ts';
+import { parseUserStateCurrentSnapshot, USER_STATE_CURRENT_MAX_BYTES, type UserStateCurrentItem } from '../src/user-state-current-protocol.ts';
+import { userStateEntityKey, type UserStateEntity, type UserStateValue } from '../src/user-state-protocol.ts';
 import type { ChapterCompositionV1 } from '../src/chapter-composition.ts';
-import { USER_STATE_MAX_BYTES } from '../src/user-state.ts';
-import {
-  parseUserStateWorkspace, parseUserStateReadResponse, parseUserStateMergeResponse,
-  userStateEntityKey, userStateWorkKey, canonicalUserStateJson,
-  type UserStateEntity, type UserStateOperation, type UserStateValue, type UserStateWorkspace,
-} from '../src/user-state-protocol.ts';
 import { consoleHeaders, deviceHeaders } from './access.ts';
 
 const work = (sourceNovelId = 'novel-1') => ({ pluginId: 'example-source', sourceNovelId, novelPath: `/novel/${sourceNovelId}`, name: 'A work' });
-const chapter = (path = '/chapter/1') => ({ chapterPath: path });
 const library = (id = 'novel-1'): UserStateEntity => ({ kind: 'library', work: work(id) });
-const reading = (id = 'novel-1'): UserStateEntity => ({ kind: 'reading', work: work(id), chapter: chapter() });
-const bookmark = (id = 'novel-1'): UserStateEntity => ({ kind: 'bookmark', work: work(id), chapter: chapter() });
+const reading = (id = 'novel-1'): UserStateEntity => ({ kind: 'reading', work: work(id), chapter: { chapterPath: '/chapter/1' } });
+const bookmark = (): UserStateEntity => ({ kind: 'bookmark', work: work(), chapter: { chapterPath: '/chapter/1' } });
 const category = (id: string): UserStateEntity => ({ kind: 'category', categoryId: id });
 const membership = (id: string): UserStateEntity => ({ kind: 'membership', work: work(), categoryId: id });
-const operation = (entity: UserStateEntity, value: UserStateValue, baseRevision = 0, seed = false): UserStateOperation => ({
-  operationId: randomUUID(), entity, value, baseRevision, ...(seed ? { seed: true } : {}),
-});
+const item = (entity: UserStateEntity, value: UserStateValue): UserStateCurrentItem => ({ entity, value });
 function composition(count = 2, padding = ''): ChapterCompositionV1 {
-  return { version: 1, updatedAt: 1700000000000, entries: Array.from({ length: count }, (_, index) => ({
+  return { version: 1, updatedAt: 100, entries: Array.from({ length: count }, (_, index) => ({
     id: `entry-${index}`, path: `norea-composed:entry-${index}`, storageChapterNumber: String(index + 1), primarySource: 0,
-    sources: [{ pluginId: 'example-source', novelId: 'source-1', novelPath: '/source/1', chapterPath: `/source/1/${index}`, sourceChapterId: `source-${index}`,
+    sources: [{ pluginId: 'example-source', novelId: 'novel-1', novelPath: '/novel/novel-1', chapterPath: `/source/${index}`, sourceChapterId: `source-${index}`,
       chapterNumber: String(index + 1), name: padding || `Source ${index}`, position: index, page: '1', contentType: 'text', releaseTime: padding || null }],
     user: { included: index !== 1, order: index === 0 ? 1 : index === 1 ? 0 : index, name: padding || null, chapterNumber: null },
   })) };
 }
 async function fixture() {
-  const dataDir = await mkdtemp(join(tmpdir(), 'norea-user-state-'));
-  const app = await buildApp({ dataDir, anonymousRead: true });
-  const headers = await deviceHeaders(app, 'Same display name');
-  const second = await deviceHeaders(app, 'Same display name');
-  const workspaceReply = await app.inject({ url: '/api/v1/user-state', headers });
-  assert.equal(workspaceReply.statusCode, 200, workspaceReply.body);
-  const workspace = parseUserStateWorkspace(workspaceReply.json());
-  const scope = { workspaceId: workspace.workspaceId, epoch: workspace.epoch };
-  const merge = (operations: unknown[], author = headers, binding = scope) => app.inject({ method: 'POST', url: '/api/v1/user-state/merge', headers: author, payload: { ...binding, operations } });
-  const read = (after = 0, through?: number, limit = 200, author = headers) => app.inject({ method: 'POST', url: '/api/v1/user-state/read', headers: author, payload: { ...scope, after, ...(through === undefined ? {} : { through }), limit } });
-  return { app, dataDir, headers, second, workspace, scope, merge, read, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
+  const dataDir = await mkdtemp(join(tmpdir(), 'norea-current-state-'));
+  const app = await buildApp({ dataDir });
+  const headers = await deviceHeaders(app, 'Same name'), second = await deviceHeaders(app, 'Same name');
+  const initial = parseUserStateCurrentSnapshot((await app.inject({ url: '/api/v1/user-state/current', headers })).json());
+  const scope = { version: 2 as const, workspaceId: initial.workspaceId, epoch: initial.epoch };
+  const post = (items: unknown[], author = headers, binding = scope) => app.inject({ method: 'POST', url: '/api/v1/user-state/current', headers: author, payload: { ...binding, items } });
+  const get = (author = headers) => app.inject({ url: '/api/v1/user-state/current', headers: author });
+  return { app, dataDir, headers, second, initial, scope, post, get, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
-function result(response: { statusCode: number; body: string; json: () => unknown }, index = 0) {
-  assert.equal(response.statusCode, 200, response.body.slice(0,1000));
-  return parseUserStateMergeResponse(response.json()).results[index];
+function result(response: { statusCode: number; body: string; json: () => unknown }) {
+  assert.equal(response.statusCode, 200, response.body.slice(0, 1200)); return parseUserStateCurrentSnapshot(response.json());
 }
-function page(response: { statusCode: number; body: string; json: () => unknown }) {
-  assert.equal(response.statusCode, 200, response.body.slice(0,1000));
-  return parseUserStateReadResponse(response.json());
-}
+const find = (items: UserStateCurrentItem[], entity: UserStateEntity) => items.find(value => userStateEntityKey(value.entity) === userStateEntityKey(entity))!;
 
-test('user state has one stable namespace shared by admitted devices, not their display names', async () => {
+test('one stable current workspace joins devices, preserves absence and rejects obsolete history clients', async () => {
   const f = await fixture();
   try {
-    const other = parseUserStateWorkspace((await f.app.inject({ url: '/api/v1/user-state', headers: f.second })).json());
-    assert.deepEqual(other, f.workspace);
-    assert.notEqual(f.workspace.workspaceId, f.workspace.epoch);
-    const capabilities = (await f.app.inject('/api/v1/capabilities')).json();
-    assert.equal(capabilities.userStateVersion, 1);
-    assert.equal(capabilities.readingStateVersion, 1);
-    assert.equal(capabilities.deviceBackupVersion, 1);
-    const a = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 123 })]));
-    const b = result(await f.merge([operation(bookmark(), { bookmarked: true })], f.second));
-    assert.notEqual(a.current!.deviceId, b.current!.deviceId);
-    assert.equal(a.current!.deviceName, b.current!.deviceName);
-    assert.equal((await f.read()).headers['cache-control'], 'no-store');
-    assert.equal(page(await f.read(0, undefined, 200, f.second)).records.length, 2);
-  } finally { await f.close(); }
-});
-
-test('namespace discovery, reads and merges reject anonymous, console, blocked and wrong-workspace access', async () => {
-  const f = await fixture();
-  try {
-    const admin = await consoleHeaders(f.app, f.dataDir);
-    for (const [method, url, payload] of [
-      ['GET', '/api/v1/user-state', undefined],
-      ['POST', '/api/v1/user-state/read', { ...f.scope, after: 0 }],
-      ['POST', '/api/v1/user-state/merge', { ...f.scope, operations: [] }],
-    ] as const) {
-      assert.equal((await f.app.inject({ method, url, payload })).statusCode, 401);
-      assert.equal((await f.app.inject({ method, url, payload, headers: admin })).statusCode, 403);
-    }
-    assert.equal((await f.merge([], f.headers, { ...f.scope, workspaceId: randomUUID() })).statusCode, 409);
-    assert.equal((await f.merge([], f.headers, { ...f.scope, epoch: randomUUID() })).statusCode, 409);
+    assert.deepEqual(result(await f.get(f.second)), f.initial); assert.notEqual(f.scope.workspaceId, f.scope.epoch);
+    const caps = (await f.app.inject('/api/v1/capabilities')).json();
+    assert.equal(caps.userStateVersion, 2); assert.equal(caps.userStateCurrentVersion, 2); assert.equal(caps.readingStateVersion, 1);
+    assert.equal((await f.get()).headers['cache-control'], 'no-store');
+    for (const suffix of ['', '/read', '/merge']) assert.equal((await f.app.inject({ method: suffix ? 'POST' : 'GET', url: '/api/v1/user-state' + suffix, headers: f.headers, ...(suffix ? { payload: {} } : {}) })).statusCode, 426);
+    result(await f.post([item(library(), { inLibrary: true, addedAt: 20 })]));
+    const b = result(await f.post([item(bookmark(), { bookmarked: true })], f.second));
+    assert.equal(b.items.length, 2); assert.deepEqual(result(await f.post([], f.second)), b); assert.deepEqual(result(await f.post(b.items)), b);
     const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    try { db.prepare('UPDATE devices SET blocked=1').run(); } finally { db.close(); }
-    assert.equal((await f.app.inject({ url: '/api/v1/user-state', headers: f.headers })).statusCode, 403);
-    assert.equal((await f.read()).statusCode, 403);
-    assert.equal((await f.merge([])).statusCode, 403);
+    try { for (const table of ['user_state_operations', 'user_state_changes', 'user_state_records']) assert.equal(db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.n, 0); } finally { db.close(); }
   } finally { await f.close(); }
 });
 
-test('portable identity ignores names/local row IDs, folds only ASCII source IDs, and scopes chapter paths to works', async () => {
-  const known = work('WORK-A');
-  const renamed = { ...known, sourceNovelId: 'work-a', novelPath: '/different', name: '' };
-  assert.equal(userStateWorkKey(known), '["example-source","id","work-a"]');
-  assert.equal(userStateEntityKey({ kind: 'library', work: known }), JSON.stringify(['library', userStateWorkKey(renamed)]));
-  assert.equal(canonicalUserStateJson({ z: 1, a: [false, null] }), '{"a":[false,null],"z":1}');
-  assert.notEqual(userStateWorkKey(work('İ')), userStateWorkKey(work('i')));
+test('anonymous, console, blocked and wrong-workspace access cannot read or write current state', async () => {
   const f = await fixture();
   try {
-    const first = result(await f.merge([operation({ kind: 'library', work: known }, { inLibrary: true, addedAt: null })]));
-    assert.equal(result(await f.merge([operation({ kind: 'library', work: renamed }, { inLibrary: true, addedAt: null })])).status, 'unchanged');
-    assert.equal(result(await f.merge([operation(reading('other-work'), { progress: 70, unread: false, readAt: 50 })])).status, 'applied');
-    assert.equal(first.current!.revision, 1);
-    for (const bad of [
-      { ...operation(library(), { inLibrary: false, addedAt: null }), entity: { kind: 'library', work: { ...work(), sourceNovelId: null } } },
-      { ...operation(reading(), { progress: 0, unread: true, readAt: null }), entity: { kind: 'reading', work: work(), chapter: { chapterPath: 'norea-folder:1' } } },
-      { ...operation(library(), { inLibrary: true, addedAt: null }), localDatabaseId: 1 },
-      { ...operation(library(), { inLibrary: true, addedAt: null }), entity: { kind: 'library', work: { ...work(), localId: 1 } } },
-    ]) assert.equal((await f.merge([bad])).statusCode, 400);
+    assert.equal((await f.app.inject('/api/v1/user-state/current')).statusCode, 401);
+    assert.equal((await f.get(await consoleHeaders(f.app, f.dataDir))).statusCode, 403);
+    assert.equal((await f.post([], f.headers, { ...f.scope, epoch: randomUUID() })).statusCode, 409);
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite')); try { db.prepare('UPDATE devices SET blocked=1').run(); } finally { db.close(); }
+    assert.equal((await f.get()).statusCode, 403); assert.equal((await f.post([])).statusCode, 403);
   } finally { await f.close(); }
 });
 
-test('blocking a device while a user-state request body arrives prevents both reads and writes', async () => {
-  for (const route of ['read', 'merge']) {
-    const f = await fixture();
-    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    let request: ReturnType<typeof httpRequest> | undefined;
-    try {
-      const address = await f.app.listen({ host: '127.0.0.1', port: 0 });
-      const body = Buffer.from(JSON.stringify(route === 'read' ? { ...f.scope, after: 0 } : { ...f.scope, operations: [operation(library(), { inLibrary: true, addedAt: 1 })] }));
-      db.prepare('UPDATE devices SET last_seen_at=0').run();
-      let finish!: (value: number | Error) => void;
-      const finished = new Promise<number | Error>(resolve => { finish = resolve; });
-      request = httpRequest(`${address}/api/v1/user-state/${route}`, { method: 'POST', headers: { ...f.headers, 'content-type': 'application/json', 'content-length': body.length } }, response => { response.resume(); finish(response.statusCode!); });
-      request.on('error', finish);
-      request.write(body.subarray(0, 12));
-      for (let attempt = 0; attempt < 100; attempt++) {
-        if (Number(db.prepare('SELECT max(last_seen_at) AS seen FROM devices').get()?.seen) > 0) break;
-        await delay(5);
-      }
-      assert(Number(db.prepare('SELECT max(last_seen_at) AS seen FROM devices').get()?.seen) > 0);
-      db.prepare('UPDATE devices SET blocked=1').run();
-      request.end(body.subarray(12));
-      assert.equal(await finished, 403);
-      assert.equal(db.prepare('SELECT COUNT(*) AS count FROM user_state_records').get()?.count, 0);
-    } finally { request?.destroy(); db.close(); await f.close(); }
-  }
+test('blocking a device while its bulk body arrives prevents the final transaction', async () => {
+  const f = await fixture(), db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+  let request: ReturnType<typeof httpRequest> | undefined;
+  try {
+    const address = await f.app.listen({ host: '127.0.0.1', port: 0 });
+    const body = Buffer.from(JSON.stringify({ ...f.scope, items: [item(library(), { inLibrary: true, addedAt: 1 })] }));
+    db.prepare('UPDATE devices SET last_seen_at=0').run();
+    let finish!: (value: number | Error) => void; const finished = new Promise<number | Error>(resolve => { finish = resolve; });
+    request = httpRequest(`${address}/api/v1/user-state/current`, { method: 'POST', headers: { ...f.headers, 'content-type': 'application/json', 'content-length': body.length } }, response => { response.resume(); finish(response.statusCode!); });
+    request.on('error', finish); request.write(body.subarray(0, 12));
+    for (let attempt = 0; attempt < 100; attempt++) { if (Number(db.prepare('SELECT max(last_seen_at) AS seen FROM devices').get()?.seen) > 0) break; await delay(5); }
+    assert(Number(db.prepare('SELECT max(last_seen_at) AS seen FROM devices').get()?.seen) > 0);
+    db.prepare('UPDATE devices SET blocked=1').run(); request.end(body.subarray(12));
+    assert.equal(await finished, 403); assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_current_records').get()?.n, 0);
+  } finally { request?.destroy(); db.close(); await f.close(); }
 });
 
-test('independent state groups merge while explicit removal, unread, rewind and unbookmark replace prior values', async () => {
+test('older snapshots cannot regress reading or initial library time, newer reading tuples remain atomic', async () => {
   const f = await fixture();
   try {
-    const a = parseUserStateMergeResponse((await f.merge([
-      operation(library(), { inLibrary: true, addedAt: 1 }),
-      operation(reading(), { progress: 100, unread: false, readAt: 100 }),
-      operation(bookmark(), { bookmarked: true }),
-    ])).json()).results;
-    const b = parseUserStateMergeResponse((await f.merge([
-      operation(bookmark(), { bookmarked: false }, a[2].current!.revision),
-      operation(reading(), { progress: 5, unread: true, readAt: null }, a[1].current!.revision),
-      operation(library(), { inLibrary: false, addedAt: null }, a[0].current!.revision),
-    ], f.second)).json()).results;
-    assert(b.every(item => item.status === 'applied'));
-    assert.deepEqual(b[0].current!.value, { bookmarked: false });
-    assert.deepEqual(b[1].current!.value, { progress: 5, unread: true, readAt: null });
-    assert.deepEqual(b[2].current!.value, { inLibrary: false, addedAt: null });
-    // Existing SQLite permits this atomic legacy tuple; never manufacture or normalize another tuple.
-    const legacy = result(await f.merge([operation(reading(), { progress: 100, unread: true, readAt: 200 }, b[1].current!.revision)]));
-    assert.deepEqual(legacy.current!.value, { progress: 100, unread: true, readAt: 200 });
+    result(await f.post([item(library(), { inLibrary: true, addedAt: 10 }), item(reading(), { progress: 80, unread: false, readAt: 20 }), item(bookmark(), { bookmarked: true })]));
+    let current = result(await f.post([item(library(), { inLibrary: true, addedAt: 30 }), item(reading(), { progress: 10, unread: true, readAt: 10 })], f.second));
+    assert.deepEqual(find(current.items, reading()).value, { progress: 80, unread: false, readAt: 20 }); assert.deepEqual(find(current.items, library()).value, { inLibrary: true, addedAt: 10 }); assert(find(current.items, bookmark()));
+    current = result(await f.post([item(reading(), { progress: 5, unread: true, readAt: 30 })])); assert.deepEqual(find(current.items, reading()).value, { progress: 5, unread: true, readAt: 30 });
+    current = result(await f.post([item(reading(), { progress: 30, unread: false, readAt: 30 })])); assert.deepEqual(find(current.items, reading()).value, { progress: 30, unread: false, readAt: 30 });
+    assert.equal((await f.post([item(library(), { inLibrary: false, addedAt: null })])).statusCode, 400); assert.equal(result(await f.get()).items.length, 3);
   } finally { await f.close(); }
 });
 
-test('CAS conflicts preserve the current value, equivalent values converge, and soft seeds never resurrect tombstones', async () => {
+test('exact category names avoid row-ID collisions and forced rename without permanent UUID-to-name aliases', async () => {
   const f = await fixture();
   try {
-    const initial = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 10 }, 0, true)]));
-    const removed = result(await f.merge([operation(library(), { inLibrary: false, addedAt: null }, initial.current!.revision)], f.second));
-    const stale = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 20 }, initial.current!.revision)]));
-    assert.equal(stale.status, 'conflict'); assert.equal(stale.reason, 'revision-mismatch');
-    assert.deepEqual(stale.current, removed.current);
-    const equal = result(await f.merge([operation(library(), { inLibrary: false, addedAt: null }, 0)]));
-    assert.equal(equal.status, 'unchanged'); assert.equal(equal.current!.revision, removed.current!.revision);
-    const seed = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 10 }, 0, true)]));
-    assert.equal(seed.status, 'seed-skipped'); assert.deepEqual(seed.current, removed.current);
-    assert.equal((await f.merge([operation(library(), { inLibrary: true, addedAt: 10 }, 1, true)])).statusCode, 400);
-    assert.equal(page(await f.read()).headRevision, 2);
+    result(await f.post([item(category('same-id'), { name: 'Old', sort: 5, deleted: false }), item(membership('same-id'), { included: true })]));
+    const current = result(await f.post([item(category('same-id'), { name: ' New ', sort: 3, deleted: false }), item(membership('same-id'), { included: true }), item(category('other-id'), { name: 'Old', sort: 2, deleted: false })], f.second));
+    assert.equal(current.items.length, 4);
+    for (const name of ['New', 'Old']) { assert(find(current.items, category(currentCategoryId(name)))); assert(find(current.items, membership(currentCategoryId(name)))); }
+    assert.deepEqual(find(current.items, category(currentCategoryId('Old'))).value, { name: 'Old', sort: 2, deleted: false });
+    result(await f.post([item(category('same-id'), { name: 'Old', sort: 4, deleted: false }), item(membership('same-id'), { included: true })]));
+    assert.equal((await f.post([item(library('uncommitted'), { inLibrary: true, addedAt: 1 }), item(membership('unknown'), { included: true })])).statusCode, 400);
+    assert.equal(result(await f.get()).items.length, 4);
   } finally { await f.close(); }
 });
 
-test('lost-response retries replay the exact durable result and operation-ID reuse is atomic', async () => {
+test('portable identity ignores labels and rejects numeric recovered paths or missing synthetic ownership', async () => {
   const f = await fixture();
   try {
-    const original = operation(reading(), { progress: 40, unread: false, readAt: 100 });
-    const accepted = result(await f.merge([original]));
-    // Copied immutable outboxes remain idempotent under another device bearer.
-    assert.deepEqual(result(await f.merge([original], f.second)), accepted);
-    result(await f.merge([operation(reading(), { progress: 0, unread: true, readAt: null }, accepted.current!.revision)], f.second));
-    assert.deepEqual(result(await f.merge([original])), accepted);
-    const before = page(await f.read()).headRevision;
-    const changed = { ...original, value: { progress: 41, unread: false, readAt: 100 } };
-    assert.equal((await f.merge([operation(library('new'), { inLibrary: true, addedAt: 10 }), changed])).statusCode, 409);
-    assert.equal((await f.merge([changed], f.second)).statusCode, 409);
-    assert.equal(page(await f.read()).headRevision, before);
-    assert.equal((await f.merge([original, original])).statusCode, 400);
-    // The immutable payload includes its identity spelling, even when the semantic key is equal.
-    assert.equal((await f.merge([{ ...original, entity: { kind: 'reading', work: { ...work(), sourceNovelId: 'NOVEL-1' }, chapter: chapter() } }])).statusCode, 409);
+    result(await f.post([item(library('ABC'), { inLibrary: true, addedAt: 1 })]));
+    const renamed: UserStateEntity = { kind: 'library', work: { ...work('abc'), novelPath: '/new/path', name: 'Other label' } };
+    assert.equal(result(await f.post([item(renamed, { inLibrary: true, addedAt: 2 })], f.second)).items.length, 1);
+    for (const path of ['norea-folder:12', 'local-folder:99', 'norea-composed:entry-without-proof']) assert.equal((await f.post([item({ kind: 'reading', work: work(), chapter: { chapterPath: path } }, { progress: 10, unread: false, readAt: 1 })])).statusCode, 400);
+    assert.equal((await f.post([{ entity: { kind: 'library', work: { ...work(), sourceNovelId: null } }, value: { inLibrary: true, addedAt: null } }])).statusCode, 400);
   } finally { await f.close(); }
 });
 
-test('same-name category creation aliases once, old membership IDs remain usable, and rename collisions stay conflicts', async () => {
+test('resume keeps newer anchors and synthetic ownership mismatch rolls the entire bulk transaction back', async () => {
   const f = await fixture();
   try {
-    const first = result(await f.merge([operation(category('first'), { name: 'Favourites', sort: -5, deleted: false })]));
-    const aliasOp = operation(category('second'), { name: 'Favourites', sort: 10, deleted: false }, 0, true);
-    const alias = result(await f.merge([aliasOp], f.second));
-    assert.equal(alias.status, 'aliased'); assert.deepEqual(alias.categoryAlias, { from: 'second', to: 'first' });
-    assert.deepEqual(alias.current, first.current);
-    const member = result(await f.merge([operation(membership('second'), { included: true })], f.second));
-    assert.deepEqual(member.current!.entity, membership('first'));
-    assert.deepEqual(member.categoryAlias, { from: 'second', to: 'first' });
-    assert.deepEqual(result(await f.merge([aliasOp], f.second)), alias);
-    const other = result(await f.merge([operation(category('third'), { name: 'Other', sort: 1, deleted: false })]));
-    const collision = result(await f.merge([operation(category('third'), { name: 'Favourites', sort: 1, deleted: false }, other.current!.revision)]));
-    assert.equal(collision.status, 'conflict'); assert.equal(collision.reason, 'category-name-conflict');
-    assert.deepEqual(collision.current, other.current); assert.equal(collision.categoryAlias, undefined);
+    const resume: UserStateEntity = { kind: 'resume', work: work() }; const anchor = { segmentIndex: 1, segmentCount: 3, offset: 0.25, progress: 40, savedAt: 1000 };
+    result(await f.post([item(resume, { chapter: { chapterPath: '/chapter/1' }, anchor, openedAt: 20 })]));
+    const current = result(await f.post([item(resume, { chapter: { chapterPath: '/chapter/2' }, anchor: null, openedAt: 10 })], f.second));
+    assert.deepEqual(find(current.items, resume).value, { chapter: { chapterPath: '/chapter/1' }, anchor, openedAt: 20 });
+    const synthetic: UserStateEntity = { kind: 'reading', work: work(), chapter: { chapterPath: 'norea-composed:shared', compositionEntryId: 'owner-a' } };
+    result(await f.post([item(synthetic, { progress: 90, unread: false, readAt: 40 })]));
+    const changed = { ...synthetic, chapter: { ...synthetic.chapter, compositionEntryId: 'owner-b' } };
+    assert.equal((await f.post([item(library('must-not-save'), { inLibrary: true, addedAt: 1 }), item(changed, { progress: 1, unread: true, readAt: 50 })])).statusCode, 409);
+    assert.equal(find(result(await f.get()).items, library('must-not-save')), undefined);
+    assert.equal((await f.post([item(resume, { chapter: null, anchor: null, openedAt: 50 })])).statusCode, 400);
   } finally { await f.close(); }
 });
 
-test('deleted categories block stale inclusion, preserve exclusion and require a current revision for restoration', async () => {
+test('composition retains excluded provenance and selects the newest current manual document', async () => {
   const f = await fixture();
   try {
-    const created = result(await f.merge([operation(category('category'), { name: 'History', sort: 0, deleted: false })]));
-    const member = result(await f.merge([operation(membership('category'), { included: true })]));
-    const alreadyFalse = result(await f.merge([operation({ kind: 'membership', work: work('excluded-work'), categoryId: 'category' }, { included: false })]));
-    result(await f.merge([operation(category('other-category'), { name: 'Another', sort: 0, deleted: false })]));
-    const otherCategory = result(await f.merge([operation(membership('other-category'), { included: true })]));
-    const beforeDeletion = page(await f.read()).headRevision;
-    const deletion = operation(category('category'), { name: 'History', sort: 0, deleted: true }, created.current!.revision);
-    const removed = result(await f.merge([deletion], f.second));
-    const cascade = page(await f.read(beforeDeletion));
-    assert.equal(cascade.headRevision, beforeDeletion + 2);
-    assert.equal(cascade.records.length, 2);
-    assert.equal(cascade.records[1].deviceId, removed.current!.deviceId);
-    assert.equal(result(await f.merge([operation({ kind: 'membership', work: work('excluded-work'), categoryId: 'category' }, { included: false }, alreadyFalse.current!.revision)])).current!.revision, alreadyFalse.current!.revision);
-    assert.equal(result(await f.merge([operation(membership('other-category'), { included: true }, otherCategory.current!.revision)])).current!.revision, otherCategory.current!.revision);
-    const blocked = result(await f.merge([operation(membership('category'), { included: true }, member.current!.revision)]));
-    assert.equal(blocked.status, 'conflict'); assert.equal(blocked.reason, 'category-deleted');
-    const exclusion = result(await f.merge([operation(membership('category'), { included: false }, member.current!.revision)]));
-    assert.equal(exclusion.status, 'unchanged');
-    assert(exclusion.current!.revision > removed.current!.revision);
-    assert.match(exclusion.current!.operationId, /^category-delete:[0-9a-f]{64}$/);
-    assert.equal(result(await f.merge([operation(category('category'), { name: 'History', sort: 0, deleted: false }, created.current!.revision)])).status, 'conflict');
-    assert.equal(result(await f.merge([operation(category('category'), { name: 'History', sort: 0, deleted: false }, removed.current!.revision)])).status, 'applied');
-    assert.equal(result(await f.merge([operation(membership('category'), { included: true }, member.current!.revision)])).reason, 'revision-mismatch');
-    assert.equal(result(await f.merge([operation(membership('category'), { included: true }, exclusion.current!.revision)])).status, 'applied');
-    const beforeReplay = page(await f.read()).headRevision;
-    assert.deepEqual(result(await f.merge([deletion], f.second)), removed);
-    assert.deepEqual(result(await f.merge([deletion], f.headers)), removed);
-    assert.equal(page(await f.read()).headRevision, beforeReplay);
-    const absent = result(await f.merge([operation(membership('missing'), { included: true })]));
-    assert.equal(absent.reason, 'category-missing'); assert.equal(absent.current, null);
-    assert.equal(result(await f.merge([operation(membership('missing'), { included: false })])).status, 'applied');
+    const entity: UserStateEntity = { kind: 'composition', work: work() }; const a = composition(); a.entries[0].user.name = 'First';
+    result(await f.post([item(entity, { composition: a })])); const b = structuredClone(a); b.updatedAt = 200; b.entries[0].user.name = 'Newest';
+    result(await f.post([item(entity, { composition: b })], f.second)); assert.deepEqual(find(result(await f.post([item(entity, { composition: a })])).items, entity).value, { composition: b });
+    assert.equal((await f.post([{ entity, value: { composition: null } }])).statusCode, 400);
   } finally { await f.close(); }
 });
 
-test('bounded revision paging freezes a boundary and does not miss updates made while pages are read', async () => {
+test('a single bulk transaction accepts 5505 rows without growing legacy operation history', async () => {
   const f = await fixture();
   try {
-    await f.merge([1, 2, 3].map(id => operation(library(String(id)), { inLibrary: true, addedAt: null })));
-    const first = page(await f.read(0, undefined, 1));
-    assert.equal(first.through, 3); assert.equal(first.nextCursor, 1); assert.equal(first.hasMore, true);
-    await f.merge([operation(library('1'), { inLibrary: false, addedAt: null }, 1)], f.second);
-    const second = page(await f.read(first.nextCursor, first.through, 1));
-    const third = page(await f.read(second.nextCursor, first.through, 1));
-    assert.equal(second.headRevision, 4); assert.equal(third.nextCursor, 3); assert.equal(third.hasMore, false);
-    const next = page(await f.read(third.nextCursor));
-    assert.equal(next.records.length, 1); assert.equal(next.records[0].revision, 4);
-    assert.deepEqual(next.records[0].value, { inLibrary: false, addedAt: null });
-    assert.equal((await f.read(5)).statusCode, 409);
-    assert.equal((await f.read(0, 5)).statusCode, 409);
-    assert.equal((await f.read(3, 2)).statusCode, 409);
-    assert.equal((await f.read(0, undefined, 201)).statusCode, 400);
+    const items = Array.from({ length: 5505 }, (_, i) => item(reading('book-' + i), { progress: i % 101, unread: false, readAt: i + 1 }));
+    const saved = result(await f.post(items)); assert.equal(saved.items.length, 5505); assert.deepEqual(result(await f.post(items, f.second)), saved);
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite')); try { assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_current_records').get()?.n, 5505); assert.equal(db.prepare('SELECT count(*) AS n FROM user_state_operations').get()?.n, 0); } finally { db.close(); }
+    assert.equal((await f.post([{ entity: library(), value: { inLibrary: true, addedAt: 1 }, operationId: randomUUID() }])).statusCode, 400);
   } finally { await f.close(); }
 });
 
-test('malformed batches, wrong value groups and arbitrary device state cannot partially write', async () => {
-  const f = await fixture();
-  try {
-    const valid = operation(library(), { inLibrary: true, addedAt: null });
-    for (const invalid of [
-      { ...operation(reading(), { progress: 0, unread: true, readAt: null }), value: { progress: 101, unread: true, readAt: null } },
-      { ...valid, deviceId: 'claimed-device' },
-      { ...valid, value: { inLibrary: true, addedAt: null, credentials: 'not allowed' } },
-      { ...valid, value: { bookmarked: true } },
-      { ...valid, operationId: 'not an identifier' },
-      { ...valid, entity: { kind: 'category', categoryId: 'x' }, value: { name: 'x'.repeat(513), sort: 0, deleted: false } },
-    ]) {
-      assert.equal((await f.merge([valid, invalid])).statusCode, 400);
-      assert.equal(page(await f.read()).headRevision, 0);
-    }
-    assert.equal((await f.merge(Array.from({ length: 201 }, (_, index) => operation(library(String(index)), { inLibrary: true, addedAt: null })))).statusCode, 400);
-    const max = await f.merge(Array.from({ length: 200 }, (_, index) => operation(library(String(index)), { inLibrary: true, addedAt: null })));
-    assert.equal(parseUserStateMergeResponse(max.json()).results.length, 200);
-    const records = page(await f.read()).records;
-    assert.equal(records.length, 200);
-    assert(records.every(record => Object.keys(record).sort().join(',') === 'deviceId,deviceName,entity,operationId,revision,updatedAt,value'));
-  } finally { await f.close(); }
-});
-
-test('resume accepts portable anchors and rejects pixel/local-ID fields, and chapter ownership cannot silently change', async () => {
-  const f = await fixture();
-  try {
-    const anchor = { segmentIndex: 1, mediaOrdinal: 0, segmentCount: 3, offset: 0.25, progress: 45, savedAt: 1700000000000 };
-    const entity: UserStateEntity = { kind: 'resume', work: work() };
-    const saved = result(await f.merge([operation(entity, { chapter: chapter(), anchor, openedAt: 1700000000000 })]));
-    assert.deepEqual(saved.current!.value, { chapter: chapter(), anchor, openedAt: 1700000000000 });
-    for (const value of [
-      { chapter: null, anchor, openedAt: null },
-      { chapter: chapter(), anchor: { ...anchor, novelId: 1 }, openedAt: null },
-      { chapter: chapter(), anchor: { ...anchor, offset: 20 }, openedAt: null },
-      { chapter: chapter(), anchor: { ...anchor, segmentIndex: 3 }, openedAt: null },
-      { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: null },
-    ]) assert.equal((await f.merge([{ ...operation(entity, { chapter: null, anchor: null, openedAt: null }), value }])).statusCode, 400);
-    const owned: UserStateEntity = { kind: 'reading', work: work(), chapter: { ...chapter(), compositionEntryId: 'entry-a' } };
-    const first = result(await f.merge([operation(owned, { progress: 10, unread: false, readAt: null })]));
-    const mismatch = result(await f.merge([operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision)]));
-    assert.equal(mismatch.status, 'conflict'); assert.equal(mismatch.reason, 'chapter-identity-mismatch');
-  } finally { await f.close(); }
-});
-
-test('composition state preserves provenance and excluded entries, validates documents and conflicts atomically', async () => {
-  const f = await fixture();
-  try {
-    const entity: UserStateEntity = { kind: 'composition', work: work() }, document = composition();
-    const first = result(await f.merge([operation(entity, { composition: document })]));
-    assert.deepEqual(first.current!.value, { composition: document });
-    const changed = structuredClone(document); changed.updatedAt++; changed.entries[0].user.name = 'Edited title';
-    const next = result(await f.merge([operation(entity, { composition: changed }, first.current!.revision)], f.second));
-    const conflicting = structuredClone(document); conflicting.entries[1].user.included = true; conflicting.entries[1].user.order = 2;
-    const conflict = result(await f.merge([operation(entity, { composition: conflicting }, first.current!.revision)]));
-    assert.equal(conflict.status, 'conflict'); assert.deepEqual(conflict.current, next.current);
-    assert.equal((await f.merge([{ ...operation(entity, { composition: document }), value: { composition: null } }])).statusCode, 400);
-    const broken = structuredClone(document); broken.entries[1].storageChapterNumber = broken.entries[0].storageChapterNumber;
-    assert.equal((await f.merge([operation(entity, { composition: broken })])).statusCode, 400);
-    assert.deepEqual((page(await f.read()).records.at(-1)!.value as { composition: ChapterCompositionV1 }).composition.entries[1], document.entries[1]);
-  } finally { await f.close(); }
-});
-
-test('large composition responses are byte-bounded and an oversized merge response rolls back for smaller retries', async () => {
+test('oversized current response rolls back while the preceding snapshot remains readable', async () => {
   const f = await fixture();
   try {
     const large = composition(1200, 'x'.repeat(4096));
-    const documentBytes = Buffer.byteLength(JSON.stringify(large));
-    assert(documentBytes > 12 * 1024 * 1024 && documentBytes < 16 * 1024 * 1024);
-    const entities: UserStateEntity[] = [1, 2, 3].map(id => ({ kind: 'composition', work: work(`large-${id}`) }));
-    for (const entity of entities) result(await f.merge([operation(entity, { composition: large })]));
-    const response = await f.read();
-    assert(Buffer.byteLength(response.body) <= USER_STATE_MAX_BYTES);
-    const first = page(response); assert.equal(first.records.length, 2); assert.equal(first.hasMore, true);
-    const last = page(await f.read(first.nextCursor, first.through));
-    assert.equal(last.records.length, 1); assert.equal(last.hasMore, false);
-    const conflicts = entities.map(entity => operation(entity, { composition: composition() }));
-    const tooLarge = await f.merge(conflicts);
-    assert.equal(tooLarge.statusCode, 413);
-    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    try {
-      for (const op of conflicts) assert.equal(db.prepare('SELECT 1 FROM user_state_operations WHERE operation_id=?').get(op.operationId), undefined);
-    } finally { db.close(); }
-    for (const op of conflicts) assert.equal(result(await f.merge([op])).status, 'conflict');
+    for (const id of ['large-1', 'large-2']) result(await f.post([item({ kind: 'composition', work: work(id) }, { composition: large })]));
+    const before = result(await f.get()); assert.equal(before.items.length, 2);
+    assert.equal((await f.post([item({ kind: 'composition', work: work('large-3') }, { composition: large })])).statusCode, 413);
+    const after = await f.get(); assert(Buffer.byteLength(after.body) <= USER_STATE_CURRENT_MAX_BYTES); assert.deepEqual(result(after), before);
   } finally { await f.close(); }
 });
 
-test('additive upgrade and restart preserve original schema, credentials, legacy reading, files and operation receipts', async () => {
-  const f = await fixture();
-  let reopened: FastifyInstance | undefined;
+test('v2 imports positive v1 current values once and preserves original state, private rows and credentials', async () => {
+  const f = await fixture(); let restarted: Awaited<ReturnType<typeof buildApp>> | undefined;
   try {
-    const original = operation(library(), { inLibrary: true, addedAt: 5 });
-    const receipt = result(await f.merge([original]));
-    const beforePassword = await readFile(join(f.dataDir, 'admin-password.hash'));
-    await writeFile(join(f.dataDir, 'original.txt'), 'content that must remain');
-    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    let checksum: unknown;
+    const password = await readFile(join(f.dataDir, 'admin-password.hash')); await writeFile(join(f.dataDir, 'original.txt'), 'original retained'); await f.app.close();
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite')); const positive = item(library(), { inLibrary: true, addedAt: 7 }), negative = item(bookmark(), { bookmarked: false }); let oldRows: unknown, checksum: unknown;
     try {
-      checksum = db.prepare('SELECT checksum FROM schema_state').get()?.checksum;
-      db.prepare('INSERT INTO reading_state_entries(profile_hash,entry_key,entry) VALUES(?,?,?)').run('legacy-private-profile', 'chapter', '{}');
-      db.prepare('INSERT INTO admin_settings(key,value) VALUES(?,?)').run('user-state-preserve-test', 'retained');
+      checksum = db.prepare('SELECT checksum FROM schema_state').get(); db.exec('DROP TABLE user_state_current_records; DROP TABLE user_state_current_meta');
+      for (const [i, entry] of [positive, negative].entries()) { const record = { ...entry, revision: i + 1, operationId: randomUUID(), updatedAt: 1, deviceId: 'old-device', deviceName: 'Same name' }; db.prepare('INSERT INTO user_state_records(entity_key,kind,revision,record) VALUES(?,?,?,?)').run(userStateEntityKey(entry.entity), entry.entity.kind, i + 1, JSON.stringify(record)); }
+      db.prepare('INSERT INTO reading_state_entries(profile_hash,entry_key,entry) VALUES(?,?,?)').run('private-profile', 'private-chapter', '{}'); oldRows = db.prepare('SELECT * FROM user_state_records ORDER BY entity_key').all();
     } finally { db.close(); }
-    await f.app.close();
-    reopened = await buildApp({ dataDir: f.dataDir });
-    const workspace = parseUserStateWorkspace((await reopened.inject({ url: '/api/v1/user-state', headers: f.headers })).json());
-    assert.equal(workspace.workspaceId, f.workspace.workspaceId); assert.equal(workspace.epoch, f.workspace.epoch);
-    const retry = await reopened.inject({ method: 'POST', url: '/api/v1/user-state/merge', headers: f.headers, payload: { ...f.scope, operations: [original] } });
-    assert.deepEqual(result(retry), receipt);
-    assert.deepEqual(await readFile(join(f.dataDir, 'admin-password.hash')), beforePassword);
-    assert.equal(await readFile(join(f.dataDir, 'original.txt'), 'utf8'), 'content that must remain');
-    const check = openDatabase(f.dataDir);
-    try {
-      assert.equal(check.prepare('SELECT checksum FROM schema_state').get()?.checksum, checksum);
-      assert.equal(check.prepare('SELECT COUNT(*) AS count FROM reading_state_entries').get()?.count, 1);
-      assert.equal(check.prepare('SELECT value FROM admin_settings WHERE key=?').get('user-state-preserve-test')?.value, 'retained');
-      assert.equal(check.prepare('SELECT COUNT(*) AS count FROM devices').get()?.count, 2);
-      assert.equal(check.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name IN ('accounts','sessions','state','state_changes','operations')").get()?.count, 0);
-    } finally { check.close(); }
-  } finally { await reopened?.close(); await f.close(); }
+    restarted = await buildApp({ dataDir: f.dataDir }); const current = result(await restarted.inject({ url: '/api/v1/user-state/current', headers: f.headers }));
+    assert.deepEqual(current.items, [positive]); assert.equal(current.workspaceId, f.scope.workspaceId); assert.equal(current.epoch, f.scope.epoch);
+    const check = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    try { assert.deepEqual(check.prepare('SELECT * FROM user_state_records ORDER BY entity_key').all(), oldRows); assert.deepEqual(check.prepare('SELECT checksum FROM schema_state').get(), checksum); assert.equal(check.prepare('SELECT count(*) AS n FROM reading_state_entries').get()?.n, 1); check.prepare('UPDATE user_state_records SET record=? WHERE entity_key=?').run(JSON.stringify({ ...positive, value: { inLibrary: true, addedAt: 1 } }), userStateEntityKey(positive.entity)); } finally { check.close(); }
+    await restarted.close(); restarted = await buildApp({ dataDir: f.dataDir }); assert.deepEqual(result(await restarted.inject({ url: '/api/v1/user-state/current', headers: f.headers })).items, [positive]);
+    assert.deepEqual(await readFile(join(f.dataDir, 'admin-password.hash')), password); assert.equal(await readFile(join(f.dataDir, 'original.txt'), 'utf8'), 'original retained');
+  } finally { await restarted?.close(); await f.close(); }
 });

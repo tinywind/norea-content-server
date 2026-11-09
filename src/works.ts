@@ -8,7 +8,7 @@ import { canonicalize } from 'json-canonicalize';
 import { authenticate, authenticateDevice } from './auth.ts';
 import { assertChapterNumberReconciliationReady, canonicalWorkChapters } from './chapter-number-mappings.ts';
 import { problem, transaction } from './db.ts';
-import { deactivateWorkMigrationsForSource } from './work-migration-lineage.ts';
+import { assertExplicitMigrationRestore, deactivateWorkMigrationsForSource } from './work-migration-lineage.ts';
 import { readUserStateComposition } from './user-state.ts';
 import { mergeUserStateComposition } from './user-state-composition.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
@@ -167,12 +167,13 @@ function discoverCover(directory: string, preferred: NovelMetadataV1['cover']): 
   const fileName = candidates.includes(preferred?.fileName ?? '') ? preferred!.fileName : candidates[0];
   return fileName ? { fileName, contentType: fileName === preferred?.fileName ? preferred.contentType : coverContentType(fileName) } : preferred;
 }
-export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1, restore = false): WorkEntry {
+export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, metadata: NovelMetadataV1, restore = false, restoreMigrationOperationId?: string): WorkEntry {
   if (directory !== workDirectory(db, metadata)) throw problem(409, 'Work folder does not match its source IDs');
   const collision = db.prepare('SELECT id FROM works WHERE lower(directory)=lower(?) AND id<>?').get(directory, metadataWorkId(metadata));
   if (collision) throw problem(409, 'Work directory is already assigned');
   metadata = { ...metadata, cover: discoverCover(join(dataDir, directory), metadata.cover), chapters: metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : canonicalWorkChapters(db, metadata.identity, metadata.chapters) };
   const id = metadataWorkId(metadata); const existing = rowFor(db, id);
+  if (restore) assertExplicitMigrationRestore(db, id, restoreMigrationOperationId);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(409, 'Work was deleted from the server');
   if (existing && existing.directory !== directory) throw problem(409, 'Duplicate work identity in different folders');
   const cover = coverBytes(join(dataDir, directory), metadata);
@@ -186,7 +187,7 @@ export function cacheWork(db: DatabaseSync, dataDir: string, directory: string, 
     db.prepare('INSERT INTO works(id,directory,entry,fingerprint) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET entry=excluded.entry,fingerprint=excluded.fingerprint').run(id, directory, json, fingerprint);
     if (restore) {
       db.prepare('UPDATE work_tombstones SET deleted=0 WHERE work_id=?').run(id);
-      deactivateWorkMigrationsForSource(db, id);
+      deactivateWorkMigrationsForSource(db, id, restoreMigrationOperationId);
     }
     return entry;
   };
@@ -284,11 +285,12 @@ function assertSharedCompositionStorage(
   }
 }
 
-export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false): WorkEntry {
+export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false, restoreMigrationOperationId?: string): WorkEntry {
   const metadata = parseNovelMetadata(value); const id = metadataWorkId(metadata);
   const incomingComposition = metadata.chapterComposition;
   const sharedComposition = readUserStateComposition(db, metadata.identity);
   let storedMetadata: NovelMetadataV1 | undefined;
+  if (restore) assertExplicitMigrationRestore(db, id, restoreMigrationOperationId);
   if (!restore && db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(410, 'Work was deleted from the server');
   if (expectedId !== undefined && expectedId !== id) throw problem(400, 'Work identity does not match requested ID');
   const directory = workDirectory(db, metadata);
@@ -329,7 +331,7 @@ export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expe
   metadata.chapters = metadata.chapterComposition ? chapterCompositionCatalog(metadata.chapterComposition) : canonicalWorkChapters(db, metadata.identity, metadata.chapters);
   parseNovelMetadata(metadata);
   if (current === undefined || canonicalize(current) !== canonicalize(metadata)) atomicWrite(file, JSON.stringify(metadata, null, 2) + '\n');
-  return cacheWork(db, dataDir, directory, metadata, restore);
+  return cacheWork(db, dataDir, directory, metadata, restore, restoreMigrationOperationId);
 }
 
 export function deleteWork(db: DatabaseSync, dataDir: string, id: string, recordDeletion?: (entry: WorkEntry) => void, verifyDeletion?: (retiredDirectory: string) => void): WorkEntry {
@@ -450,13 +452,13 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
     authenticateDevice(db, request);
     const entry = deleteWork(db, dataDir, request.params.id); notify(); return entry;
   });
-  app.put<{ Params: { id: string }; Querystring: { restore?: boolean } }>('/api/v1/works/:id', { bodyLimit: metadataByteLimit, onRequest: async request => {
+  app.put<{ Params: { id: string }; Querystring: { restore?: boolean; restoreMigrationOperationId?: string } }>('/api/v1/works/:id', { bodyLimit: metadataByteLimit, onRequest: async request => {
     authenticateDevice(db, request);
     uploadCursors.set(request, (db.prepare('SELECT coalesce(max(sequence),0) AS n FROM work_changes').get() as { n: number }).n);
-  }, schema: { params, querystring: { type: 'object', properties: { restore: { type: 'boolean', default: false } } }, security: [{ bearerAuth: [] }] } }, async request => {
+  }, schema: { params, querystring: { type: 'object', properties: { restore: { type: 'boolean', default: false }, restoreMigrationOperationId: { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' } } }, security: [{ bearerAuth: [] }] } }, async request => {
     const deletion = db.prepare('SELECT sequence FROM work_tombstones WHERE work_id=?').get(request.params.id) as { sequence: number } | undefined;
     if ((deletion?.sequence ?? 0) > uploadCursors.get(request)!) throw problem(410, 'Work was deleted during upload');
-    const entry = saveWork(db, dataDir, request.body, request.params.id, request.query.restore); notify(); return entry;
+    const entry = saveWork(db, dataDir, request.body, request.params.id, request.query.restore, request.query.restoreMigrationOperationId); notify(); return entry;
   });
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/works', { schema: { querystring: { type: 'object', properties: { after: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 } } } } }, async request => {
     requireRead(request);

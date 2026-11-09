@@ -8,7 +8,7 @@ import { authenticateDevice } from './auth.ts';
 import { inspectChapterInventory } from './chapter-inventory.ts';
 import { chapterFileStream } from './chapter-files.ts';
 import { problem } from './db.ts';
-import { readWorkMigrations, readWorkMigration, recordWorkMigrationLineage, type MigrationChapterDecision, type MigrationLineageChapterDecision, type MigrationLineageMapping } from './work-migration-lineage.ts';
+import { assertMigrationNotRevoked, readWorkMigrations, readWorkMigration, recordWorkMigrationLineage, type MigrationChapterDecision, type MigrationLineageChapterDecision, type MigrationLineageMapping } from './work-migration-lineage.ts';
 import { isMigrationTextBody } from './migration-text-body.ts';
 import { availableChapter, chapterRow, chapterStoragePath, digest, type CatalogEntry, type Limits } from './packages.ts';
 import { coverBytes, deleteWork, getWork, isCoverFile, metadataByteLimit, type NovelMetadataV1, type WorkEntry } from './works.ts';
@@ -28,6 +28,13 @@ export interface FinalizeMigrationRequest {
   chapterDecisions?: MigrationChapterDecision[];
 }
 export interface FinalizeMigrationResult { operationId: string; deletedWork: WorkEntry }
+export interface ReconcileMigrationRequest {
+  legacyOperationId: string;
+  legacyRequest: FinalizeMigrationRequest;
+  current: FinalizeMigrationRequest;
+  /** A fresh explicit reviewed decision, never emitted by automatic completed-job repair. */
+  reviewedCurrentState?: true;
+}
 interface ChapterRecord { id: string; entry: string; directory: string; path: string | null; deleted_at: number | null }
 interface WorkRecord { entry: string; directory: string; fingerprint: string }
 interface FileFence { path: string; signature: string }
@@ -304,7 +311,7 @@ function receipt(db: DatabaseSync, sourceId: string, request: FinalizeMigrationR
   return result;
 }
 
-export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourceId: string, request: FinalizeMigrationRequest, limits: Limits, authorizeCommit?: () => void): Promise<FinalizeMigrationResult> {
+export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourceId: string, request: FinalizeMigrationRequest, limits: Limits, authorizeCommit?: () => void, legacyOperationId?: string): Promise<FinalizeMigrationResult> {
   const requestHash = digest(canonicalize({ sourceId, request }));
   const previous = receipt(db, sourceId, request, requestHash);
   if (previous) return previous;
@@ -365,7 +372,7 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
     let result: FinalizeMigrationResult;
     deleteWork(db, dataDir, sourceId, deletedWork => {
       result = { operationId: request.operationId, deletedWork };
-      recordWorkMigrationLineage(db, { operationId: request.operationId, sourceWork, targetWork, deletedSource: { revision: request.source.revision, sequence: deletedWork.sequence }, mappings, chapterDecisions, fullDecisionCoverage: request.chapterDecisions !== undefined });
+      recordWorkMigrationLineage(db, { operationId: request.operationId, ...(legacyOperationId ? { legacyOperationId } : {}), sourceWork, targetWork, deletedSource: { revision: request.source.revision, sequence: deletedWork.sequence }, mappings, chapterDecisions, fullDecisionCoverage: request.chapterDecisions !== undefined });
       db.prepare('INSERT INTO work_migrations(operation_id,source_work_id,request_hash,result) VALUES(?,?,?,?)')
         .run(request.operationId, sourceId, requestHash, JSON.stringify(result));
     }, retiredRoot => {
@@ -390,6 +397,40 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
   }
 }
 
+/** Repair a previously completed source reupload using its immutable exact receipt. */
+export async function reconcileMigration(db: DatabaseSync, dataDir: string, sourceId: string, request: ReconcileMigrationRequest, limits: Limits, authorizeCommit?: () => void): Promise<FinalizeMigrationResult> {
+  const { legacyOperationId, legacyRequest, current } = request;
+  if (legacyRequest.operationId !== legacyOperationId || current.operationId === legacyOperationId || current.chapterDecisions === undefined)
+    conflict('reconciliation requires a distinct operation and full fresh chapter decisions');
+  const saved = db.prepare('SELECT source_work_id,request_hash,result FROM work_migrations WHERE operation_id=?').get(legacyOperationId) as { source_work_id: string; request_hash: string; result: string } | undefined;
+  if (!saved || saved.source_work_id !== sourceId || saved.request_hash !== digest(canonicalize({ sourceId, request: legacyRequest })))
+    conflict('legacy receipt does not match the exact completed request');
+  const deleted = (JSON.parse(saved!.result) as FinalizeMigrationResult).deletedWork;
+  if (deleted.id !== sourceId || deleted.deleted !== true || current.target.id !== legacyRequest.target.id)
+    conflict('legacy receipt does not prove retirement into this target');
+  assertMigrationNotRevoked(db, sourceId, legacyOperationId);
+  const existing = db.prepare('SELECT entry FROM work_migration_lineage WHERE operation_id=?').get(current.operationId) as { entry: string } | undefined;
+  if (existing && JSON.parse(existing.entry).legacyOperationId !== legacyOperationId) conflict('current operation belongs to a different migration');
+  if (!existing) {
+    const source = checkedWork(db, dataDir, sourceId, current.source.revision);
+    if (canonicalize(source.entry.metadata.identity) !== canonicalize(deleted.metadata.identity)) conflict('current source identity differs from the completed receipt');
+  }
+  const legacyMappings = new Map(legacyRequest.mappings.map(mapping => [mapping.sourceChapterId, mapping]));
+  const legacyRevisions = new Map(legacyRequest.source.chapters.map(chapter => [chapter.id, chapter.revision]));
+  const currentRevisions = new Map(current.source.chapters.map(chapter => [chapter.id, chapter.revision]));
+  for (const mapping of request.reviewedCurrentState ? [] : current.mappings) {
+    const original = legacyMappings.get(mapping.sourceChapterId);
+    if (!original || original.decision !== mapping.decision || original.targetChapterId !== mapping.targetChapterId)
+      conflict('a current source chapter has no matching completed migration decision');
+    if (mapping.decision !== 'copy-source' && currentRevisions.get(mapping.sourceChapterId) !== legacyRevisions.get(mapping.sourceChapterId))
+      conflict('a discarded or kept source changed since the completed decision');
+  }
+  return finalizeMigration(db, dataDir, sourceId, current, limits, () => {
+    assertMigrationNotRevoked(db, sourceId, legacyOperationId);
+    authorizeCommit?.();
+  }, legacyOperationId);
+}
+
 const hash = { type: 'string', pattern: '^[0-9a-f]{64}$' };
 const count = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
 const reference = { type: 'object', additionalProperties: false, required: ['id', 'revision'], properties: { id: hash, revision: hash } };
@@ -404,6 +445,22 @@ export function registerWorkMigrations(app: FastifyInstance, context: { db: Data
   const { db, dataDir, limits, requireRead, notify } = context;
   const params = { type: 'object', required: ['id'], properties: { id: hash } };
   const operationId = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' };
+  const finalizeBody = { type: 'object', additionalProperties: false, required: ['operationId', 'source', 'target', 'mappings'], properties: {
+        operationId,
+        source: { type: 'object', additionalProperties: false, required: ['revision', 'chapters'], properties: { revision: hash, chapters: { type: 'array', maxItems: MAX_CHAPTERS, items: reference } } },
+        target: reference,
+        mappings: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
+          required: ['sourceChapterId', 'decision'], properties: { sourceChapterId: hash, targetChapterId: hash, targetRevision: hash,
+            decision: { type: 'string', enum: ['copy-source', 'keep-target', 'delete-source'] }, expectedTargetInventory: inventory } } },
+        chapterDecisions: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
+          required: ['sourceChapterPath', 'sourceChapterNumber', 'targetChapterPath', 'targetChapterNumber'], properties: {
+            discardSourceContent: { type: 'boolean', const: true },
+            sourceChapterPath: { type: 'string', minLength: 1, maxLength: 4096 },
+            sourceChapterNumber: { anyOf: [{ type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' }, { type: 'null' }] },
+            targetChapterPath: { anyOf: [{ type: 'string', minLength: 1, maxLength: 4096 }, { type: 'null' }] },
+            targetChapterNumber: { anyOf: [{ type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' }, { type: 'null' }] },
+          } } },
+      } };
   const pageQuery = { type: 'object', additionalProperties: false, properties: { after: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 } } };
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/work-migrations', { schema: { querystring: pageQuery,
     description: 'Read durable migration decisions in current event order. Returns only the latest active or revoked event for each operation, with full captured source and target metadata.',
@@ -438,22 +495,7 @@ export function registerWorkMigrations(app: FastifyInstance, context: { db: Data
     onRequest: async request => { authenticateDevice(db, request); },
     schema: { params, security: [{ bearerAuth: [] }],
       description: 'Retire a source work only after an exact full snapshot, unambiguous mappings, and complete target payloads pass fresh integrity checks. Persists an idempotent receipt with the deletion tombstones. A conflict preserves the source.',
-      body: { type: 'object', additionalProperties: false, required: ['operationId', 'source', 'target', 'mappings'], properties: {
-        operationId,
-        source: { type: 'object', additionalProperties: false, required: ['revision', 'chapters'], properties: { revision: hash, chapters: { type: 'array', maxItems: MAX_CHAPTERS, items: reference } } },
-        target: reference,
-        mappings: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
-          required: ['sourceChapterId', 'decision'], properties: { sourceChapterId: hash, targetChapterId: hash, targetRevision: hash,
-            decision: { type: 'string', enum: ['copy-source', 'keep-target', 'delete-source'] }, expectedTargetInventory: inventory } } },
-        chapterDecisions: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
-          required: ['sourceChapterPath', 'sourceChapterNumber', 'targetChapterPath', 'targetChapterNumber'], properties: {
-            discardSourceContent: { type: 'boolean', const: true },
-            sourceChapterPath: { type: 'string', minLength: 1, maxLength: 4096 },
-            sourceChapterNumber: { anyOf: [{ type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' }, { type: 'null' }] },
-            targetChapterPath: { anyOf: [{ type: 'string', minLength: 1, maxLength: 4096 }, { type: 'null' }] },
-            targetChapterNumber: { anyOf: [{ type: 'string', maxLength: 100, pattern: '^\\d+(?:\\.\\d+)?$' }, { type: 'null' }] },
-          } } },
-      } },
+      body: finalizeBody,
     },
   }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
@@ -461,4 +503,20 @@ export function registerWorkMigrations(app: FastifyInstance, context: { db: Data
     const result = await finalizeMigration(db, dataDir, request.params.id, request.body, limits, () => { authenticateDevice(db, request); });
     notify(); return result;
   });
+  app.post<{ Params: { id: string }; Body: ReconcileMigrationRequest }>('/api/v1/works/:id/migration-reconcile', {
+    bodyLimit: metadataByteLimit,
+    onRequest: async request => { authenticateDevice(db, request); },
+    schema: { params, security: [{ bearerAuth: [] }],
+      description: 'Reconcile an accidentally reuploaded completed migration from its exact immutable legacy request and a fresh full mapping. Keeps all source files on conflict and records the legacy operation binding.',
+      body: { type: 'object', additionalProperties: false, required: ['legacyOperationId', 'legacyRequest', 'current'], properties: {
+        legacyOperationId: operationId, legacyRequest: finalizeBody, current: finalizeBody,
+        reviewedCurrentState: { type: 'boolean', const: true },
+      } },
+    },
+  }, async (request, reply) => {
+    reply.header('Cache-Control', 'no-store'); request.raw.setTimeout?.(300000);
+    const result = await reconcileMigration(db, dataDir, request.params.id, request.body, limits, () => { authenticateDevice(db, request); });
+    notify(); return result;
+  });
+
 }

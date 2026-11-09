@@ -63,9 +63,11 @@ function storedRecord(db: DatabaseSync, entity: UserStateEntity): UserStateRecor
   const row = db.prepare('SELECT record FROM user_state_records WHERE entity_key=?').get(userStateEntityKey(entity)) as { record: string } | undefined;
   return row ? JSON.parse(row.record) as UserStateRecord : null;
 }
-/** User-state CAS is the authority for manual composition choices, not a device clock. */
+/** The merged current document supplies shared manual choices for content metadata overlays. */
 export function readUserStateComposition(db: DatabaseSync, identity: { pluginId: string; novelId: string; novelPath: string }): ChapterCompositionV1 | null {
   const entity: UserStateEntity = { kind: 'composition', work: { pluginId: identity.pluginId, sourceNovelId: identity.novelId, novelPath: identity.novelPath, name: '' } };
+  const current = db.prepare('SELECT item FROM user_state_current_records WHERE entity_key=?').get(userStateEntityKey(entity)) as { item: string } | undefined;
+  if (current) return parseChapterComposition((JSON.parse(current.item).value as { composition: ChapterCompositionV1 }).composition);
   const saved = storedRecord(db, entity);
   return saved ? parseChapterComposition((saved.value as { composition: ChapterCompositionV1 }).composition) : null;
 }

@@ -1,3 +1,4 @@
+import { initializeUserStateCurrent } from './user-state-current-store.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -44,6 +45,10 @@ const readingStateSchema = `
 `;
 
 const workMigrationSchema = `
+    CREATE TABLE IF NOT EXISTS work_migration_restorations (
+      operation_id TEXT PRIMARY KEY,
+      source_work_id TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS work_migrations (
       operation_id TEXT PRIMARY KEY,
       source_work_id TEXT NOT NULL,
@@ -131,6 +136,7 @@ export function openDatabase(dataDir: string): DatabaseSync {
     transaction(db, () => {
       db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(userStateSchema);
       db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
+      initializeUserStateCurrent(db);
     });
     return db;
   } catch (error) { db.close(); throw error; }
