@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, lstatSync, openSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -10,6 +10,7 @@ import { problem, transaction } from './db.ts';
 import { chapterStoragePath, digest, recordEntry, type CatalogEntry } from './packages.ts';
 import { mergeReadingState, normalizeReadingState, readingStateKey, type ReadingStateEntry } from './reading-state.ts';
 import { cacheWork, getWork, metadataByteLimit, parseNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { readVerifiedRegularFileSync } from './secure-files.ts';
 
 export interface ChapterNumberMapping { chapterPath: string; from: string; to: string }
 export interface ReconcileChapterNumbersRequest {
@@ -86,9 +87,8 @@ function sameDirectory(path: string, move: FolderMove): boolean {
 }
 function metadataBytes(dataDir: string, path: string): Buffer {
   const absolute = chapterStoragePath(dataDir, path);
-  const info = lstatSync(absolute);
-  if (!info.isFile() || info.isSymbolicLink() || info.size > metadataByteLimit) conflict('work metadata must be a regular bounded file');
-  return readFileSync(absolute);
+  try { return readVerifiedRegularFileSync(absolute, metadataByteLimit).bytes; }
+  catch { return conflict('work metadata must be an unchanged regular bounded file'); }
 }
 function checkedJournal(dataDir: string, receipt: Receipt): Journal {
   let journal: Journal;

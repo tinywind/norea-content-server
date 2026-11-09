@@ -68,15 +68,15 @@ function readsFile(file: Parameters<typeof fs.readFileSync>[0], path: string): b
 test('inspects four chapter archives concurrently before accepting more work', async t => {
   const f = await fixture();
   for (let number = 2; number <= 9; number++) await cp(f.directory, join(f.directory, '..', String(number)), { recursive: true });
-  const open = yauzl.open;
+  const fromFd = yauzl.fromFd;
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   let active = 0;
   let peak = 0;
-  t.mock.method(yauzl, 'open', ((...args: Parameters<typeof open>) => {
+  t.mock.method(yauzl, 'fromFd', ((...args: Parameters<typeof fromFd>) => {
     active++; peak = Math.max(peak, active);
-    void gate.then(() => { active--; open(...args); });
-  }) as typeof open);
+    void gate.then(() => { active--; fromFd(...args); });
+  }) as typeof fromFd);
   const recovery = f.run();
   try {
     for (let attempt = 0; attempt < 200 && active < 4; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
@@ -93,14 +93,14 @@ test('inspects four chapter archives concurrently before accepting more work', a
 test('cancellation drains concurrent archive inspections before returning', async t => {
   const f = await fixture();
   for (let number = 2; number <= 8; number++) await cp(f.directory, join(f.directory, '..', String(number)), { recursive: true });
-  const open = yauzl.open;
+  const fromFd = yauzl.fromFd;
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   let started = 0;
-  t.mock.method(yauzl, 'open', ((...args: Parameters<typeof open>) => {
+  t.mock.method(yauzl, 'fromFd', ((...args: Parameters<typeof fromFd>) => {
     started++;
-    void gate.then(() => { open(...args); });
-  }) as typeof open);
+    void gate.then(() => { fromFd(...args); });
+  }) as typeof fromFd);
   const controller = new AbortController();
   let settled = false;
   const recovery = f.run({ signal: controller.signal }).finally(() => { settled = true; });
@@ -289,8 +289,8 @@ test('cancels between items without creating staging files or changing source fi
 test('a one-time source stat change during media validation is indexed on the first scan', async t => {
   const f = await fixture();
   try {
-    const originalOpen = yauzl.open; const body = join(f.directory, 'content.html'); let changed = false;
-    t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => {
+    const originalOpen = yauzl.fromFd; const body = join(f.directory, 'content.html'); let changed = false;
+    t.mock.method(yauzl, 'fromFd', (...args: Parameters<typeof yauzl.fromFd>) => {
       if (!changed) {
         changed = true; const info = statSync(body); utimesSync(body, info.atime, new Date(info.mtimeMs + 1000));
       }
@@ -306,9 +306,9 @@ test('a one-time source stat change during media validation is indexed on the fi
 test('source changes during both media validations are skipped and retried on the next scan', async t => {
   const f = await fixture();
   try {
-    const originalOpen = yauzl.open;
+    const originalOpen = yauzl.fromFd;
     const body = join(f.directory, 'content.html');
-    const archives = t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => {
+    const archives = t.mock.method(yauzl, 'fromFd', (...args: Parameters<typeof yauzl.fromFd>) => {
       const info = statSync(body); utimesSync(body, info.atime, new Date(info.mtimeMs + 1000));
       return originalOpen(...args);
     });
@@ -502,7 +502,7 @@ test('persistent checkpoints avoid reading unchanged payloads and archives after
     await f.run(); f.db.close(); const db = openDatabase(f.dataDir);
     try {
       const reads = t.mock.method(fs, 'createReadStream', () => { throw new Error('Unchanged payloads must not be read'); });
-      const archives = t.mock.method(yauzl, 'open', () => { throw new Error('Unchanged archives must not be opened'); });
+      const archives = t.mock.method(yauzl, 'fromFd', () => { throw new Error('Unchanged archives must not be opened'); });
       syncBuiltinESMExports();
       try {
         const result = await scanFolder({ dataDir: f.dataDir, db, limits: defaultLimits });
@@ -520,8 +520,8 @@ test('incremental scans discover new entries and refresh only the changed curren
     const second = join(f.directory, '..', '0'); await mkdir(second); await writeFile(join(second, 'content.html'), '<p>New</p>');
     const newWork = join(f.dataDir, 'contents/example/Another'); await mkdir(newWork);
     await writeFile(join(newWork, 'novel.json'), JSON.stringify({ ...workMetadata(), identity: { pluginId: 'example', novelId: 'Another', novelPath: '/another' } }));
-    const originalOpen = yauzl.open;
-    const archives = t.mock.method(yauzl, 'open', (...args: Parameters<typeof yauzl.open>) => originalOpen(...args));
+    const originalOpen = yauzl.fromFd;
+    const archives = t.mock.method(yauzl, 'fromFd', (...args: Parameters<typeof yauzl.fromFd>) => originalOpen(...args));
     const result = await f.run({ full: false }); assert.equal(result.registered, 2); assert.equal(result.unchanged, 2); assert.equal(archives.mock.callCount(), 0);
     await writeFile(join(f.directory, 'content.html'), '<p>Changed body</p>');
     const changed = await f.run(); assert.equal(changed.registered, 1); assert.equal(changed.unchanged, 3); assert.equal(archives.mock.callCount(), 1);
@@ -538,7 +538,7 @@ test('work metadata and cover changes leave unchanged chapter payloads unopened'
   try {
     await f.run(); const metadata = workMetadata(); metadata.novel.name = 'Updated title';
     await writeFile(join(f.directory, '..', 'novel.json'), JSON.stringify(metadata)); await writeFile(join(f.directory, '..', 'cover.png'), 'updated cover');
-    const archives = t.mock.method(yauzl, 'open', () => { throw new Error('Unchanged archive must not be opened'); });
+    const archives = t.mock.method(yauzl, 'fromFd', () => { throw new Error('Unchanged archive must not be opened'); });
     const result = await f.run({ full: false }); assert.equal(result.registered, 1); assert.equal(result.unchanged, 1); assert.equal(archives.mock.callCount(), 0);
     const work = getWork(f.db, f.dataDir, digest(JSON.stringify(['example', metadata.identity.novelPath])));
     assert.equal(work.metadata.novel.name, 'Updated title'); assert.equal(work.hasCover, true);

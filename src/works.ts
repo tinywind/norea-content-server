@@ -1,6 +1,6 @@
 import { chapterCompositionCatalog, parseChapterComposition, type ChapterCompositionV1, type ChapterCompositionEntry, type ChapterSourceSnapshot } from './chapter-composition.ts';
 import { randomUUID } from 'node:crypto';
-import { closeSync, constants, copyFileSync, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, copyFileSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
@@ -12,6 +12,7 @@ import { assertExplicitMigrationRestore, deactivateWorkMigrationsForSource } fro
 import { readUserStateComposition } from './user-state.ts';
 import { mergeUserStateComposition } from './user-state-composition.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
+import { readVerifiedRegularFileSync } from './secure-files.ts';
 
 export interface NovelMetadataV1 {
   schemaVersion: 1;
@@ -119,18 +120,14 @@ function noLinks(path: string): void {
 }
 function readBytes(path: string, limit: number): Buffer {
   noLinks(path);
-  const info = lstatSync(path);
-  if (!info.isFile()) throw problem(400, 'Expected a regular work file');
-  if (info.size > limit) throw problem(413, 'Work file exceeds byte limit');
-  const descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const opened = fstatSync(descriptor);
-    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino) throw problem(400, 'Work file changed while opening');
-    if (opened.size > limit) throw problem(413, 'Work file exceeds byte limit');
-    const bytes = readFileSync(descriptor);
-    if (bytes.length > limit) throw problem(413, 'Work file exceeds byte limit');
-    return bytes;
-  } finally { closeSync(descriptor); }
+  try { return readVerifiedRegularFileSync(path, limit).bytes; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') throw error;
+    if (/byte limit/i.test((error as Error).message)) throw problem(413, 'Work file exceeds byte limit');
+    if (/changed|descriptor was closed/i.test((error as Error).message)) throw problem(400, 'Work file changed while reading');
+    throw problem(400, 'Expected a non-symbolic regular work file');
+  }
 }
 export function readNovelMetadata(path: string): NovelMetadataV1 {
   let value: unknown;
