@@ -53,7 +53,7 @@ test('one workspace bridges current clients into indexed delta history during up
   try {
     assert.deepEqual(result(await f.get(f.second)), f.initial); assert.notEqual(f.scope.workspaceId, f.scope.epoch);
     const caps = (await f.app.inject('/api/v1/capabilities')).json();
-    assert.equal(caps.userStateVersion, 1); assert.equal(caps.userStateCurrentVersion, 2); assert.equal(caps.readingStateVersion, 1);
+    assert.equal(caps.userStateVersion, 1); assert.equal(caps.userStateBulkVersion, 1); assert.equal(caps.userStateCurrentVersion, 2); assert.equal(caps.readingStateVersion, 1);
     assert.equal((await f.get()).headers['cache-control'], 'no-store');
     const workspaceReply = await f.app.inject({ url: '/api/v1/user-state', headers: f.headers });
     assert.equal(workspaceReply.statusCode, 200, workspaceReply.body);

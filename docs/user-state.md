@@ -26,9 +26,13 @@ An operation contains an operation UUID, entity, observed base revision, value,
 and optional soft-seed flag. A record contains the entity/value, assigned revision,
 operation UUID, authenticated device author, and server timestamp.
 
-A page or merge batch contains at most 200 records or operations. Requests and
-responses are limited to 32 MiB. Oversized merge responses roll back atomically so
-the client can retry the same immutable operations in smaller batches.
+Bulk-capable clients use the same array-shaped messages for any item count that
+fits the byte budget. Requests and responses are limited to 32 MiB; reads stop at
+the response byte boundary and merges accept every operation present in the
+bounded request body. Oversized merge responses roll back atomically so the
+client can retry the same immutable operations in smaller byte-sized batches.
+The server advertises userStateBulkVersion 1; older clients may continue to send
+their legacy 200-item pages.
 
 ## Database model and cost
 
