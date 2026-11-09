@@ -20,7 +20,8 @@ import { consoleHeaders, deviceHeaders } from './access.ts';
 const work = (sourceNovelId = 'novel-1') => ({ pluginId: 'example-source', sourceNovelId, novelPath: `/novel/${sourceNovelId}`, name: 'A work' });
 const library = (id = 'novel-1'): UserStateEntity => ({ kind: 'library', work: work(id) });
 const reading = (id = 'novel-1'): UserStateEntity => ({ kind: 'reading', work: work(id), chapter: { chapterPath: '/chapter/1' } });
-const bookmark = (): UserStateEntity => ({ kind: 'bookmark', work: work(), chapter: { chapterPath: '/chapter/1' } });
+const bookmark = (id = 'novel-1'): UserStateEntity => ({ kind: 'bookmark', work: work(id), chapter: { chapterPath: '/chapter/1' } });
+const resume = (id = 'novel-1'): UserStateEntity => ({ kind: 'resume', work: work(id) });
 const category = (id: string): UserStateEntity => ({ kind: 'category', categoryId: id });
 const membership = (id: string): UserStateEntity => ({ kind: 'membership', work: work(), categoryId: id });
 const item = (entity: UserStateEntity, value: UserStateValue): UserStateCurrentItem => ({ entity, value });
@@ -142,10 +143,16 @@ test('delta category renames move compatibility memberships and stale snapshots 
   } finally { await f.close(); }
 });
 
-test('startup imports deployed current rows into delta tables exactly once', async () => {
+test('startup imports current rows, closes stale delta positives, and runs exactly once', async () => {
   const f = await fixture();
   let restarted: Awaited<ReturnType<typeof buildApp>> | undefined;
   const migrated = item(library('migrated-current'), { inLibrary: true, addedAt: 7 });
+  const staleItems: UserStateCurrentItem[] = [
+    item(library('stale-library'), { inLibrary: true, addedAt: 3 }),
+    item(reading('stale-reading'), { progress: 55, unread: false, readAt: 5 }),
+    item(bookmark('stale-bookmark'), { bookmarked: true }),
+    item(resume('stale-resume'), { chapter: { chapterPath: '/chapter/1' }, anchor: null, openedAt: 5 }),
+  ];
   const readDelta = async (app: Awaited<ReturnType<typeof buildApp>>) => {
     const workspaceReply = await app.inject({ url: '/api/v1/user-state', headers: f.headers });
     assert.equal(workspaceReply.statusCode, 200, workspaceReply.body);
@@ -155,6 +162,11 @@ test('startup imports deployed current rows into delta tables exactly once', asy
     assert.equal(pageReply.statusCode, 200, pageReply.body);
     return parseUserStateReadResponse(pageReply.json());
   };
+  const latest = (records: ReturnType<typeof parseUserStateReadResponse>['records']) => {
+    const result = new Map<string, (typeof records)[number]>();
+    for (const record of records) result.set(userStateEntityKey(record.entity), record);
+    return result;
+  };
   try {
     await f.app.close();
     const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
@@ -162,22 +174,53 @@ test('startup imports deployed current rows into delta tables exactly once', asy
       db.exec('DELETE FROM user_state_delta_bridge_meta; DELETE FROM user_state_changes; DELETE FROM user_state_records; DELETE FROM user_state_operations');
       db.prepare('INSERT INTO user_state_current_records(entity_key,kind,item) VALUES(?,?,?)')
         .run(userStateEntityKey(migrated.entity), migrated.entity.kind, JSON.stringify(migrated));
+      const change = db.prepare("INSERT INTO user_state_changes(entity_key,record) VALUES(?,'{}')");
+      const save = db.prepare(`INSERT INTO user_state_records(
+        entity_key,kind,category_name,category_deleted,membership_category_id,membership_included,revision,record
+      ) VALUES(?,?,?,?,?,?,?,?)`);
+      const finish = db.prepare('UPDATE user_state_changes SET record=? WHERE revision=?');
+      for (const stale of staleItems) {
+        const key = userStateEntityKey(stale.entity);
+        const revision = Number(change.run(key).lastInsertRowid);
+        const record = { ...stale, revision, operationId: `old-${revision}`, updatedAt: 1,
+          deviceId: 'old-device', deviceName: 'Old device' };
+        const serialized = JSON.stringify(record);
+        save.run(key, stale.entity.kind, null, null, null, null, revision, serialized);
+        finish.run(serialized, revision);
+      }
     } finally { db.close(); }
 
     restarted = await buildApp({ dataDir: f.dataDir });
     let page = await readDelta(restarted);
-    assert.equal(page.records.length, 1); assert.deepEqual(page.records[0].value, migrated.value);
+    let records = latest(page.records);
+    assert.deepEqual(records.get(userStateEntityKey(migrated.entity))?.value, migrated.value);
+    assert.deepEqual(records.get(userStateEntityKey(staleItems[0].entity))?.value, { inLibrary: false, addedAt: null });
+    assert.deepEqual(records.get(userStateEntityKey(staleItems[1].entity))?.value, { progress: 0, unread: true, readAt: null });
+    assert.deepEqual(records.get(userStateEntityKey(staleItems[2].entity))?.value, { bookmarked: false });
+    assert.deepEqual(records.get(userStateEntityKey(staleItems[3].entity))?.value, { chapter: null, anchor: null, openedAt: null });
+
+    const staleReply = await restarted.inject({ method: 'POST', url: '/api/v1/user-state/current', headers: f.second,
+      payload: { ...f.scope, items: staleItems } });
+    assert.equal(staleReply.statusCode, 200, staleReply.body);
+    const current = parseUserStateCurrentSnapshot(staleReply.json());
+    for (const stale of staleItems) assert.equal(find(current.items, stale.entity), undefined);
     await restarted.close(); restarted = undefined;
 
     const changed = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    let changeCount = 0;
     try {
       assert.equal(changed.prepare('SELECT count(*) AS n FROM user_state_delta_bridge_meta').get()?.n, 1);
+      changeCount = Number(changed.prepare('SELECT count(*) AS n FROM user_state_changes').get()?.n);
       changed.prepare('UPDATE user_state_current_records SET item=? WHERE entity_key=?')
         .run(JSON.stringify({ ...migrated, value: { inLibrary: true, addedAt: 99 } }), userStateEntityKey(migrated.entity));
     } finally { changed.close(); }
     restarted = await buildApp({ dataDir: f.dataDir });
     page = await readDelta(restarted);
-    assert.equal(page.records.length, 1); assert.deepEqual(page.records[0].value, migrated.value);
+    records = latest(page.records);
+    assert.deepEqual(records.get(userStateEntityKey(migrated.entity))?.value, migrated.value);
+    const finalDb = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'), { readOnly: true });
+    try { assert.equal(finalDb.prepare('SELECT count(*) AS n FROM user_state_changes').get()?.n, changeCount); }
+    finally { finalDb.close(); }
   } finally { await restarted?.close(); await f.close(); }
 });
 

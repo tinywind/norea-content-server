@@ -132,6 +132,7 @@ function positiveLegacy(record: { entity: UserStateEntity; value: unknown }): bo
     case 'bookmark': return value.bookmarked === true;
     case 'category': return value.deleted === false;
     case 'membership': return value.included === true;
+    case 'reading': return Number(value.progress) > 0 || value.unread === false || value.readAt !== null;
     case 'resume': return value.chapter !== null;
     default: return true;
   }
@@ -291,11 +292,10 @@ export function mirrorDeltaRecordToCurrent(db: DatabaseSync, entity: UserStateEn
     .run(key, item.entity.kind, canonicalUserStateJson(item));
 }
 
-/** Import the deployed server's v2 current rows once, then bridge only touched records. */
-export function mirrorCurrentItemsToDelta(
-  db: DatabaseSync, incoming: readonly UserStateCurrentItem[], authoritative = false,
+function mirrorMappedCurrentItemsToDelta(
+  db: DatabaseSync, incoming: readonly UserStateCurrentItem[], authoritative: boolean,
 ): void {
-  for (const item of mappedCurrentItems(db, incoming)) {
+  for (const item of incoming) {
     const current = deltaRecord(db, item.entity);
     if (!authoritative && current && !positiveLegacy(current)) {
       mirrorDeltaRecordToCurrent(db, current.entity, current.value);
@@ -305,6 +305,32 @@ export function mirrorCurrentItemsToDelta(
     mirrorDeltaRecordToCurrent(db, record.entity, record.value);
   }
 }
+
+/** Import or bridge positive v2 rows while preserving explicit delta tombstones. */
+export function mirrorCurrentItemsToDelta(
+  db: DatabaseSync, incoming: readonly UserStateCurrentItem[], authoritative = false,
+): void {
+  mirrorMappedCurrentItemsToDelta(db, mappedCurrentItems(db, incoming), authoritative);
+}
+
+function authoritativeAbsenceValue(record: UserStateRecord): UserStateValue | null {
+  switch (record.entity.kind) {
+    case 'library': return { inLibrary: false, addedAt: null };
+    case 'category': {
+      const category = record.value as UserStateValueMap['category'];
+      return { ...category, deleted: true };
+    }
+    case 'membership': return { included: false };
+    case 'reading': return { progress: 0, unread: true, readAt: null };
+    case 'bookmark': return { bookmarked: false };
+    case 'resume': return { chapter: null, anchor: null, openedAt: null };
+    // Version 1 has no composition-deletion value. Current v2 never removed a
+    // stored composition, so retain a legacy composition rather than inventing one.
+    case 'composition': return null;
+  }
+}
+
+/** Import the deployed server's v2 rows once and close stale v1 positives with explicit revisions. */
 export function initializeUserStateDeltaBridge(db: DatabaseSync): void {
   if (!db.isTransaction) throw new Error('Current-to-delta user-state migration requires the schema transaction');
   db.exec(deltaBridgeSchema);
@@ -312,7 +338,17 @@ export function initializeUserStateDeltaBridge(db: DatabaseSync): void {
   const items: UserStateCurrentItem[] = [];
   for (const row of db.prepare('SELECT item FROM user_state_current_records ORDER BY kind,entity_key').iterate())
     items.push(parseUserStateCurrentItem(JSON.parse(row.item as string)));
-  mirrorCurrentItemsToDelta(db, items, true);
+  const mapped = mappedCurrentItems(db, items);
+  mirrorMappedCurrentItemsToDelta(db, mapped, true);
+  const retained = new Set(mapped.map(item => userStateEntityKey(item.entity)));
+  const stale: UserStateRecord[] = [];
+  for (const row of db.prepare('SELECT record FROM user_state_records ORDER BY kind,entity_key').iterate())
+    stale.push(JSON.parse(row.record as string) as UserStateRecord);
+  for (const record of stale) {
+    if (retained.has(userStateEntityKey(record.entity)) || !positiveLegacy(record)) continue;
+    const value = authoritativeAbsenceValue(record);
+    if (value) publishCurrentItemToDelta(db, { entity: record.entity, value });
+  }
   db.prepare('INSERT INTO user_state_delta_bridge_meta(singleton,imported_current_v2) VALUES(1,1)').run();
 }
 

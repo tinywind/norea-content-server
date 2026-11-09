@@ -104,9 +104,14 @@ The compatibility endpoint remains available temporarily:
 
 At the first upgraded server start, existing `user_state_current_records` are
 copied once into `user_state_records` and `user_state_changes` inside the additive
-schema transaction. A completion marker prevents repeated full conversion.
-Existing content, devices, credentials, settings, workspace identity, current
-rows, prior delta rows, and operation receipts remain intact.
+schema transaction. The deployed current snapshot is authoritative for this
+one-time handoff: older positive delta records absent from it receive explicit
+library/removal, reading-reset, unbookmark, membership/category-deletion, or
+resume-clear revisions instead of being silently resurrected. Composition records
+are retained because protocol version 1 has no composition-deletion value. A
+completion marker prevents repeated full conversion. Existing content, devices,
+credentials, settings, workspace identity, current rows, prior delta rows, and
+operation receipts remain intact.
 
 During the rollout, delta writes are projected back into the current table so an
 older client can still read positive values. Explicit negative delta values are
