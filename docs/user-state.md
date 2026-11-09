@@ -1,47 +1,147 @@
-# Shared current user state v2
+# Shared user-state delta protocol
 
-User-state sharing exchanges a positive snapshot of the current SQLite values. It does not replay an operation journal, copy a database file, replace localStorage, or interpret missing rows as deletion. Capabilities advertise both `userStateVersion: 2` and `userStateCurrentVersion: 2`; legacy user-state discovery, `/read` and `/merge` return 426 so old clients cannot publish an unnoticed second history.
+The content server stores personal library and reading changes as indexed records,
+not as one repeatedly merged JSON snapshot. Registered, unblocked devices share a
+single persistent workspace UUID and epoch. Device names are audit labels; they
+are not storage partitions.
 
-## Scope and API
+The server advertises:
 
-Every registered, unblocked device shares one persistent workspace UUID and a separate persistent epoch UUID. Device names are labels and never storage slots. Console sessions and anonymous readers cannot use current-state endpoints. Device registration, original content access, private reading profiles and device recovery archives keep their existing authentication and data.
+- `userStateVersion: 1` for the normal delta protocol.
+- `userStateCurrentVersion: 2` temporarily for deployed older clients during the
+  transition.
 
-Both `GET /api/v1/user-state/current` and `POST /api/v1/user-state/current` return `{version:2,workspaceId,epoch,items:[{entity,value}]}`. POST accepts this same shape. A workspace or epoch mismatch returns 409 without discarding client state. Responses use `Cache-Control: no-store`.
+Anonymous requests, console sessions, blocked devices, and requests for another
+workspace are rejected. Responses use `Cache-Control: no-store`.
 
-GET obtains the initial workspace and current snapshot. A bound client exports its real current SQLite values, POSTs once and applies the returned merged current snapshot. There are no operation IDs, base revisions, per-operation acknowledgements or change-feed pages. A complete POST is validated before one SQLite write transaction. Both request and merged response are limited to 32 MiB and 100,000 items; a response overflow rolls the transaction back and retains the previous readable snapshot. Authentication is checked again after the body arrives.
+## Delta API
 
-## Current-value merge
+| Endpoint | Contract |
+| --- | --- |
+| `GET /api/v1/user-state` | Returns protocol version, workspace, epoch, and current head revision |
+| `POST /api/v1/user-state/read` | Returns ordered records after a cursor through a frozen upper revision |
+| `POST /api/v1/user-state/merge` | Applies immutable operations and returns exactly one receipt per operation |
 
-| Kind | Accepted current value | Merge rule |
-| --- | --- | --- |
-| library | `inLibrary:true`, nullable `addedAt` | Earliest nonnull added time |
-| category | Current trimmed name, sort, `deleted:false` | Exact name identity; minimum sort |
-| membership | `included:true` | Add the named category relation |
-| bookmark | `bookmarked:true` | Add the bookmark |
-| reading | Progress, unread and readAt tuple | Later readAt wins the whole tuple; equal times use maximum progress and unread only if both unread |
-| resume | Nonnull portable chapter, optional anchor, openedAt | Later openedAt, then later anchor savedAt, then canonical JSON tie-break |
-| composition | Valid nonnull v1 composition document | Later document updatedAt owns manual choices; deterministic equal-time tie, with safe exact-source overlay |
+An operation contains an operation UUID, entity, observed base revision, value,
+and optional soft-seed flag. A record contains the entity/value, assigned revision,
+operation UUID, authenticated device author, and server timestamp.
 
-Absence, local removal, unbookmarking, category deletion and clearing resume do not delete another device's positive state. Negative membership/library/bookmark/category payloads are rejected. An explicit newer reading timestamp may carry lower progress; an older full snapshot cannot regress it. Reading/open/added times use Unix seconds; scroll-anchor savedAt and composition updatedAt use milliseconds.
+A page or merge batch contains at most 200 records or operations. Requests and
+responses are limited to 32 MiB. Oversized merge responses roll back atomically so
+the client can retry the same immutable operations in smaller batches.
 
-Categories use `name-` plus the SHA-256 of the exact trimmed UTF-8 current name. The request's category ID-to-name mapping canonicalizes its memberships. A renamed category is a separate positive name; an old device can retain its old name. Neither unrelated names nor local integer IDs overwrite one another. No permanent alias redirects a reused old category UUID to a new name.
+## Database model and cost
 
-Work identity is plugin ID plus the ASCII-case-folded source novel ID. Names, local row IDs and user-visible chapter numbers are not identities. Work-scoped values require a resolved source ID. Chapters use their stable path scoped to the work; recovered numeric folder placeholders are rejected. Synthetic composed/source paths additionally require an exact composition entry ID. Conflicting synthetic ownership returns 409 without a partial write. Provider paths do not require a device-generated entry UUID.
+The protocol uses the following SQLite tables:
 
-Shared composition choices retain primary sources, manual order, exclusions, user titles, IDs and storage assignments. Safe overlay retains exact provider facts and default target-provider discoveries. Ambiguous physical storage is rejected. Physical source chapter numbers and user composition order are distinct.
+- `user_state_records`: one current row per portable entity key.
+- `user_state_changes`: append-only increasing revisions used by cursor reads.
+- `user_state_operations`: idempotent operation receipts.
+- `user_state_category_aliases`: stable category-ID canonicalization.
 
-## Additive upgrade and retained data
+Normal merge work is proportional to the submitted operations: one indexed entity
+lookup, validation, and one record upsert/change row per accepted value. It does
+not scan or merge the accumulated user-state document.
 
-`user_state_current_meta` and `user_state_current_records` extend the existing database without changing its original schema checksum. The first upgrade imports positive current records from v1 `user_state_records` in the same transaction, normalizing category names and memberships. Original v1 records, operations, changes, category aliases and namespace are retained unchanged and are no longer writable through public v1 routes. Legacy private reading profiles are never imported. Catalog rows, credentials, settings, content files and device backups are retained. There is no reset route or automatic expiry.
+Category membership rows additionally store `membership_category_id` and
+`membership_included` in indexed columns. Deleting a category queries only the
+included memberships belonging to that category and writes an explicit false
+revision for each affected relation. This work is proportional to the relations
+that must actually change, not to all personal-state records.
+
+Reads use the `user_state_changes` revision primary key. A returning device asks
+only for revisions after its saved cursor. The first connection may page through
+existing history once; subsequent checks process only later changes.
+
+## Merge behavior
+
+Each entity is an independent conflict unit: library membership, category,
+work/category membership, chapter reading tuple, bookmark, work resume position,
+or complete chapter-composition document.
+
+A command is applied only when its base revision matches the current entity
+revision. An equivalent value converges without creating another revision. A
+stale different value returns an explicit conflict while preserving the current
+record. Soft seeds fill only absent entities and never replace a record or
+negative value.
+
+Removal, unread/reset progress, unbookmarking, category deletion, membership
+removal, and resume clearing are first-class values. They are never inferred from
+absence and never expire. Operation IDs are immutable and idempotent across the
+workspace; replaying the same bytes returns the original receipt, while reusing an
+ID with different bytes is rejected before any batch write occurs.
+
+Category names are unique while active. A new category with an existing exact
+name can alias to the canonical stable ID. Deleting a category advances included
+membership records to false, preventing stale offline inclusion from resurrecting
+it. Composition values retain their complete provenance, storage identities,
+manual order, labels, and exclusions.
+
+## Portable identities and privacy
+
+Works use plugin ID plus provider-owned work ID. Chapters use their exact provider
+path scoped to the work; composed chapters additionally require their composition
+entry ID. Local database integers, titles, displayed chapter numbers, and folder
+numbers are not portable identities.
+
+Recovered source chapters may use an opaque `norea-stored:` identity containing a
+content digest and encoded storage path. Applying such state requires exact local
+ownership and body/media verification. Missing or ambiguous metadata remains
+pending on the client rather than being guessed by name or number.
+
+The protocol does not contain credentials, VPN settings, storage roots, plugin
+code, download queues, cached chapter bodies, images, or viewport-only state.
+Private/incognito reading is excluded by the app before operations are created.
+
+## Upgrade from current-snapshot version 2
+
+The compatibility endpoint remains available temporarily:
+
+| Endpoint | Compatibility behavior |
+| --- | --- |
+| `GET /api/v1/user-state/current` | Returns the positive current-state projection |
+| `POST /api/v1/user-state/current` | Accepts an older positive snapshot and bridges touched values into delta records |
+
+At the first upgraded server start, existing `user_state_current_records` are
+copied once into `user_state_records` and `user_state_changes` inside the additive
+schema transaction. The deployed current snapshot is authoritative for this
+one-time handoff: older positive delta records absent from it receive explicit
+library/removal, reading-reset, unbookmark, membership/category-deletion, or
+resume-clear revisions instead of being silently resurrected. Composition records
+are retained because protocol version 1 has no composition-deletion value. A
+completion marker prevents repeated full conversion. Existing content, devices,
+credentials, settings, workspace identity, current rows, prior delta rows, and
+operation receipts remain intact.
+
+During the rollout, delta writes are projected back into the current table so an
+older client can still read positive values. Explicit negative delta values are
+protected from stale positive snapshots. Stable category IDs are mapped to current
+name hashes in dedicated bridge tables; rename history is retained so an old
+snapshot cannot rename a category back or restore memberships under its previous
+name.
+
+The compatibility path is transitional. New apps use only the delta endpoints and
+do not upload the accumulated state snapshot.
 
 ## Completed migration reconciliation
 
-`workMigrationReconcileVersion:1` advertises `POST /api/v1/works/:id/migration-reconcile`. Its body is `{legacyOperationId,legacyRequest,current}`: the exact originally completed finalize request plus a new UUID request with fresh snapshots, full chapter decisions and current path-resolved physical numbers. The server verifies the immutable receipt hash and target, exact original source-to-target decisions, complete current source coverage and the existing body/asset preservation fences before retirement. Unknown new source bodies, changed targets or stale numbers cause 409 and leave source data intact. A keep-target/delete-source decision may discard only the exact captured legacy source revision. Copy-source verifies actual current body and stored assets against the target.
+`workMigrationReconcileVersion: 1` advertises
+`POST /api/v1/works/:id/migration-reconcile`. Its body includes the exact legacy
+receipt request and a separately reviewed current request. The server verifies
+source/target identity, complete chapter coverage, storage numbers, selected body
+and asset inventories, and existing preservation decisions before retiring a
+restored source.
 
-A fresh user-reviewed reconciliation may additionally supply `reviewedCurrentState:true`. Automatic clients never send this field. The explicit mode accepts reindexed source IDs and fresh keep-target decisions while retaining the same legacy receipt, source/target identity, current full coverage, selected target inventory and body/asset verification. It does not override prior explicit restoration.
+The new lineage records both the new operation ID and legacy operation ID.
+Retirement, receipt, and lineage commit atomically. A deliberate restoration must
+name the active migration operation and persists revocation; routine uploads or
+rescans cannot silently reverse either a completed retirement or an explicit
+restore.
 
-The new lineage carries its new operationId and the exact legacyOperationId. Its source deletion, receipt and lineage commit atomically, and replay uses the new immutable receipt. `?restore=true` alone cannot reactivate a migrated source, including older receipt-only retirements. A deliberate restore supplies `restoreMigrationOperationId` naming the current retirement; it persists revocation and deactivates active lineage. Automatic reconciliation of that legacy operation is thereafter rejected. Existing receipts are not rewritten, and routine uploads cannot undo a user's deliberate restoration or a completed retirement.
+## Deployment and recovery
 
-## Active migration projection
-
-GET and POST project current positive values through active exact source-to-target lineage, including chains. Library and membership values follow the exact work identity; reading, bookmarks and resume require an exact chapter-decision path. Deleted, unmapped or ambiguous destinations are withheld without guessing a title or chapter number. A source composition is retained internally and never transplanted over the target composition. Resume anchors carry over only with verified copy-source payloads; another selected body clears the old anchor. Successfully mapped current keys converge on the target and use the normal type-specific current-value merge. Original v1 rows remain unchanged. A restored/revoked lineage is not an active projection edge.
+The tables and columns above are added without replacing the installation's schema
+checksum or deleting existing rows. Before deploying a database-changing server
+image, create a consistent SQLite backup using the backup API (or stop writes for
+a full persistent-state copy), validate integrity and representative records, and
+retain the previous image digest for rollback.

@@ -8,9 +8,10 @@ renamed to `0.2`; it is not a second release branch.
 
 [docker-publish.yml](../.github/workflows/docker-publish.yml) runs on pull
 requests, pushes to branches other than `dependabot/**`, and manual **Run
-workflow** dispatches. Dependabot changes are validated by the pull-request
-event, without a duplicate push run that mistakes their slash-containing branch
-name for a publishing tag. Manual runs on Dependabot branches also validate only.
+workflow** dispatches. Pull requests and ordinary feature-branch pushes validate
+only. A push or manual run publishes only when the exact branch name is a version
+branch such as `0.2` or `0.3`. Dependabot changes are validated by the pull-request
+event, and manual runs on Dependabot branches also validate only.
 The workflow uses GitHub-hosted Ubuntu runners, Node.js 24, and pnpm 11.25.0 with a
 frozen lockfile.
 The first job runs type checks, the complete server test suite, and the console
@@ -56,12 +57,10 @@ tinywind0/norea-content-server:latest
 ```
 
 For the current branch these are `:0.2` and `:latest`. A future `0.3` branch uses
-`:0.3` automatically. Branch names must already be valid Docker tags: 1–128
-ASCII letters, digits, underscores, periods, or hyphens, beginning with a letter,
-digit, or underscore. The branch name `latest` is reserved. A name containing
-`/`, for example, fails publication validation rather than being silently
-rewritten into a potentially colliding tag. Pull requests may still use such
-branch names because they do not publish.
+`:0.3` automatically. Publication is limited to exact `major.minor` numeric branch
+names, which are already unambiguous Docker tags. Other branch names, including
+feature branches containing `/`, run validation only and are never rewritten into
+a tag or allowed to replace `latest`.
 
 `latest` means the last successful publication across branches. It does not mean
 the numerically highest version. Match the app's contract to the version branch
@@ -80,8 +79,8 @@ If the branch advances after its version tag has been pushed, that run leaves
 
 ## Completing a server change
 
-1. Commit and push the tested source on its version branch.
-2. Wait for the GitHub Actions run for that exact commit. Read the publication
+1. Merge the validated pull request into its version branch.
+2. Wait for the version-branch GitHub Actions run for that exact merge commit. Read the publication
    summary and record its branch tag, full source commit, and `sha256` digest.
    A failed validation, failed publication, or stale-run skip is not a release.
 3. Recreate the tinywind-SER container from the published digest, preserving its

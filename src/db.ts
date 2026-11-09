@@ -1,4 +1,4 @@
-import { initializeUserStateCurrent } from './user-state-current-store.ts';
+import { initializeUserStateCurrent, initializeUserStateDeltaBridge } from './user-state-current-store.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -102,6 +102,7 @@ const userStateSchema = `
     );
     CREATE TABLE IF NOT EXISTS user_state_records (
       entity_key TEXT PRIMARY KEY, kind TEXT NOT NULL, category_name TEXT, category_deleted INTEGER,
+      membership_category_id TEXT, membership_included INTEGER,
       revision INTEGER NOT NULL, record TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS user_state_record_kinds ON user_state_records(kind);
@@ -119,6 +120,19 @@ const userStateSchema = `
     );
 `;
 
+function ensureUserStateRecordIndexes(db: DatabaseSync): void {
+  const columns = new Set((db.prepare('PRAGMA table_info(user_state_records)').all() as { name: string }[]).map(column => column.name));
+  const needsBackfill = !columns.has('membership_category_id') || !columns.has('membership_included');
+  if (!columns.has('membership_category_id')) db.exec('ALTER TABLE user_state_records ADD COLUMN membership_category_id TEXT');
+  if (!columns.has('membership_included')) db.exec('ALTER TABLE user_state_records ADD COLUMN membership_included INTEGER');
+  db.exec(`CREATE INDEX IF NOT EXISTS user_state_membership_categories
+    ON user_state_records(membership_category_id,membership_included) WHERE kind='membership'`);
+  if (needsBackfill) db.exec(`UPDATE user_state_records SET
+    membership_category_id=json_extract(record,'$.entity.categoryId'),
+    membership_included=CAST(json_extract(record,'$.value.included') AS INTEGER)
+    WHERE kind='membership'`);
+}
+
 export function openDatabase(dataDir: string): DatabaseSync {
   mkdirSync(resolve(dataDir), { recursive: true });
   const db = new DatabaseSync(join(dataDir, 'metadata.sqlite'));
@@ -135,8 +149,10 @@ export function openDatabase(dataDir: string): DatabaseSync {
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
     transaction(db, () => {
       db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(userStateSchema);
+      ensureUserStateRecordIndexes(db);
       db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
       initializeUserStateCurrent(db);
+      initializeUserStateDeltaBridge(db);
     });
     return db;
   } catch (error) { db.close(); throw error; }
