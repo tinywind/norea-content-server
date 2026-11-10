@@ -130,7 +130,9 @@ function applyOperation(db: DatabaseSync, operation: UserStateOperation, writer:
     operationId: operation.operationId, status, current: record,
     ...(reason === undefined ? {} : { reason }), ...(canonical.categoryAlias ? { categoryAlias: canonical.categoryAlias } : {}),
   });
-  if (ownershipConflict(current, entity)) return result('conflict', current, 'chapter-identity-mismatch');
+  if (ownershipConflict(current, entity)) {
+    throw problem(409, 'User state: chapter identity mismatch requires metadata reconciliation');
+  }
   if (operation.seed && current) return result('seed-skipped');
   if (entity.kind === 'category') {
     const value = operation.value as CategoryValue;
@@ -141,16 +143,24 @@ function applyOperation(db: DatabaseSync, operation: UserStateOperation, writer:
         db.prepare('INSERT INTO user_state_category_aliases(alias_id,canonical_id) VALUES(?,?)').run(entity.categoryId, to);
         return { operationId: operation.operationId, status: 'aliased', current: sameName, categoryAlias: { from: entity.categoryId, to } };
       }
-      return result('conflict', current, 'category-name-conflict');
+      throw problem(409, 'User state: category name is already owned by another category');
     }
   }
   if (entity.kind === 'membership' && (operation.value as { included: boolean }).included) {
-    const category = storedRecord(db, { kind: 'category', categoryId: entity.categoryId });
-    if (!category) return result('conflict', current, 'category-missing');
-    if ((category.value as CategoryValue).deleted) return result('conflict', current, 'category-deleted');
+    const categoryEntity: UserStateEntity = { kind: 'category', categoryId: entity.categoryId };
+    const category = storedRecord(db, categoryEntity);
+    if (!category) throw problem(409, 'User state: membership category is missing');
+    if ((category.value as CategoryValue).deleted) {
+      const restoreId = 'category-restore:' + createHash('sha256')
+        .update(JSON.stringify([writer.id, operation.operationId, entity.categoryId])).digest('hex');
+      const value = { ...(category.value as CategoryValue), deleted: false };
+      publish(db, { operationId: restoreId, entity: categoryEntity, baseRevision: category.revision, value }, categoryEntity, writer);
+    }
   }
   if (current && canonicalize(current.value) === canonicalize(operation.value)) return result('unchanged');
-  if ((current?.revision ?? 0) !== operation.baseRevision) return result('conflict', current, 'revision-mismatch');
+  // One workspace represents one person's state across devices. Explicit edits are
+  // ordered by the server commit revision; a stale observed base never creates a
+  // user-facing conflict. baseRevision remains diagnostic/idempotency metadata.
   // Keep an already known optional ownership proof when an older client lacks it.
   const publishedEntity = (entity.kind === 'reading' || entity.kind === 'bookmark') &&
     (current?.entity.kind === 'reading' || current?.entity.kind === 'bookmark') && !entity.chapter.compositionEntryId && current.entity.chapter.compositionEntryId
@@ -188,7 +198,7 @@ export function registerUserState(app: FastifyInstance, db: DatabaseSync): void 
     if (hasMore && records.length === 0) throw problem(413, 'User state: a stored record exceeds the response budget');
     return { version: 1, ...scope, headRevision: head, through, nextCursor: hasMore ? cursor : through, hasMore, records };
   });
-  app.post('/api/v1/user-state/merge', { onRequest, bodyLimit: USER_STATE_MAX_BYTES, schema: { security: [{ bearerAuth: [] }], body: { type: 'object' }, description: 'Apply immutable idempotent user edits with per-entity revisions. A soft seed never replaces existing state; conflicting edits remain explicit.' } }, async request => {
+  app.post('/api/v1/user-state/merge', { onRequest, bodyLimit: USER_STATE_MAX_BYTES, schema: { security: [{ bearerAuth: [] }], body: { type: 'object' }, description: 'Apply immutable idempotent single-user edits. Explicit edits use server-revision last-write-wins; soft seeds never replace existing state.' } }, async request => {
     const body = object(request.body, ['workspaceId', 'epoch', 'operations']);
     const scope = assertNamespace(db, body);
     if (!Array.isArray(body.operations)) throw problem(400, 'User state: expected an operations array');

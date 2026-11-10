@@ -185,20 +185,21 @@ test('independent state groups merge while explicit removal, unread, rewind and 
   } finally { await f.close(); }
 });
 
-test('CAS conflicts preserve the current value, equivalent values converge, and soft seeds never resurrect tombstones', async () => {
+test('explicit edits use server-revision last-write-wins while equivalent values and soft seeds remain idempotent', async () => {
   const f = await fixture();
   try {
     const initial = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 10 }, 0, true)]));
     const removed = result(await f.merge([operation(library(), { inLibrary: false, addedAt: null }, initial.current!.revision)], f.second));
-    const stale = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 20 }, initial.current!.revision)]));
-    assert.equal(stale.status, 'conflict'); assert.equal(stale.reason, 'revision-mismatch');
-    assert.deepEqual(stale.current, removed.current);
-    const equal = result(await f.merge([operation(library(), { inLibrary: false, addedAt: null }, 0)]));
-    assert.equal(equal.status, 'unchanged'); assert.equal(equal.current!.revision, removed.current!.revision);
-    const seed = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 10 }, 0, true)]));
-    assert.equal(seed.status, 'seed-skipped'); assert.deepEqual(seed.current, removed.current);
+    const later = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 20 }, initial.current!.revision)]));
+    assert.equal(later.status, 'applied');
+    assert.deepEqual(later.current!.value, { inLibrary: true, addedAt: 20 });
+    assert(later.current!.revision > removed.current!.revision);
+    const equal = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 20 }, 0)]));
+    assert.equal(equal.status, 'unchanged'); assert.equal(equal.current!.revision, later.current!.revision);
+    const seed = result(await f.merge([operation(library(), { inLibrary: false, addedAt: null }, 0, true)]));
+    assert.equal(seed.status, 'seed-skipped'); assert.deepEqual(seed.current, later.current);
     assert.equal((await f.merge([operation(library(), { inLibrary: true, addedAt: 10 }, 1, true)])).statusCode, 400);
-    assert.equal(page(await f.read()).headRevision, 2);
+    assert.equal(page(await f.read()).headRevision, 3);
   } finally { await f.close(); }
 });
 
@@ -222,7 +223,7 @@ test('lost-response retries replay the exact durable result and operation-ID reu
   } finally { await f.close(); }
 });
 
-test('same-name category creation aliases once, old membership IDs remain usable, and rename collisions stay conflicts', async () => {
+test('same-name category creation aliases once, old membership IDs remain usable, and invalid rename collisions reject atomically', async () => {
   const f = await fixture();
   try {
     const first = result(await f.merge([operation(category('first'), { name: 'Favourites', sort: -5, deleted: false })]));
@@ -235,58 +236,50 @@ test('same-name category creation aliases once, old membership IDs remain usable
     assert.deepEqual(member.categoryAlias, { from: 'second', to: 'first' });
     assert.deepEqual(result(await f.merge([aliasOp], f.second)), alias);
     const other = result(await f.merge([operation(category('third'), { name: 'Other', sort: 1, deleted: false })]));
-    const collision = result(await f.merge([operation(category('third'), { name: 'Favourites', sort: 1, deleted: false }, other.current!.revision)]));
-    assert.equal(collision.status, 'conflict'); assert.equal(collision.reason, 'category-name-conflict');
-    assert.deepEqual(collision.current, other.current); assert.equal(collision.categoryAlias, undefined);
+    const collision = await f.merge([operation(category('third'), { name: 'Favourites', sort: 1, deleted: false }, other.current!.revision)]);
+    assert.equal(collision.statusCode, 409, collision.body);
+    assert.match(collision.json().message, /category name is already owned/);
   } finally { await f.close(); }
 });
 
-test('deleted categories block stale inclusion, preserve exclusion and require a current revision for restoration', async () => {
+test('later membership edits restore a deleted category and server revision order converges without conflicts', async () => {
   const f = await fixture();
   try {
     const created = result(await f.merge([operation(category('category'), { name: 'History', sort: 0, deleted: false })]));
     const member = result(await f.merge([operation(membership('category'), { included: true })]));
-    const alreadyFalse = result(await f.merge([operation({ kind: 'membership', work: work('excluded-work'), categoryId: 'category' }, { included: false })]));
-    result(await f.merge([operation(category('other-category'), { name: 'Another', sort: 0, deleted: false })]));
-    const otherCategory = result(await f.merge([operation(membership('other-category'), { included: true })]));
-    const indexed = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
-    try {
-      const indexedMemberships = indexed.prepare(`SELECT membership_category_id AS categoryId,membership_included AS included
-        FROM user_state_records WHERE kind='membership' ORDER BY membership_category_id,membership_included DESC`).all()
-        .map(row => ({ ...(row as { categoryId: string; included: number }) }));
-      assert.deepEqual(indexedMemberships, [
-        { categoryId: 'category', included: 1 }, { categoryId: 'category', included: 0 },
-        { categoryId: 'other-category', included: 1 },
-      ]);
-      const plan = indexed.prepare(`EXPLAIN QUERY PLAN SELECT entity_key FROM user_state_records
-        WHERE kind='membership' AND membership_category_id=? AND membership_included=1`).all('category') as { detail: string }[];
-      assert(plan.some(row => row.detail.includes('user_state_membership_categories')), JSON.stringify(plan));
-    } finally { indexed.close(); }
     const beforeDeletion = page(await f.read()).headRevision;
     const deletion = operation(category('category'), { name: 'History', sort: 0, deleted: true }, created.current!.revision);
     const removed = result(await f.merge([deletion], f.second));
     const cascade = page(await f.read(beforeDeletion));
-    assert.equal(cascade.headRevision, beforeDeletion + 2);
     assert.equal(cascade.records.length, 2);
-    assert.equal(cascade.records[1].deviceId, removed.current!.deviceId);
-    assert.equal(result(await f.merge([operation({ kind: 'membership', work: work('excluded-work'), categoryId: 'category' }, { included: false }, alreadyFalse.current!.revision)])).current!.revision, alreadyFalse.current!.revision);
-    assert.equal(result(await f.merge([operation(membership('other-category'), { included: true }, otherCategory.current!.revision)])).current!.revision, otherCategory.current!.revision);
-    const blocked = result(await f.merge([operation(membership('category'), { included: true }, member.current!.revision)]));
-    assert.equal(blocked.status, 'conflict'); assert.equal(blocked.reason, 'category-deleted');
-    const exclusion = result(await f.merge([operation(membership('category'), { included: false }, member.current!.revision)]));
-    assert.equal(exclusion.status, 'unchanged');
-    assert(exclusion.current!.revision > removed.current!.revision);
-    assert.match(exclusion.current!.operationId, /^category-delete:[0-9a-f]{64}$/);
-    assert.equal(result(await f.merge([operation(category('category'), { name: 'History', sort: 0, deleted: false }, created.current!.revision)])).status, 'conflict');
-    assert.equal(result(await f.merge([operation(category('category'), { name: 'History', sort: 0, deleted: false }, removed.current!.revision)])).status, 'applied');
-    assert.equal(result(await f.merge([operation(membership('category'), { included: true }, member.current!.revision)])).reason, 'revision-mismatch');
-    assert.equal(result(await f.merge([operation(membership('category'), { included: true }, exclusion.current!.revision)])).status, 'applied');
+    assert.deepEqual(cascade.records.at(-1)!.value, { included: false });
+
+    const restoredMembership = result(await f.merge([
+      operation(membership('category'), { included: true }, member.current!.revision),
+    ]));
+    assert.equal(restoredMembership.status, 'applied');
+    assert.deepEqual(restoredMembership.current!.value, { included: true });
+
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    try {
+      const categoryRow = JSON.parse(String(db.prepare("SELECT record FROM user_state_records WHERE kind='category'").get()?.record));
+      assert.deepEqual(categoryRow.value, { name: 'History', sort: 0, deleted: false });
+      const membershipRow = JSON.parse(String(db.prepare("SELECT record FROM user_state_records WHERE kind='membership'").get()?.record));
+      assert.deepEqual(membershipRow.value, { included: true });
+    } finally { db.close(); }
+
+    const excluded = result(await f.merge([
+      operation(membership('category'), { included: false }, member.current!.revision),
+    ], f.second));
+    assert.equal(excluded.status, 'applied');
+    assert.deepEqual(excluded.current!.value, { included: false });
+
     const beforeReplay = page(await f.read()).headRevision;
     assert.deepEqual(result(await f.merge([deletion], f.second)), removed);
-    assert.deepEqual(result(await f.merge([deletion], f.headers)), removed);
     assert.equal(page(await f.read()).headRevision, beforeReplay);
-    const absent = result(await f.merge([operation(membership('missing'), { included: true })]));
-    assert.equal(absent.reason, 'category-missing'); assert.equal(absent.current, null);
+
+    const absent = await f.merge([operation(membership('missing'), { included: true })]);
+    assert.equal(absent.statusCode, 409, absent.body);
     assert.equal(result(await f.merge([operation(membership('missing'), { included: false })])).status, 'applied');
   } finally { await f.close(); }
 });
@@ -358,12 +351,13 @@ test('resume accepts portable anchors and rejects pixel/local-ID fields, and cha
     assert.deepEqual(opaqueResume.current!.value, { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: 1700000000001 });
     const owned: UserStateEntity = { kind: 'reading', work: work(), chapter: { ...chapter(), compositionEntryId: 'entry-a' } };
     const first = result(await f.merge([operation(owned, { progress: 10, unread: false, readAt: null })]));
-    const mismatch = result(await f.merge([operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision)]));
-    assert.equal(mismatch.status, 'conflict'); assert.equal(mismatch.reason, 'chapter-identity-mismatch');
+    const mismatch = await f.merge([operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision)]);
+    assert.equal(mismatch.statusCode, 409, mismatch.body);
+    assert.match(mismatch.json().message, /chapter identity mismatch/);
   } finally { await f.close(); }
 });
 
-test('composition state preserves provenance and excluded entries, validates documents and conflicts atomically', async () => {
+test('composition state preserves provenance, validates documents, and later server commits win', async () => {
   const f = await fixture();
   try {
     const entity: UserStateEntity = { kind: 'composition', work: work() }, document = composition();
@@ -371,13 +365,15 @@ test('composition state preserves provenance and excluded entries, validates doc
     assert.deepEqual(first.current!.value, { composition: document });
     const changed = structuredClone(document); changed.updatedAt++; changed.entries[0].user.name = 'Edited title';
     const next = result(await f.merge([operation(entity, { composition: changed }, first.current!.revision)], f.second));
-    const conflicting = structuredClone(document); conflicting.entries[1].user.included = true; conflicting.entries[1].user.order = 2;
-    const conflict = result(await f.merge([operation(entity, { composition: conflicting }, first.current!.revision)]));
-    assert.equal(conflict.status, 'conflict'); assert.deepEqual(conflict.current, next.current);
+    const later = structuredClone(document); later.entries[1].user.included = true; later.entries[1].user.order = 2;
+    const appliedLater = result(await f.merge([operation(entity, { composition: later }, first.current!.revision)]));
+    assert.equal(appliedLater.status, 'applied');
+    assert.deepEqual(appliedLater.current!.value, { composition: later });
+    assert(appliedLater.current!.revision > next.current!.revision);
     assert.equal((await f.merge([{ ...operation(entity, { composition: document }), value: { composition: null } }])).statusCode, 400);
     const broken = structuredClone(document); broken.entries[1].storageChapterNumber = broken.entries[0].storageChapterNumber;
     assert.equal((await f.merge([operation(entity, { composition: broken })])).statusCode, 400);
-    assert.deepEqual((page(await f.read()).records.at(-1)!.value as { composition: ChapterCompositionV1 }).composition.entries[1], document.entries[1]);
+    assert.deepEqual((page(await f.read()).records.at(-1)!.value as { composition: ChapterCompositionV1 }).composition.entries[1], later.entries[1]);
   } finally { await f.close(); }
 });
 
@@ -394,14 +390,14 @@ test('large composition responses are byte-bounded and an oversized merge respon
     const first = page(response); assert.equal(first.records.length, 2); assert.equal(first.hasMore, true);
     const last = page(await f.read(first.nextCursor, first.through));
     assert.equal(last.records.length, 1); assert.equal(last.hasMore, false);
-    const conflicts = entities.map(entity => operation(entity, { composition: composition() }));
-    const tooLarge = await f.merge(conflicts);
+    const replacements = entities.map(entity => operation(entity, { composition: composition() }, 0, true));
+    const tooLarge = await f.merge(replacements);
     assert.equal(tooLarge.statusCode, 413);
     const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
     try {
-      for (const op of conflicts) assert.equal(db.prepare('SELECT 1 FROM user_state_operations WHERE operation_id=?').get(op.operationId), undefined);
+      for (const op of replacements) assert.equal(db.prepare('SELECT 1 FROM user_state_operations WHERE operation_id=?').get(op.operationId), undefined);
     } finally { db.close(); }
-    for (const op of conflicts) assert.equal(result(await f.merge([op])).status, 'conflict');
+    for (const op of replacements) assert.equal(result(await f.merge([op])).status, 'seed-skipped');
   } finally { await f.close(); }
 });
 

@@ -59,15 +59,17 @@ existing history once; subsequent checks process only later changes.
 
 ## Merge behavior
 
-Each entity is an independent conflict unit: library membership, category,
-work/category membership, chapter reading tuple, bookmark, work resume position,
-or complete chapter-composition document.
+Each entity is an independent last-write-wins register: library membership,
+category, work/category membership, chapter reading tuple, bookmark, work resume
+position, or complete chapter-composition document.
 
-A command is applied only when its base revision matches the current entity
-revision. An equivalent value converges without creating another revision. A
-stale different value returns an explicit conflict while preserving the current
-record. Soft seeds fill only absent entities and never replace a record or
-negative value.
+The workspace represents one person across devices. Explicit edits are committed
+in server arrival order and receive monotonically increasing revisions; the later
+commit for an entity wins even when its sender observed an older base revision.
+An equivalent value converges without creating another revision. `baseRevision`
+remains diagnostic and part of the immutable operation receipt, not a
+compare-and-swap rejection condition. Soft seeds fill only absent entities and
+never replace a record or negative value.
 
 Removal, unread/reset progress, unbookmarking, category deletion, membership
 removal, and resume clearing are first-class values. They are never inferred from
@@ -77,9 +79,11 @@ ID with different bytes is rejected before any batch write occurs.
 
 Category names are unique while active. A new category with an existing exact
 name can alias to the canonical stable ID. Deleting a category advances included
-membership records to false, preventing stale offline inclusion from resurrecting
-it. Composition values retain their complete provenance, storage identities,
-manual order, labels, and exclusions.
+membership records to false. A later explicit membership add restores that
+category and then wins by its newer server revision. Invalid category-name or
+chapter-ownership changes fail atomically as structural validation errors rather
+than becoming user-facing conflicts. Composition values retain their complete
+provenance, storage identities, manual order, labels, and exclusions.
 
 ## Opaque identity retention
 
@@ -139,7 +143,9 @@ snapshot cannot rename a category back or restore memberships under its previous
 name.
 
 The compatibility path is transitional. New apps use only the delta endpoints and
-do not upload the accumulated state snapshot.
+do not upload the accumulated state snapshot. Normal synchronization cost is
+therefore proportional to the number of changed revisions rather than the total
+library or chapter count.
 
 ## Completed migration reconciliation
 
