@@ -236,9 +236,19 @@ test('same-name category creation aliases once, old membership IDs remain usable
     assert.deepEqual(member.categoryAlias, { from: 'second', to: 'first' });
     assert.deepEqual(result(await f.merge([aliasOp], f.second)), alias);
     const other = result(await f.merge([operation(category('third'), { name: 'Other', sort: 1, deleted: false })]));
-    const collision = await f.merge([operation(category('third'), { name: 'Favourites', sort: 1, deleted: false }, other.current!.revision)]);
-    assert.equal(collision.statusCode, 409, collision.body);
-    assert.match(collision.json().message, /category name is already owned/);
+    const renameOp = operation(category('third'), { name: 'Favourites', sort: 1, deleted: false }, other.current!.revision);
+    const companionOp = operation(library('after-collision'), { inLibrary: true, addedAt: 50 });
+    const collisionBatch = await f.merge([renameOp, companionOp]);
+    assert.equal(collisionBatch.statusCode, 200, collisionBatch.body);
+    const collisionResults = parseUserStateMergeResponse(collisionBatch.json()).results;
+    assert.deepEqual(collisionResults[0], {
+      operationId: renameOp.operationId,
+      status: 'conflict',
+      current: other.current,
+      reason: 'category-name-exists',
+    });
+    assert.equal(collisionResults[1].status, 'applied');
+    assert.deepEqual(result(await f.merge([renameOp])), collisionResults[0]);
   } finally { await f.close(); }
 });
 
@@ -278,8 +288,15 @@ test('later membership edits restore a deleted category and server revision orde
     assert.deepEqual(result(await f.merge([deletion], f.second)), removed);
     assert.equal(page(await f.read()).headRevision, beforeReplay);
 
-    const absent = await f.merge([operation(membership('missing'), { included: true })]);
-    assert.equal(absent.statusCode, 409, absent.body);
+    const absentOp = operation(membership('missing'), { included: true });
+    const absent = result(await f.merge([absentOp]));
+    assert.deepEqual(absent, {
+      operationId: absentOp.operationId,
+      status: 'conflict',
+      current: null,
+      reason: 'category-missing',
+    });
+    assert.deepEqual(result(await f.merge([absentOp])), absent);
     assert.equal(result(await f.merge([operation(membership('missing'), { included: false })])).status, 'applied');
   } finally { await f.close(); }
 });
@@ -351,9 +368,15 @@ test('resume accepts portable anchors and rejects pixel/local-ID fields, and cha
     assert.deepEqual(opaqueResume.current!.value, { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: 1700000000001 });
     const owned: UserStateEntity = { kind: 'reading', work: work(), chapter: { ...chapter(), compositionEntryId: 'entry-a' } };
     const first = result(await f.merge([operation(owned, { progress: 10, unread: false, readAt: null })]));
-    const mismatch = await f.merge([operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision)]);
-    assert.equal(mismatch.statusCode, 409, mismatch.body);
-    assert.match(mismatch.json().message, /chapter identity mismatch/);
+    const mismatchOp = operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision);
+    const mismatch = result(await f.merge([mismatchOp]));
+    assert.deepEqual(mismatch, {
+      operationId: mismatchOp.operationId,
+      status: 'conflict',
+      current: first.current,
+      reason: 'chapter-ownership-conflict',
+    });
+    assert.deepEqual(result(await f.merge([mismatchOp])), mismatch);
   } finally { await f.close(); }
 });
 

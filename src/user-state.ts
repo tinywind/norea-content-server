@@ -131,7 +131,7 @@ function applyOperation(db: DatabaseSync, operation: UserStateOperation, writer:
     ...(reason === undefined ? {} : { reason }), ...(canonical.categoryAlias ? { categoryAlias: canonical.categoryAlias } : {}),
   });
   if (ownershipConflict(current, entity)) {
-    throw problem(409, 'User state: chapter identity mismatch requires metadata reconciliation');
+    return result('conflict', current, 'chapter-ownership-conflict');
   }
   if (operation.seed && current) return result('seed-skipped');
   if (entity.kind === 'category') {
@@ -143,13 +143,13 @@ function applyOperation(db: DatabaseSync, operation: UserStateOperation, writer:
         db.prepare('INSERT INTO user_state_category_aliases(alias_id,canonical_id) VALUES(?,?)').run(entity.categoryId, to);
         return { operationId: operation.operationId, status: 'aliased', current: sameName, categoryAlias: { from: entity.categoryId, to } };
       }
-      throw problem(409, 'User state: category name is already owned by another category');
+      return result('conflict', current, 'category-name-exists');
     }
   }
   if (entity.kind === 'membership' && (operation.value as { included: boolean }).included) {
     const categoryEntity: UserStateEntity = { kind: 'category', categoryId: entity.categoryId };
     const category = storedRecord(db, categoryEntity);
-    if (!category) throw problem(409, 'User state: membership category is missing');
+    if (!category) return result('conflict', current, 'category-missing');
     if ((category.value as CategoryValue).deleted) {
       const restoreId = 'category-restore:' + createHash('sha256')
         .update(JSON.stringify([writer.id, operation.operationId, entity.categoryId])).digest('hex');

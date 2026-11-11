@@ -141,6 +141,16 @@ test('resolves folder chapters only within the exact canonical work', async () =
     const original = await f.putChapter(other, '/original/chapter', 3);
     const reverse = new URLSearchParams({ ...other.identity, chapterPath: 'norea-folder:3', chapterNumber: '3' });
     assert.deepEqual((await f.app.inject(`/api/v1/catalog/chapter?${reverse}`)).json(), original);
+    reverse.set('chapterNumber', '03');
+    assert.deepEqual((await f.app.inject(`/api/v1/catalog/chapter?${reverse}`)).json(), original);
+    reverse.set('chapterNumber', '3.0');
+    assert.deepEqual((await f.app.inject(`/api/v1/catalog/chapter?${reverse}`)).json(), original);
+    const db = openDatabase(f.dataDir);
+    try {
+      db.prepare("UPDATE chapters SET entry=json_set(entry,'$.manifest.chapter.chapterNumber','03') WHERE id=?").run(original.id);
+    } finally { db.close(); }
+    reverse.set('chapterNumber', '3');
+    assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${reverse}`)).json().id, original.id);
   } finally { await f.close(); }
 });
 

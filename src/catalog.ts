@@ -156,12 +156,25 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
       return entry;
     }
     if (!chapterNumber || pluginId === 'local') throw problem(404, 'Chapter not found');
+    const normalized = String(Number(chapterNumber));
+    const targetNumber = canonicalChapterNumber(db, { pluginId, novelPath }, normalized);
     const work = digest(JSON.stringify([pluginId, novelPath]));
-    const matches = db.prepare("SELECT entry FROM chapters WHERE work_id=? AND json_extract(entry,'$.manifest.chapter.chapterNumber')=? AND deleted_at IS NULL AND (? OR (path IS NOT NULL))").all(work, canonicalChapterNumber(db, { pluginId, novelPath }, chapterNumber), request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
+    const rows = db.prepare(`SELECT entry FROM chapters WHERE work_id=? AND (
+      CAST(json_extract(entry,'$.manifest.chapter.chapterNumber') AS REAL)=CAST(? AS REAL)
+      OR json_extract(entry,'$.manifest.identity.chapterPath')=?
+    ) AND deleted_at IS NULL AND (? OR (path IS NOT NULL))`).all(work, targetNumber, `norea-folder:${targetNumber}`, request.query.includeUnavailable ? 1 : 0) as { entry: string }[];
+    const matches = rows.map(row => JSON.parse(row.entry) as CatalogEntry).filter(entry => {
+      const folderNumber = /^norea-folder:(\d+(?:\.\d+)?)$/.exec(entry.manifest.identity.chapterPath)?.[1];
+      const rawNumber = entry.manifest.chapter.chapterNumber;
+      const entryNumber = rawNumber != null && /^\d+(?:\.\d+)?$/.test(rawNumber) && Number.isFinite(Number(rawNumber))
+        ? String(Number(rawNumber))
+        : undefined;
+      return (folderNumber ?? entryNumber) === targetNumber && (folderNumber === undefined || entryNumber === undefined || folderNumber === entryNumber);
+    });
     if (!matches.length) throw problem(404, 'Chapter not found');
     if (matches.length > 1) throw problem(409, 'Multiple folder chapters match the source identity');
-    if (request.query.includeUnavailable) return JSON.parse(matches[0].entry) as CatalogEntry;
-    const entry = availableChapter(db, dataDir, (JSON.parse(matches[0].entry) as CatalogEntry).id);
+    if (request.query.includeUnavailable) return matches[0];
+    const entry = availableChapter(db, dataDir, matches[0].id);
     if (!entry) throw problem(404, 'Chapter files are unavailable');
     return entry;
   });
