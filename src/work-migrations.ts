@@ -329,7 +329,6 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
     if (sourceId === request.target.id) conflict('source and target must be different works');
     const source = checkedWork(db, dataDir, sourceId, request.source.revision);
     const target = checkedWork(db, dataDir, request.target.id, request.target.revision);
-    if (source.entry.metadata.identity.pluginId === target.entry.metadata.identity.pluginId) conflict('source and target must use different plugins');
     const rows = checkedSourceRows(db, sourceId, request.source.chapters);
     validateMappings(rows, request);
     const chapterDecisions = validateChapterDecisions(db, source.entry, target.entry, rows, request);

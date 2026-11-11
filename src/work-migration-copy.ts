@@ -47,7 +47,6 @@ async function performMigrationCopy(db: DatabaseSync, dataDir: string, sourceId:
   if (existing?.deleted_at != null) conflict('the target chapter was explicitly deleted');
   const current = existing ? JSON.parse(existing.entry) as CatalogEntry : undefined;
   const fence = migrationCopyFence(db, dataDir, sourceId, request.source.revision, source.id, request.target.id, request.target.revision, existing?.id);
-  if (fence.source.metadata.identity.pluginId === fence.target.metadata.identity.pluginId) conflict('source and target must use different plugins');
   const sourceIdentity = source.manifest.identity;
   if (sourceIdentity.pluginId !== fence.source.metadata.identity.pluginId || sourceIdentity.novelId !== fence.source.metadata.identity.novelId || sourceIdentity.novelPath !== fence.source.metadata.identity.novelPath || source.id !== chapterIdentityId(db, sourceIdentity)) conflict('source chapter identity differs from its work');
   const title = fence.target.metadata.chapters[requestedNumber];
