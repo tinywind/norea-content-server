@@ -315,11 +315,14 @@ An excluded package uses:
 {"sourceChapterId":"<source chapter ID>","decision":"delete-source"}
 ~~~
 
-It requires a matching null-target chapter decision and cannot carry target
-fields or inventory. The source snapshot still fixes its current revision.
-An unavailable source package may be explicitly deleted, but remaining files
-are fenced and unindexed contents still block retirement. Copy and keep retain
-all prior preservation and completeness checks.
+It requires a matching chapter decision and cannot carry target package fields
+or target inventory. An unavailable source package with no remaining payload
+files on disk may be explicitly deleted without a discard inventory; any stored
+source package requires `explicitSourceDiscard: { "approvedByUser": true,
+"expectedSourceInventory": <inventory> }` matching its fresh server inventory so
+missing local files on a client device can never discard stored server content.
+Remaining files are fenced and unindexed or partial contents still block
+retirement. Copy and keep retain all prior preservation and completeness checks.
 
 Older requests without `chapterDecisions` can use the original copy/keep
 protocol. Their lineage has `fullDecisionCoverage: false` and an empty decision

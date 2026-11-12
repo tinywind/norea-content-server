@@ -21,11 +21,15 @@ export interface MigrationSnapshot {
   work: Reference & { identity: NovelMetadataV1['identity']; metadata: NovelMetadataV1; coverSha256: string | null };
   chapters: (Reference & { chapterPath: string; chapterNumber: string | null; position: number; name: string; complete: boolean; available: boolean })[];
 }
+export interface ExplicitSourceContentDiscard {
+  approvedByUser: true;
+  expectedSourceInventory: MigrationInventory;
+}
 export interface FinalizeMigrationRequest {
   operationId: string;
   source: { revision: string; chapters: Reference[] };
   target: Reference;
-  mappings: { sourceChapterId: string; targetChapterId?: string; targetRevision?: string; decision: 'copy-source' | 'keep-target' | 'delete-source'; expectedTargetInventory?: MigrationInventory }[];
+  mappings: { sourceChapterId: string; targetChapterId?: string; targetRevision?: string; decision: 'copy-source' | 'keep-target' | 'delete-source'; expectedTargetInventory?: MigrationInventory; explicitSourceDiscard?: ExplicitSourceContentDiscard }[];
   chapterDecisions?: MigrationChapterDecision[];
 }
 export interface FinalizeMigrationResult { operationId: string; deletedWork: WorkEntry }
@@ -203,8 +207,10 @@ function validateMappings(rows: ChapterRecord[], request: FinalizeMigrationReque
     if (!sources.delete(mapping.sourceChapterId)) conflict('chapter mappings are missing, repeated, or ambiguous');
     if (mapping.decision === 'delete-source') {
       if (request.chapterDecisions === undefined || mapping.targetChapterId !== undefined || mapping.targetRevision !== undefined || mapping.expectedTargetInventory !== undefined) conflict('deletion requires an explicit chapter decision without a target');
+      if (mapping.explicitSourceDiscard !== undefined && (mapping.explicitSourceDiscard.approvedByUser !== true || !mapping.explicitSourceDiscard.expectedSourceInventory)) conflict('explicit source discard requires user approval and its verified source inventory');
       continue;
     }
+    if (mapping.explicitSourceDiscard !== undefined) conflict('explicit source discard contradicts chapter preservation');
     if (!mapping.targetChapterId || !mapping.targetRevision || targets.has(mapping.targetChapterId)) conflict('chapter targets are missing, repeated, or ambiguous');
     targets.add(mapping.targetChapterId!);
     if ((mapping.decision === 'keep-target') !== (mapping.expectedTargetInventory !== undefined)) conflict('keep-target requires its explicitly selected inventory');
@@ -344,8 +350,27 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
       if (mapping.decision === 'delete-source') {
         const sourceIdentity = sourceEntry.manifest.identity;
         if (sourceIdentity.pluginId !== sourceWork.identity.pluginId || sourceIdentity.novelId !== sourceWork.identity.novelId || sourceIdentity.novelPath !== sourceWork.identity.novelPath || sourceEntry.id !== chapterIdentityId(db, sourceIdentity)) conflict('deleted chapter does not belong to the source work');
-        fences.push(chapterFence(db, dataDir, mapping.sourceChapterId, true));
-        mappings.push({ source: chapterSnapshot(sourceEntry, !!availableChapter(db, dataDir, sourceEntry.id)), decision: 'delete-source', target: null, targetInventory: null });
+        const sourceFence = chapterFence(db, dataDir, mapping.sourceChapterId, true);
+        fences.push(sourceFence);
+        const sourceAvailable = availableChapter(db, dataDir, sourceEntry.id);
+        const hasStoredSourceFiles = Boolean(sourceAvailable) || (sourceFence.names !== null && (JSON.parse(sourceFence.names) as string[]).length > 0);
+        if (hasStoredSourceFiles) {
+          if (!sourceAvailable) conflict('source chapter retains partial or unverified files on disk');
+          const explicitDiscard = mapping.explicitSourceDiscard;
+          if (!explicitDiscard?.approvedByUser) {
+            conflict('stored source chapter content cannot be deleted without verified target preservation or explicit inventory-bound user approval');
+          }
+          validateInventory(explicitDiscard!.expectedSourceInventory);
+          const inspectedSource = await inspectChapterInventory(db, dataDir, mapping.sourceChapterId, sourceEntry.revision, limits);
+          if (!inspectedSource.inventory.body || inspectedSource.inventory.body.bytes <= 0) conflict('stored source chapter body cannot be verified');
+          if (canonicalize(normalizedInventory(explicitDiscard!.expectedSourceInventory)) !== canonicalize(normalizedInventory(inspectedSource.inventory))) {
+            conflict('stored source chapter differs from the explicitly approved discard inventory');
+          }
+          mappings.push({ source: chapterSnapshot(sourceEntry, true), decision: 'delete-source', target: null, targetInventory: null, discardedSourceInventory: inspectedSource.inventory });
+        } else {
+          if (mapping.explicitSourceDiscard !== undefined) conflict('unavailable source chapter cannot carry a stored discard inventory');
+          mappings.push({ source: chapterSnapshot(sourceEntry, false), decision: 'delete-source', target: null, targetInventory: null });
+        }
         continue;
       }
       const targetEntry = chapterRow(db, mapping.targetChapterId!).catalog;
@@ -460,7 +485,10 @@ export function registerWorkMigrations(app: FastifyInstance, context: { db: Data
         target: reference,
         mappings: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
           required: ['sourceChapterId', 'decision'], properties: { sourceChapterId: hash, targetChapterId: hash, targetRevision: hash,
-            decision: { type: 'string', enum: ['copy-source', 'keep-target', 'delete-source'] }, expectedTargetInventory: inventory } } },
+            decision: { type: 'string', enum: ['copy-source', 'keep-target', 'delete-source'] }, expectedTargetInventory: inventory,
+            explicitSourceDiscard: { type: 'object', additionalProperties: false, required: ['approvedByUser', 'expectedSourceInventory'], properties: {
+              approvedByUser: { type: 'boolean', const: true }, expectedSourceInventory: inventory,
+            } } } } },
         chapterDecisions: { type: 'array', maxItems: MAX_CHAPTERS, items: { type: 'object', additionalProperties: false,
           required: ['sourceChapterPath', 'sourceChapterNumber', 'targetChapterPath', 'targetChapterNumber'], properties: {
             discardSourceContent: { type: 'boolean', const: true },

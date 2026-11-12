@@ -23,6 +23,7 @@ export type MigrationLineageMapping = {
   decision: 'delete-source';
   target: null;
   targetInventory: null;
+  discardedSourceInventory?: MigrationInventory;
 });
 export interface WorkMigrationLineage {
   sequence: number;

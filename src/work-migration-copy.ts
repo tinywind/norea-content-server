@@ -7,9 +7,10 @@ import { canonicalize } from 'json-canonicalize';
 import { authenticateDevice } from './auth.ts';
 import { chapterIdentityId, canonicalChapterManifest } from './chapter-number-mappings.ts';
 import { inspectChapterInventory } from './chapter-inventory.ts';
-import { validateFiles } from './chapter-files.ts';
+import { validateFiles, validateMedia } from './chapter-files.ts';
 import { problem } from './db.ts';
 import { availableChapter, chapterRow, chapterStoragePath, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { readVerifiedRegularFile } from './secure-files.ts';
 import { migrationCopyFence, type MigrationInventory } from './work-migrations.ts';
 
 interface Reference { id: string; revision: string }
@@ -31,7 +32,7 @@ function packageMetadata(manifest: PackageManifest): string {
   return canonicalize({ identity: manifest.identity, novel: manifest.novel, chapter: manifest.chapter, bodyPath: manifest.bodyPath });
 }
 
-async function performMigrationCopy(db: DatabaseSync, dataDir: string, sourceId: string, request: MigrationCopyRequest, limits: Limits, authorizeCommit?: () => void): Promise<{ entry: CatalogEntry }> {
+async function performMigrationCopy(db: DatabaseSync, dataDir: string, sourceId: string, request: MigrationCopyRequest, limits: Limits, authorizeCommit?: () => void, beforePublishStage?: (stage: string) => Promise<void> | void): Promise<{ entry: CatalogEntry }> {
   if (request.decision !== 'copy-source' || sourceId === request.target.id) conflict('an explicit copy to a different work is required');
   const sourceRow = chapterRow(db, request.source.chapter.id);
   const source = sourceRow.catalog;
@@ -78,7 +79,8 @@ async function performMigrationCopy(db: DatabaseSync, dataDir: string, sourceId:
   };
   const startedAt = uploadCursor(db);
   const inspected = await inspectChapterInventory(db, dataDir, source.id, source.revision, limits);
-  if (!inspected.inventory.body || inspected.inventory.body.bytes === 0) conflict('source body is not a verified nonempty copy');
+  const inspectedBody = inspected.inventory.body;
+  if (!inspectedBody || inspectedBody.bytes === 0) conflict('source body is not a verified nonempty copy');
   if (source.manifest.files.some(file => file.path === 'manifest.json' || file.path === 'media.zip') && inspected.inventory.expectedAssetKeys === null) conflict('source media declarations cannot be verified');
   if (current && availableChapter(db, dataDir, current.id)) {
     const targetInventory = await inspectChapterInventory(db, dataDir, current.id, current.revision, limits);
@@ -93,16 +95,28 @@ async function performMigrationCopy(db: DatabaseSync, dataDir: string, sourceId:
   try {
     await mkdir(stage, { recursive: true });
     for (const file of manifest.files) await copyFile(chapterStoragePath(dataDir, join(sourceRow.path!, file.path)), join(stage, file.path));
-    const entry: CatalogEntry = { id: targetId, revision: digest(canonicalize(manifest)), manifest, complete: source.complete, deleted: false,
+    await beforePublishStage?.(stage);
+    const complete = await validateMedia(stage, manifest, limits);
+    if (complete !== source.complete) conflict('copied stage completeness differs from the verified source chapter');
+    const stagedBody = (await readVerifiedRegularFile(join(stage, manifest.bodyPath), limits.expandedBytes)).bytes;
+    if (stagedBody.length !== inspectedBody!.bytes || digest(stagedBody) !== inspectedBody!.sha256) {
+      conflict('copied stage body digest differs from the verified source inventory');
+    }
+    const entry: CatalogEntry = { id: targetId, revision: digest(canonicalize(manifest)), manifest, complete, deleted: false,
       fileBytes: manifest.files.reduce((total, file) => total + file.size, 0), sequence: 0 };
     // publishChapter performs the final guard under its existing write lock.
     // It handles atomic replacement and restoration; source files are untouched.
-    return { entry: publishChapter(db, dataDir, stage, entry, startedAt, false, 'replace-server', verify) };
+    const published = publishChapter(db, dataDir, stage, entry, startedAt, false, 'replace-server', verify);
+    const verifiedPublished = await inspectChapterInventory(db, dataDir, published.id, published.revision, limits);
+    if (inventoryKey(verifiedPublished.inventory) !== inventoryKey(inspected.inventory)) {
+      throw problem(500, 'Published migration copy failed post-commit inventory verification');
+    }
+    return { entry: published };
   } finally { await rm(stage, { recursive: true, force: true }); }
 }
 
-export async function copyMigrationChapter(db: DatabaseSync, dataDir: string, sourceId: string, request: MigrationCopyRequest, limits: Limits, authorizeCommit?: () => void): Promise<{ entry: CatalogEntry }> {
-  try { return await performMigrationCopy(db, dataDir, sourceId, request, limits, authorizeCommit); }
+export async function copyMigrationChapter(db: DatabaseSync, dataDir: string, sourceId: string, request: MigrationCopyRequest, limits: Limits, authorizeCommit?: () => void, beforePublishStage?: (stage: string) => Promise<void> | void): Promise<{ entry: CatalogEntry }> {
+  try { return await performMigrationCopy(db, dataDir, sourceId, request, limits, authorizeCommit, beforePublishStage); }
   catch (error) {
     const status = (error as { statusCode?: number }).statusCode;
     if (status === 400 || status === 404 || status === 410 || (error as NodeJS.ErrnoException).code === 'ENOENT') conflict('source or target changed or became unavailable');

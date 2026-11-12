@@ -624,7 +624,7 @@ test('all regular source cover formats are fenced while the fresh target metadat
   } finally { await f.close(); }
 });
 
-for (const hasTargetBody of [false, true]) test('target-primary discards A body but retains its reading-state destination (B body: ' + hasTargetBody + ')', async () => {
+for (const hasTargetBody of [false, true]) test('blocks unapproved delete-source when the server still stores the source body (B body: ' + hasTargetBody + ')', async () => {
   const f = await fixture();
   try {
     saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'A episode' } });
@@ -642,16 +642,157 @@ for (const hasTargetBody of [false, true]) test('target-primary discards A body 
         targetChapterNumber: '1001', discardSourceContent: true }],
     };
     const response = await f.submit(payload);
-    assert.equal(response.statusCode, 200, response.body);
-    const entry = (await f.app.inject('/api/v1/work-migrations/' + payload.operationId)).json();
-    assert.equal(entry.chapterDecisions[0].targetChapterPath, '/target/1');
-    assert.equal(entry.chapterDecisions[0].discardSourceContent, true);
-    assert.equal(entry.mappings[0].decision, 'delete-source');
-    const target = migrationSnapshot(f.db, f.dataDir, targetId);
-    assert.equal(target.chapters.length, hasTargetBody ? 1 : 0);
-    if (hasTargetBody) assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'B chosen body');
-    assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 404);
+    assert.equal(response.statusCode, 409, response.body);
+    assert.match(response.json().message, /stored source chapter content cannot be deleted/);
+    assert.equal(await f.sourceBody(), 'A original body');
+    assert.equal((await f.app.inject('/api/v1/works/' + sourceId)).statusCode, 200);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migrations').get() as { n: number }).n, 0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_tombstones').get() as { n: number }).n, 0);
   } finally { await f.close(); }
+});
+
+test('blocks delete-source when partial source files remain on disk and allows explicit user discard only with exact source inventory', async () => {
+  const f = await fixture();
+  try {
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'A episode' } });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: { '1001': 'B episode' } });
+    const original = await f.upload('source', 1, 'A original body');
+    const sourceInventory = await f.inventory(original);
+    // Truncate content.html so availableChapter becomes false while partial bytes still remain on disk.
+    await writeFile(join(f.dataDir, 'contents/source/book/1/content.html'), 'truncated');
+    const partialFrom = migrationSnapshot(f.db, f.dataDir, sourceId);
+    const partialTo = migrationSnapshot(f.db, f.dataDir, targetId);
+    const partialPayload: FinalizeMigrationRequest = {
+      operationId: randomUUID(),
+      source: { revision: partialFrom.work.revision, chapters: [{ id: original.id, revision: original.revision }] },
+      target: { id: targetId, revision: partialTo.work.revision },
+      mappings: [{ sourceChapterId: original.id, decision: 'delete-source' }],
+      chapterDecisions: [{ sourceChapterPath: '/source/1', sourceChapterNumber: '1', targetChapterPath: null, targetChapterNumber: null }],
+    };
+    const partialResult = await f.submit(partialPayload);
+    assert.equal(partialResult.statusCode, 409, partialResult.body);
+    assert.equal(await f.sourceBody(), 'truncated');
+
+    // Restore exact original bytes and verify explicit inventory-bound user discard checks SHA-256.
+    await writeFile(join(f.dataDir, 'contents/source/book/1/content.html'), 'A original body');
+    const wrongInventory = structuredClone(sourceInventory);
+    wrongInventory.body!.sha256 = '0'.repeat(64);
+    const wrongPayload: FinalizeMigrationRequest = {
+      operationId: randomUUID(),
+      source: { revision: partialFrom.work.revision, chapters: [{ id: original.id, revision: original.revision }] },
+      target: { id: targetId, revision: partialTo.work.revision },
+      mappings: [{ sourceChapterId: original.id, decision: 'delete-source', explicitSourceDiscard: { approvedByUser: true, expectedSourceInventory: wrongInventory } }],
+      chapterDecisions: [{ sourceChapterPath: '/source/1', sourceChapterNumber: '1', targetChapterPath: '/target/1', targetChapterNumber: '1001', discardSourceContent: true }],
+    };
+    assert.equal((await f.submit(wrongPayload)).statusCode, 409);
+    assert.equal(await f.sourceBody(), 'A original body');
+
+    const approvedPayload: FinalizeMigrationRequest = {
+      ...wrongPayload,
+      operationId: randomUUID(),
+      mappings: [{ sourceChapterId: original.id, decision: 'delete-source', explicitSourceDiscard: { approvedByUser: true, expectedSourceInventory: sourceInventory } }],
+    };
+    const approvedResult = await f.submit(approvedPayload);
+    assert.equal(approvedResult.statusCode, 200, approvedResult.body);
+    const entry = (await f.app.inject('/api/v1/work-migrations/' + approvedPayload.operationId)).json();
+    assert.deepEqual(entry.mappings[0].discardedSourceInventory, sourceInventory);
+  } finally { await f.close(); }
+});
+
+test('protects existing migration patterns: 5 stored composed chapters (6579->6157) and pre-existing identical target bodies without duplication (57768->6439)', async () => {
+  const f = await fixture();
+  try {
+    // Pattern 1: 6579 -> 6157 (5 stored chapters + 5 metadata-only chapters)
+    const srcChapters: Record<string, string> = {};
+    const dstChapters: Record<string, string> = {};
+    for (let i = 1; i <= 10; i++) {
+      srcChapters[String(i)] = `Episode ${i}`;
+      dstChapters[String(1000 + i)] = `Episode ${i}`;
+    }
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: srcChapters });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: dstChapters });
+    const uploadedSource: CatalogEntry[] = [];
+    const uploadedTarget: CatalogEntry[] = [];
+    for (let i = 1; i <= 5; i++) {
+      uploadedSource.push(await f.upload('source', i, `Preserved body ${i}`, undefined, `norea-composed:src-${i}`));
+      uploadedTarget.push(await f.upload('target', i, `Preserved body ${i}`, undefined, `norea-composed:dst-${i}`));
+    }
+    const from1 = migrationSnapshot(f.db, f.dataDir, sourceId);
+    const to1 = migrationSnapshot(f.db, f.dataDir, targetId);
+    const req1: FinalizeMigrationRequest = {
+      operationId: randomUUID(),
+      source: { revision: from1.work.revision, chapters: from1.chapters.map(({ id, revision }) => ({ id, revision })) },
+      target: { id: targetId, revision: to1.work.revision },
+      mappings: uploadedSource.map((src, idx) => ({
+        sourceChapterId: src.id,
+        targetChapterId: uploadedTarget[idx].id,
+        targetRevision: uploadedTarget[idx].revision,
+        decision: 'copy-source' as const,
+      })),
+      chapterDecisions: [
+        ...uploadedSource.map((src, idx) => ({
+          sourceChapterPath: src.manifest.identity.chapterPath,
+          sourceChapterNumber: String(idx + 1),
+          targetChapterPath: uploadedTarget[idx].manifest.identity.chapterPath,
+          targetChapterNumber: String(1001 + idx),
+        })),
+        ...[6, 7, 8, 9, 10].map(i => ({
+          sourceChapterPath: `/source/${i}`,
+          sourceChapterNumber: String(i),
+          targetChapterPath: `/target/${i}`,
+          targetChapterNumber: String(1000 + i),
+        })),
+      ],
+    };
+    const res1 = await f.submit(req1);
+    assert.equal(res1.statusCode, 200, res1.body);
+    const afterTo1 = migrationSnapshot(f.db, f.dataDir, targetId);
+    assert.equal(afterTo1.chapters.length, 5);
+    for (let i = 1; i <= 5; i++) {
+      assert.equal(await readFile(join(f.dataDir, `contents/target/book/${1000 + i}/content.html`), 'utf8'), `Preserved body ${i}`);
+    }
+  } finally { await f.close(); }
+
+  // Pattern 2: 57768 -> 6439 (norea-folder source chapters mapped to native target paths that already hold identical bodies)
+  const f2 = await fixture();
+  try {
+    const srcChapters: Record<string, string> = {};
+    const dstChapters: Record<string, string> = {};
+    for (let i = 1; i <= 6; i++) {
+      srcChapters[String(i)] = `Episode ${i}`;
+      dstChapters[String(1000 + i)] = `Shepherd Mage Episode ${i}`;
+    }
+    saveWork(f2.db, f2.dataDir, { ...metadata('source'), chapters: srcChapters });
+    saveWork(f2.db, f2.dataDir, { ...metadata('target'), chapters: dstChapters });
+    const srcEntries: CatalogEntry[] = [];
+    const dstEntries: CatalogEntry[] = [];
+    for (let i = 1; i <= 6; i++) {
+      srcEntries.push(await f2.upload('source', i, `<p>Shared episode ${i}</p>`, undefined, `norea-folder:${i}`));
+      dstEntries.push(await f2.upload('target', i, `<p>Shared episode ${i}</p>`, undefined, `/bookkor/ep-${i}`));
+    }
+    const from2 = migrationSnapshot(f2.db, f2.dataDir, sourceId);
+    const to2 = migrationSnapshot(f2.db, f2.dataDir, targetId);
+    const req2: FinalizeMigrationRequest = {
+      operationId: randomUUID(),
+      source: { revision: from2.work.revision, chapters: from2.chapters.map(({ id, revision }) => ({ id, revision })) },
+      target: { id: targetId, revision: to2.work.revision },
+      mappings: srcEntries.map((src, idx) => ({
+        sourceChapterId: src.id,
+        targetChapterId: dstEntries[idx].id,
+        targetRevision: dstEntries[idx].revision,
+        decision: 'copy-source' as const,
+      })),
+      chapterDecisions: srcEntries.map((src, idx) => ({
+        sourceChapterPath: src.manifest.identity.chapterPath,
+        sourceChapterNumber: String(idx + 1),
+        targetChapterPath: dstEntries[idx].manifest.identity.chapterPath,
+        targetChapterNumber: String(1001 + idx),
+      })),
+    };
+    const res2 = await f2.submit(req2);
+    assert.equal(res2.statusCode, 200, res2.body);
+    assert.equal(migrationSnapshot(f2.db, f2.dataDir, targetId).chapters.length, 6);
+  } finally { await f2.close(); }
 });
 
 async function legacyCompletedFixture(keepTarget = false, resurrected = true) {

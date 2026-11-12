@@ -191,3 +191,153 @@ test('copy API requires a registered unblocked device and preserves existing pay
     assert.equal(migrationSnapshot(f.db, f.dataDir, targetId).chapters.length, 0);
   } finally { await f.close(); }
 });
+
+test('staged copy verification failure preserves source files and leaves target SQLite rows untouched', async () => {
+  const f = await fixture();
+  try {
+    const source = await f.upload('source', 'verified original html');
+    const beforeChapters = f.db.prepare('SELECT id,entry,directory,path,deleted_at FROM chapters ORDER BY id').all();
+    await assert.rejects(
+      copyMigrationChapter(f.db, f.dataDir, sourceId, f.request(source), defaultLimits, undefined, stage => {
+        writeFileSync(join(stage, 'content.html'), 'corrupted staged html!!');
+      }),
+      (error: unknown) => (error as { statusCode: number }).statusCode === 409,
+    );
+    assert.equal(await f.body('source'), 'verified original html');
+    assert.deepEqual(f.db.prepare('SELECT id,entry,directory,path,deleted_at FROM chapters ORDER BY id').all(), beforeChapters);
+    assert.equal(migrationSnapshot(f.db, f.dataDir, targetId).chapters.length, 0);
+  } finally { await f.close(); }
+});
+
+test('copies 10 server-only chapters cleanly, blocks source deletion on partial copy, and completes on retry without duplicates', async () => {
+  const f = await fixture();
+  try {
+    const srcMap: Record<string, string> = {};
+    const dstMap: Record<string, string> = {};
+    for (let i = 1; i <= 10; i++) {
+      srcMap[String(i)] = `Old episode ${i}`;
+      dstMap[String(1000 + i)] = `Fresh episode ${i}`;
+    }
+    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: srcMap });
+    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: dstMap });
+
+    const sources: CatalogEntry[] = [];
+    for (let i = 1; i <= 10; i++) {
+      const manifest: PackageManifest = {
+        packageVersion: 1,
+        layout: 'chapter-files',
+        identity: { ...metadata('source').identity, chapterPath: `norea-folder:${i}` },
+        novel: { name: 'Old source title', author: 'Old author', summary: 'Old summary', isLocal: false },
+        chapter: { name: srcMap[String(i)], chapterNumber: String(i), position: i, page: '1', contentType: 'html' },
+        bodyPath: 'content.html',
+        files: [{ path: 'content.html', size: Buffer.byteLength(`<p>Server-only chapter ${i}</p>`), modifiedAt: 1 }],
+      };
+      const form = new FormData();
+      form.append('metadata', JSON.stringify(manifest));
+      form.append('content.html', new Blob([`<p>Server-only chapter ${i}</p>`]), 'content.html');
+      const req = new Request('http://fixture', { method: 'POST', body: form });
+      const res = await f.app.inject({
+        method: 'POST',
+        url: '/api/v1/chapter-files?conflictPolicy=replace-server',
+        headers: { ...f.headers, 'content-type': req.headers.get('content-type')! },
+        payload: Buffer.from(await req.arrayBuffer()),
+      });
+      assert.equal(res.statusCode, 200, res.body);
+      sources.push(res.json<CatalogEntry>());
+    }
+
+    // Copy only first 4 chapters, then attempt premature finalization -> must block (409) and keep all 10 source chapters!
+    const copiedByIndex = new Map<number, CatalogEntry>();
+    for (let i = 0; i < 4; i++) {
+      const fromSnap = migrationSnapshot(f.db, f.dataDir, sourceId);
+      const toSnap = migrationSnapshot(f.db, f.dataDir, targetId);
+      const copyRes = await f.copy({
+        decision: 'copy-source',
+        source: { revision: fromSnap.work.revision, chapter: { id: sources[i].id, revision: sources[i].revision } },
+        target: {
+          id: targetId,
+          revision: toSnap.work.revision,
+          chapter: { chapterPath: `/target/${i + 1}`, chapterNumber: String(1001 + i), position: i + 1, name: dstMap[String(1001 + i)], page: '1' },
+          expectedChapter: null,
+        },
+      });
+      assert.equal(copyRes.statusCode, 200, copyRes.body);
+      copiedByIndex.set(i, copyRes.json().entry);
+    }
+
+    const partialFrom = migrationSnapshot(f.db, f.dataDir, sourceId);
+    const partialTo = migrationSnapshot(f.db, f.dataDir, targetId);
+    const blockedRes = await f.app.inject({
+      method: 'POST',
+      url: `/api/v1/works/${sourceId}/finalize-migration`,
+      headers: f.headers,
+      payload: {
+        operationId: randomUUID(),
+        source: { revision: partialFrom.work.revision, chapters: partialFrom.chapters.map(({ id, revision }) => ({ id, revision })) },
+        target: { id: targetId, revision: partialTo.work.revision },
+        mappings: sources.map((src, idx) =>
+          copiedByIndex.has(idx)
+            ? { sourceChapterId: src.id, targetChapterId: copiedByIndex.get(idx)!.id, targetRevision: copiedByIndex.get(idx)!.revision, decision: 'copy-source' }
+            : { sourceChapterId: src.id, decision: 'delete-source' },
+        ),
+        chapterDecisions: sources.map((src, idx) => ({
+          sourceChapterPath: src.manifest.identity.chapterPath,
+          sourceChapterNumber: String(idx + 1),
+          targetChapterPath: `/target/${idx + 1}`,
+          targetChapterNumber: String(1001 + idx),
+          ...(copiedByIndex.has(idx) ? {} : { discardSourceContent: true }),
+        })),
+      },
+    });
+    assert.equal(blockedRes.statusCode, 409, blockedRes.body);
+    assert.equal(migrationSnapshot(f.db, f.dataDir, sourceId).chapters.length, 10);
+
+    // Retry from chapter 1..10 (including already copied 1..4) -> zero duplicates, all 10 verified & finalized!
+    for (let i = 0; i < 10; i++) {
+      const fromSnap = migrationSnapshot(f.db, f.dataDir, sourceId);
+      const toSnap = migrationSnapshot(f.db, f.dataDir, targetId);
+      const copyRes = await f.copy({
+        decision: 'copy-source',
+        source: { revision: fromSnap.work.revision, chapter: { id: sources[i].id, revision: sources[i].revision } },
+        target: {
+          id: targetId,
+          revision: toSnap.work.revision,
+          chapter: { chapterPath: `/target/${i + 1}`, chapterNumber: String(1001 + i), position: i + 1, name: dstMap[String(1001 + i)], page: '1' },
+          expectedChapter: null,
+        },
+      });
+      assert.equal(copyRes.statusCode, 200, copyRes.body);
+      copiedByIndex.set(i, copyRes.json().entry);
+    }
+    const finalFrom = migrationSnapshot(f.db, f.dataDir, sourceId);
+    const finalTo = migrationSnapshot(f.db, f.dataDir, targetId);
+    assert.equal(finalTo.chapters.length, 10);
+    const finalRes = await f.app.inject({
+      method: 'POST',
+      url: `/api/v1/works/${sourceId}/finalize-migration`,
+      headers: f.headers,
+      payload: {
+        operationId: randomUUID(),
+        source: { revision: finalFrom.work.revision, chapters: finalFrom.chapters.map(({ id, revision }) => ({ id, revision })) },
+        target: { id: targetId, revision: finalTo.work.revision },
+        mappings: sources.map((src, idx) => ({
+          sourceChapterId: src.id,
+          targetChapterId: copiedByIndex.get(idx)!.id,
+          targetRevision: copiedByIndex.get(idx)!.revision,
+          decision: 'copy-source' as const,
+        })),
+        chapterDecisions: sources.map((src, idx) => ({
+          sourceChapterPath: src.manifest.identity.chapterPath,
+          sourceChapterNumber: String(idx + 1),
+          targetChapterPath: `/target/${idx + 1}`,
+          targetChapterNumber: String(1001 + idx),
+        })),
+      },
+    });
+    assert.equal(finalRes.statusCode, 200, finalRes.body);
+    for (let i = 1; i <= 10; i++) {
+      const actual = await readFile(join(f.dataDir, `contents/target/book/${1000 + i}/content.html`), 'utf8');
+      assert.equal(digest(Buffer.from(actual)), digest(Buffer.from(`<p>Server-only chapter ${i}</p>`)));
+    }
+  } finally { await f.close(); }
+});
