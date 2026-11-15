@@ -204,6 +204,17 @@ export function registerUserState(app: FastifyInstance, db: DatabaseSync): void 
     if (!Array.isArray(body.operations)) throw problem(400, 'User state: expected an operations array');
     // Parse every operation before entering the write transaction, including those after a valid edit.
     const operations = body.operations.map(parseOperation);
+    for (const operation of operations) {
+      if ('work' in operation.entity && operation.entity.work.pluginId === 'local') {
+        throw problem(400, 'User state: local works cannot be synchronized');
+      }
+      if (operation.entity.kind === 'composition') {
+        const composition = (operation.value as { composition: ChapterCompositionV1 }).composition;
+        if (composition.entries.some(entry => entry.sources.some(source => source.pluginId === 'local'))) {
+          throw problem(400, 'User state: local works cannot be synchronized');
+        }
+      }
+    }
     const writer = actor(db, request); // Recheck blocking after the request body has arrived.
     const hashes = new Map<string, string>();
     for (const [index, operation] of operations.entries()) {

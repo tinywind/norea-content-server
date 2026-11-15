@@ -267,3 +267,100 @@ test('a slow upload that keeps sending finishes, and a stalled one is closed aft
     assert.equal(stalled, 'closed');
   } finally { await s.close(); }
 });
+
+test('rejects local work, chapter, reading-state, and user-state uploads', async () => {
+  const s = await setup();
+  try {
+    const headers = await s.device();
+    const localMetadata = {
+      schemaVersion: 1,
+      identity: { pluginId: 'local', novelId: 'qa-01', novelPath: 'local:qa-01' },
+      novel: { name: 'Local QA', author: null, artist: null, summary: null, status: null, rating: null, genres: null, isLocal: true },
+      cover: null,
+      chapters: { '1': 'Chapter 1' },
+    };
+    const { metadataWorkId } = await import('../src/works.ts');
+    const localWorkId = metadataWorkId(localMetadata as any);
+    const workRes = await s.app.inject({
+      method: 'PUT',
+      url: `/api/v1/works/${localWorkId}`,
+      headers,
+      payload: localMetadata,
+    });
+    assert.equal(workRes.statusCode, 400, workRes.body);
+
+    const chapterPayload = await chapterFiles('<p>Local</p>', manifest => {
+      manifest.identity = { pluginId: 'local', novelId: 'qa-01', novelPath: 'local:qa-01', chapterPath: 'local:qa-01/chapter-0001' };
+      manifest.novel = { name: 'Local QA', isLocal: true };
+    });
+    const chapterRes = await s.app.inject({
+      method: 'POST',
+      url: '/api/v1/chapter-files',
+      headers: { ...headers, 'content-type': multipartType },
+      payload: chapterPayload,
+    });
+    assert.equal(chapterRes.statusCode, 400, chapterRes.body);
+
+    const ws = (await s.app.inject({ url: '/api/v1/user-state', headers })).json();
+    const mergeRes = await s.app.inject({
+      method: 'POST',
+      url: '/api/v1/user-state/merge',
+      headers,
+      payload: {
+        workspaceId: ws.workspaceId,
+        epoch: ws.epoch,
+        operations: [{
+          operationId: 'local-op-1',
+          entity: {
+            kind: 'library',
+            work: { pluginId: 'local', sourceNovelId: 'qa-01', novelPath: 'local:qa-01', name: 'Local QA' },
+          },
+          baseRevision: 0,
+          value: { inLibrary: true, addedAt: 1700000000 },
+        }],
+      },
+    });
+    assert.equal(mergeRes.statusCode, 400, mergeRes.body);
+
+    const currentRes = await s.app.inject({
+      method: 'POST',
+      url: '/api/v1/user-state/current',
+      headers,
+      payload: {
+        version: 2,
+        workspaceId: ws.workspaceId,
+        epoch: ws.epoch,
+        items: [{
+          entity: {
+            kind: 'library',
+            work: { pluginId: 'local', sourceNovelId: 'qa-01', novelPath: 'local:qa-01', name: 'Local QA' },
+          },
+          value: { inLibrary: true, addedAt: 1700000000 },
+        }],
+      },
+    });
+    assert.equal(currentRes.statusCode, 400, currentRes.body);
+
+    const readingRes = await s.app.inject({
+      method: 'POST',
+      url: '/api/v1/reading-state/merge',
+      headers,
+      payload: {
+        syncKey: 'a'.repeat(64),
+        entries: [{
+          pluginId: 'local',
+          sourceNovelId: 'qa-01',
+          novelPath: 'local:qa-01',
+          chapterPath: 'local:qa-01/chapter-0001',
+          chapterNumber: '1',
+          page: '1',
+          unread: false,
+          progress: 100,
+          bookmark: false,
+          readAt: 1700000000,
+        }],
+      },
+    });
+    assert.equal(readingRes.statusCode, 400, readingRes.body);
+  } finally { await s.close(); }
+});

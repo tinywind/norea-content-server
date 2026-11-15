@@ -178,6 +178,9 @@ export function uploadCursor(db: DatabaseSync): { catalog: number; works: number
 }
 
 export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete', verifyCommit?: () => void): CatalogEntry {
+  if (!imported && (entry.manifest.identity.pluginId === 'local' || entry.manifest.novel.isLocal)) {
+    throw problem(400, 'Local chapters cannot be uploaded to the content server');
+  }
   let manifest = canonicalChapterManifest(db, entry.manifest);
   let id = chapterIdentityId(db, manifest.identity);
   if (id !== entry.id || canonicalize(manifest) !== canonicalize(entry.manifest)) {

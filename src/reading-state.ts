@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance } from 'fastify';
 import { authenticateDevice, tokenDigest } from './auth.ts';
-import { transaction } from './db.ts';
+import { problem, transaction } from './db.ts';
 
 export interface ReadingStateEntry {
   pluginId: string;
@@ -116,6 +116,9 @@ export function registerReadingState(app: FastifyInstance, db: DatabaseSync): vo
       response: { 200: { type: 'object', required: ['received', 'updated', 'total'], properties: { received: offsetSchema, updated: offsetSchema, total: offsetSchema } } },
     },
   }, async request => {
+    if (request.body.entries.some(entry => entry.pluginId === 'local')) {
+      throw problem(400, 'Local works cannot be synchronized');
+    }
     const profileHash = tokenDigest(request.body.syncKey);
     return transaction(db, () => {
       const lookup = db.prepare('SELECT entry FROM reading_state_entries WHERE profile_hash=? AND entry_key=?');

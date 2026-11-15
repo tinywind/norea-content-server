@@ -97,6 +97,9 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
         let parsed: unknown;
         try { parsed = JSON.parse(part.value); } catch { throw problem(400, 'Invalid chapter metadata JSON'); }
         validateFiles(parsed, limits);
+        if (parsed.identity.pluginId === 'local' || parsed.novel.isLocal) {
+          throw problem(400, 'Local chapters cannot be uploaded to the content server');
+        }
         manifest = parsed;
         continue;
       }

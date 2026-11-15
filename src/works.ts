@@ -284,6 +284,10 @@ function assertSharedCompositionStorage(
 
 export function saveWork(db: DatabaseSync, dataDir: string, value: unknown, expectedId?: string, restore = false, restoreMigrationOperationId?: string): WorkEntry {
   const metadata = parseNovelMetadata(value); const id = metadataWorkId(metadata);
+  if (metadata.identity.pluginId === 'local' || metadata.novel.isLocal ||
+      metadata.chapterComposition?.entries.some(entry => entry.sources.some(source => source.pluginId === 'local'))) {
+    throw problem(400, 'Local works cannot be uploaded to the content server');
+  }
   const incomingComposition = metadata.chapterComposition;
   const sharedComposition = readUserStateComposition(db, metadata.identity);
   let storedMetadata: NovelMetadataV1 | undefined;

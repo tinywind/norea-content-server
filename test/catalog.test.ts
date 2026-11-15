@@ -158,14 +158,28 @@ test('keeps different local files separate when their chapter numbers match', as
   const f = await fixture();
   try {
     const work = metadata('local', 'local');
+    work.identity = { pluginId: 'local', novelId: 'local', novelPath: 'local' };
     work.novel.isLocal = true;
-    const stored = await f.putChapter(work, 'norea-folder:1', 1);
+    const directory = join(f.dataDir, 'contents/local/local');
+    await mkdir(join(directory, '1'), { recursive: true });
+    await writeFile(join(directory, 'novel.json'), JSON.stringify(work));
+    await writeFile(join(directory, '1/content.html'), '<p>Chapter content</p>');
+    let storedId = '';
+    let storedPath = '';
+    const db = openDatabase(f.dataDir);
+    try {
+      const scanned = await scanFolder({ db, dataDir: f.dataDir, limits: defaultLimits });
+      assert.equal(scanned.skipped, 0);
+      const row = db.prepare("SELECT id, entry FROM chapters WHERE json_extract(entry,'$.manifest.identity.pluginId')='local'").get() as { id: string; entry: string };
+      storedId = row.id;
+      storedPath = (JSON.parse(row.entry) as { manifest: PackageManifest }).manifest.identity.chapterPath;
+    } finally { db.close(); }
     const query = new URLSearchParams({ ...work.identity, chapterPath: 'local:markdown:different/chapter-0001', chapterNumber: '1' });
     assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
     query.set('includeUnavailable', 'true');
     assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).statusCode, 404);
-    query.set('chapterPath', stored.manifest.identity.chapterPath);
-    assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).json().id, stored.id);
+    query.set('chapterPath', storedPath);
+    assert.equal((await f.app.inject(`/api/v1/catalog/chapter?${query}`)).json().id, storedId);
   } finally { await f.close(); }
 });
 
