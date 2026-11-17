@@ -35,11 +35,13 @@ const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identi
 const pagination = (limit: number) => ({ offset: { ...count, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: limit } });
 const pageSchema = (item: object) => ({ type: 'object', required: ['items', 'total', 'hasMore'], properties: { items: { type: 'array', items: item }, total: count, hasMore: { type: 'boolean' } } });
 const security: Record<string, string[]>[] = [{ bearerAuth: [] }, {}];
-/** 1 for a completed work, 0 otherwise; matches the app's completion rule for a work and its override. */
+/**
+ * 1 for a completed work, 0 otherwise: the user's completed override, else the plugin's exact
+ * `Completed` status. Recognizing a source's own completion wording is the plugin's job.
+ */
 const completedWork = `COALESCE(
   (SELECT CASE json_type(o.document,'$.fields.completed.value') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END FROM work_overrides o WHERE o.work_id=w.id),
-  (SELECT CASE WHEN status LIKE '%complete%' OR status LIKE '%finished%' OR status LIKE '%완결%' OR status LIKE '%完結%' OR status LIKE '%完结%' THEN 1 ELSE 0 END
-    FROM (SELECT COALESCE(json_extract(w.entry,'$.metadata.novel.status'),'') AS status)))`;
+  COALESCE(json_extract(w.entry,'$.metadata.novel.status'),'')='Completed')`;
 
 export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
   const { db, dataDir, requireRead, catalogSchema } = context;
@@ -97,7 +99,7 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
   });
   app.get<{ Querystring: { q?: string; source?: string; completion?: 'completed' | 'ongoing'; offset: number; limit: number } }>('/api/v1/catalog/works', { schema: {
     security,
-    description: 'Browse current indexed work summaries without synchronizing change history. Search matches a literal substring of the title (ASCII case-insensitive); source matches an exact plugin ID. completion keeps completed or ongoing works: a user-set completed override decides, otherwise a source status containing complete, finished, 완결, 完結 or 完结 (ASCII case-insensitive) means completed. chapterCount counts available nondeleted chapter packages regardless of media completeness. Ordered by title, then ID. Concurrent changes can shift offset pages.',
+    description: 'Browse current indexed work summaries without synchronizing change history. Search matches a literal substring of the title (ASCII case-insensitive); source matches an exact plugin ID. completion keeps completed or ongoing works: a user-set completed override decides, otherwise only the exact plugin status Completed means completed. chapterCount counts available nondeleted chapter packages regardless of media completeness. Ordered by title, then ID. Concurrent changes can shift offset pages.',
     querystring: { type: 'object', additionalProperties: false, properties: { q: { type: 'string', maxLength: 500 }, source: identityText, completion: { type: 'string', enum: ['completed', 'ongoing'] }, ...pagination(40) } },
     response: { 200: pageSchema(workSummarySchema) },
   } }, async request => {

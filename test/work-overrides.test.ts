@@ -317,10 +317,11 @@ test('merges an externally synchronized override file and ignores an invalid one
   } finally { await f.close(); }
 });
 
-test('filters browsed works by completion, letting a set override decide over the source status', async () => {
+test('filters browsed works by completion, letting a set override decide over the plugin status', async () => {
   const f = await fixture(false, ['Ongoing', 'Marked', 'Unmarked', 'Cleared']);
   try {
-    for (const [novelId, status] of [['Status', '완결'], ['English', 'Completed'], ['Unmarked', 'COMPLETE'], ['Cleared', 'Finished'], ['Unknown', null]] as const) {
+    for (const [novelId, status] of [['Plugin', 'Completed'], ['Wording', '완결'], ['Lowercase', 'completed'], ['Finished', 'Publishing Finished'],
+      ['Unmarked', 'Completed'], ['Cleared', 'Completed'], ['Unknown', null]] as const) {
       const saved = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId(novelId), headers: f.headers, payload: { ...metadata(novelId), novel: { ...metadata(novelId).novel, status } } });
       assert.equal(saved.statusCode, 200, saved.body);
     }
@@ -334,8 +335,8 @@ test('filters browsed works by completion, letting a set override decide over th
       assert.equal(page.total, page.items.length);
       return page.items.map((item: { novel: { name: string } }) => item.novel.name);
     };
-    assert.deepEqual(await names('completed'), ['Cleared', 'English', 'Marked', 'Status']);
-    assert.deepEqual(await names('ongoing'), ['Ongoing', 'Unknown', 'Unmarked']);
+    assert.deepEqual(await names('completed'), ['Cleared', 'Marked', 'Plugin']);
+    assert.deepEqual(await names('ongoing'), ['Finished', 'Lowercase', 'Ongoing', 'Unknown', 'Unmarked', 'Wording']);
     assert.equal((await f.app.inject({ url: '/api/v1/catalog/works?completion=done', headers: f.headers })).statusCode, 400);
   } finally { await f.close(); }
 });
