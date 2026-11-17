@@ -316,3 +316,26 @@ test('merges an externally synchronized override file and ignores an invalid one
     assert.deepEqual((await f.feed()).json().items.map((item: { revision: number; override: WorkOverrideV1 }) => [item.revision, item.override]), [[3, combined]]);
   } finally { await f.close(); }
 });
+
+test('filters browsed works by completion, letting a set override decide over the source status', async () => {
+  const f = await fixture(false, ['Ongoing', 'Marked', 'Unmarked', 'Cleared']);
+  try {
+    for (const [novelId, status] of [['Status', '완결'], ['English', 'Completed'], ['Unmarked', 'COMPLETE'], ['Cleared', 'Finished'], ['Unknown', null]] as const) {
+      const saved = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId(novelId), headers: f.headers, payload: { ...metadata(novelId), novel: { ...metadata(novelId).novel, status } } });
+      assert.equal(saved.statusCode, 200, saved.body);
+    }
+    for (const [novelId, value] of [['Marked', true], ['Unmarked', false], ['Cleared', null]] as const) {
+      assert.equal((await f.put(override(completed(value, 5), novelId), novelId)).statusCode, 200);
+    }
+    const names = async (completion: string) => {
+      const response = await f.app.inject({ url: '/api/v1/catalog/works?completion=' + completion, headers: f.headers });
+      assert.equal(response.statusCode, 200, response.body);
+      const page = response.json();
+      assert.equal(page.total, page.items.length);
+      return page.items.map((item: { novel: { name: string } }) => item.novel.name);
+    };
+    assert.deepEqual(await names('completed'), ['Cleared', 'English', 'Marked', 'Status']);
+    assert.deepEqual(await names('ongoing'), ['Ongoing', 'Unknown', 'Unmarked']);
+    assert.equal((await f.app.inject({ url: '/api/v1/catalog/works?completion=done', headers: f.headers })).statusCode, 400);
+  } finally { await f.close(); }
+});
