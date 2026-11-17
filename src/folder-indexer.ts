@@ -209,7 +209,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     }
     const folders: typeof entries = [];
     for (const entry of entries) {
-      if (entry.name === 'novel.json' || isCoverFile(entry.name) || entry.name === '.nomedia') continue;
+      if (entry.name === 'novel.json' || entry.name === 'override.json' || isCoverFile(entry.name) || entry.name === '.nomedia') continue;
       if (!entry.isDirectory() || entry.isSymbolicLink() || unfinished(entry.name)) {
         await report({ path: join(directory, entry.name), sourceId, status: 'skipped', reason: 'Chapter entry is not a directory, is symbolic, or is unfinished' }); continue;
       }

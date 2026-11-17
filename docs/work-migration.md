@@ -179,6 +179,16 @@ and rechecked under the final deletion lock. Modified backups, other filenames,
 symlinks, and unindexed chapter folders still return 409. This does not change
 the source snapshot or the client's persisted finalization request.
 
+A regular `override.json` is a known work-level file and is fenced like a cover.
+The retirement transaction merges the source work's override into the target's
+with the target's entries as the base and the target identity, so user-set
+values follow the work. The target row receives a new override revision only
+when its document changes; nothing is stored when the source has no override.
+The target's `override.json` is written after the commit, because the target
+folder is fenced until then, and is rewritten by the next override read if that
+write was interrupted. A receipt replay does not merge again, and restoring the
+source later does not move the carried values back.
+
 The deletion transaction records the usual work/chapter tombstones and an
 idempotency receipt together. Receipt storage is an additive table; the original
 schema checksum and existing catalogs, devices, settings, and files are retained.

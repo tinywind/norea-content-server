@@ -116,6 +116,22 @@ test('cancellation drains concurrent archive inspections before returning', asyn
   } finally { release(); await recovery; t.mock.restoreAll(); await f.close(); }
 });
 
+test('a work override file is a known work-level file and is not reported', async () => {
+  const f = await fixture();
+  try {
+    const override = join(f.directory, '..', 'override.json');
+    const document = JSON.stringify({ schemaVersion: 1, identity: workMetadata().identity, fields: { completed: { value: true, updatedAt: 1 } } });
+    await writeFile(override, document);
+    for (const expected of [2, 0]) {
+      const summary = await f.run();
+      assert.equal(summary.registered, expected, JSON.stringify(f.items));
+      assert.equal(summary.skipped + summary.failed, 0, JSON.stringify(f.items));
+    }
+    assert.equal(f.items.some(item => item.path.endsWith('override.json')), false);
+    assert.equal(await readFile(override, 'utf8'), document);
+  } finally { await f.close(); }
+});
+
 test('folder collision checks use an index as the recovered catalog grows', async () => {
   const f = await fixture();
   try {

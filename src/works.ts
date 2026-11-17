@@ -118,7 +118,7 @@ function noLinks(path: string): void {
     if (dirname(current) === current) break;
   }
 }
-function readBytes(path: string, limit: number): Buffer {
+export function readBytes(path: string, limit: number): Buffer {
   noLinks(path);
   try { return readVerifiedRegularFileSync(path, limit).bytes; }
   catch (error) {
@@ -135,7 +135,7 @@ export function readNovelMetadata(path: string): NovelMetadataV1 {
   catch (error) { throw problem(400, `Cannot read novel.json: ${(error as Error).message}`); }
   return parseNovelMetadata(value);
 }
-function atomicWrite(path: string, bytes: string | Buffer): void {
+export function atomicWrite(path: string, bytes: string | Buffer): void {
   noLinks(path); mkdirSync(dirname(path), { recursive: true });
   const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`);
   let descriptor: number | undefined;
@@ -362,6 +362,7 @@ export function deleteWork(db: DatabaseSync, dataDir: string, id: string, record
       db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(JSON.stringify(deleted), sequence);
       db.prepare('DELETE FROM chapters WHERE work_id=?').run(id);
       db.prepare('DELETE FROM works WHERE id=?').run(id);
+      db.prepare('DELETE FROM work_overrides WHERE work_id=?').run(id);
       db.prepare("DELETE FROM scan_checkpoints WHERE path=? OR substr(path,1,?)=?").run(folder, folder.length + 1, folder + sep);
       recordDeletion?.(deleted);
       return deleted;

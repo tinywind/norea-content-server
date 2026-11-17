@@ -95,6 +95,11 @@ const chapterNumberSchema = `
     );
 `;
 
+// The counter outlives deleted rows so a change-feed revision is never reused.
+const workOverrideSchema = `
+    CREATE TABLE IF NOT EXISTS work_overrides (work_id TEXT PRIMARY KEY, revision INTEGER NOT NULL UNIQUE, document TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS work_override_revision (singleton INTEGER PRIMARY KEY CHECK(singleton=1), revision INTEGER NOT NULL);
+`;
 
 const userStateSchema = `
     CREATE TABLE IF NOT EXISTS user_state_meta (
@@ -148,7 +153,7 @@ export function openDatabase(dataDir: string): DatabaseSync {
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
     transaction(db, () => {
-      db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(userStateSchema);
+      db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(workOverrideSchema); db.exec(userStateSchema);
       ensureUserStateRecordIndexes(db);
       db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
       initializeUserStateCurrent(db);

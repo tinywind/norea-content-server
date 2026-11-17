@@ -75,6 +75,57 @@ filesystem metadata contract preserves source identity, work details, canonical
 chapter listings, and cover metadata. Clients validate exact identity before
 using recovered files.
 
+## Work overrides
+
+User-set work metadata is kept apart from source metadata so that neither a
+metadata refresh nor a reinstall can change it. Capability
+`workOverrideVersion: 1` exposes one `WorkOverrideV1` document per remote work:
+
+~~~json
+{
+  "schemaVersion": 1,
+  "identity": { "pluginId": "source-plugin", "novelId": "source-work", "novelPath": "/source/work" },
+  "fields": { "completed": { "value": true, "updatedAt": 1763350000000 } }
+}
+~~~
+
+`fields` holds at most 64 entries named `^[a-z][A-Za-z0-9]{0,63}$`. Each entry is
+exactly `{ value, updatedAt }`: a string of at most 8192 characters, a finite
+number, a boolean, or null, with a positive safe-integer millisecond timestamp.
+`completed` is the only field the server interprets and must be a boolean or
+null; a null value is a cleared field that is kept so the clearing reaches other
+devices. Other validly shaped fields are stored verbatim. The compact document
+is limited to 256 KiB.
+
+Merging is per field: the entry with the strictly greater `updatedAt` wins, a
+tie keeps the stored entry, and fields present on one side are kept. The
+identity is always that of the work being written.
+
+- `GET /api/v1/works/:id/override` follows the read policy and returns
+  `{ revision, override }`. It returns 404 for an unknown work or a work without
+  an override and 410 for a deleted work.
+- `PUT /api/v1/works/:id/override` requires a device key. The body identity must
+  hash to `:id` and equal the stored work identity. The server stores the merge
+  of the stored document and the body and returns `{ revision, override }`.
+  Local works are rejected with 400. A document without fields is not stored and
+  reports revision 0.
+- `GET /api/v1/work-overrides?after=0&limit=100` follows the read policy and
+  returns `{ items: [{ workId, revision, override }], cursor, hasMore }` in
+  ascending revision order, one item per work.
+
+`revision` is a server-wide strictly increasing integer taken from a durable
+counter. It advances only when a stored document changes and is never reused
+after a deletion. Both tables are additive extensions outside the original
+schema checksum.
+
+The same document is written atomically as `override.json` beside `novel.json`.
+Because the content folder may be synchronized by external tools, reading or
+writing one work's override first merges a valid sibling file into the stored
+document; an invalid file or one for another identity is ignored and replaced.
+The change feed reads stored documents only. Deleting a work removes its
+override row together with its folder, and a later restore starts without one.
+An index removal caused by a missing folder keeps the row.
+
 ## Migrations and chapter-number reconciliation
 
 Work migration and chapter-number correction use durable server records and

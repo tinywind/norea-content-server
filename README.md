@@ -50,6 +50,8 @@ The server has independent synchronization lanes:
 
 - **Content** — work metadata, covers, chapter packages, availability changes,
   deletions/restores, and chapter-number reconciliation.
+- **Work overrides** — user-set work metadata such as the manual completion
+  flag, merged per field and kept apart from source metadata.
 - **Shared user changes** — library membership, categories, reading tuples,
   bookmarks, resume state, and chapter compositions using durable revisions and
   idempotent operation receipts.
@@ -71,7 +73,9 @@ Major endpoint families:
 
 - `/api/v1/devices/*` — device registration and access.
 - `/api/v1/catalog/*` — work/chapter browsing and change cursors.
-- `/api/v1/works/*` — work metadata, covers, migrations, and reconciliation.
+- `/api/v1/works/*` — work metadata, covers, overrides, migrations, and
+  reconciliation.
+- `/api/v1/work-overrides` — work override change feed.
 - `/api/v1/chapters/*` — package upload, download, deletion, and restore.
 - `/api/v1/user-state/*` — durable shared user-state synchronization.
 - `/api/v1/reading-state/*` — legacy explicit reading-history exchange.

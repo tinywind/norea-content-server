@@ -12,6 +12,7 @@ import { assertMigrationNotRevoked, readWorkMigrations, readWorkMigration, recor
 import { isMigrationTextBody } from './migration-text-body.ts';
 import { availableChapter, chapterRow, chapterStoragePath, digest, type CatalogEntry, type Limits } from './packages.ts';
 import { coverBytes, deleteWork, getWork, isCoverFile, metadataByteLimit, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { carryWorkOverride, currentWorkOverride } from './work-overrides.ts';
 import { readVerifiedRegularFileSync, regularFileSignature } from './secure-files.ts';
 
 type Digest = { sha256: string; bytes: number };
@@ -147,6 +148,11 @@ function sourceFolderFence(dataDir: string, work: WorkRecord, rows: ChapterRecor
     const path = join(folder, name);
     if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) conflict('source cover is not a regular file');
     allowed.add(name); metadataFiles.push(fileFence(path));
+  }
+  if (names.includes('override.json')) {
+    const path = join(folder, 'override.json');
+    if (!lstatSync(path).isFile()) conflict('source override is not a regular file');
+    allowed.add('override.json'); metadataFiles.push(fileFence(path));
   }
   const extras = names.filter(name => !allowed.has(name));
   if (extras.length) {
@@ -403,12 +409,16 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
     if (completed) return completed;
     checkedWork(db, dataDir, sourceId, request.source.revision);
     checkedWork(db, dataDir, request.target.id, request.target.revision);
+    // Captured before retirement removes the source row and folder; reading leaves every fence intact.
+    const sourceOverride = currentWorkOverride(db, dataDir, sourceId);
+    let writeTargetOverride = () => {};
     let result: FinalizeMigrationResult;
     deleteWork(db, dataDir, sourceId, deletedWork => {
       result = { operationId: request.operationId, deletedWork };
       recordWorkMigrationLineage(db, { operationId: request.operationId, ...(legacyOperationId ? { legacyOperationId } : {}), sourceWork, targetWork, deletedSource: { revision: request.source.revision, sequence: deletedWork.sequence }, mappings, chapterDecisions, fullDecisionCoverage: request.chapterDecisions !== undefined });
       db.prepare('INSERT INTO work_migrations(operation_id,source_work_id,request_hash,result) VALUES(?,?,?,?)')
         .run(request.operationId, sourceId, requestHash, JSON.stringify(result));
+      writeTargetOverride = carryWorkOverride(db, dataDir, request.target.id, sourceOverride);
     }, retiredRoot => {
       // These guards run under deleteWork's BEGIN IMMEDIATE, before any row is removed.
       // Only the retired root's ctime may change because of the preceding directory rename.
@@ -421,6 +431,7 @@ export async function finalizeMigration(db: DatabaseSync, dataDir: string, sourc
       for (const fence of fences) assertChapterFence(db, fence, folder.root.path, retiredRoot);
       authorizeCommit?.();
     });
+    writeTargetOverride();
     return result!;
   } catch (error) {
     const completed = receipt(db, sourceId, request, requestHash);
