@@ -5,7 +5,7 @@ import { problem } from './db.ts';
 import { authenticate } from './auth.ts';
 import { availableChapter, digest } from './packages.ts';
 import type { CatalogEntry } from './packages.ts';
-import type { NovelMetadataV1, WorkEntry } from './works.ts';
+import { NOVEL_STATUS_VALUES, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
 interface WorkSummary {
   id: string;
@@ -20,7 +20,7 @@ const nullableText = { type: ['string', 'null'] };
 const identityText = { type: 'string', minLength: 1, maxLength: 4096 };
 const count = { type: 'integer', minimum: 0 };
 const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name', 'chapterNumber', 'page', 'contentType', 'complete'], properties: {
-  id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf'] }, complete: { type: 'boolean' },
+  id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf', 'epub'] }, complete: { type: 'boolean' },
 } };
 const chapterChangeSchema = { type: 'object', required: ['identity', 'complete', 'deleted', 'sequence'], properties: {
   identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelId: text, novelPath: text, chapterPath: text } },
@@ -29,7 +29,7 @@ const chapterChangeSchema = { type: 'object', required: ['identity', 'complete',
 const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identity', 'novel', 'hasCover', 'chapterCount'], properties: {
   id: text, sequence: count,
   identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath'], properties: { pluginId: text, novelId: text, novelPath: text } },
-  novel: { type: 'object', required: ['name', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal'], properties: { name: text, author: nullableText, artist: nullableText, summary: nullableText, status: nullableText, rating: { type: ['number', 'null'], minimum: 0, maximum: 5 }, genres: nullableText, isLocal: { type: 'boolean' } } },
+  novel: { type: 'object', required: ['name', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal'], properties: { name: text, author: nullableText, artist: nullableText, summary: nullableText, status: { type: ['string', 'null'], enum: [...NOVEL_STATUS_VALUES, null] }, rating: { type: ['number', 'null'], minimum: 0, maximum: 5 }, genres: nullableText, isLocal: { type: 'boolean' } } },
   hasCover: { type: 'boolean' }, chapterCount: count,
 } };
 const pagination = (limit: number) => ({ offset: { ...count, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: limit } });

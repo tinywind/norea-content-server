@@ -1005,3 +1005,29 @@ test('individual media retrieval rejects a declared size mismatch', async () => 
     assert.equal(response.statusCode, 410);
   } finally { await s.close(); }
 });
+
+test('accepts and serves chapter-files packages with epub contentType', async () => {
+  const s = await setup();
+  try {
+    const files = { 'content.html': Buffer.from('<p>epub body</p>') };
+    const manifest: PackageManifest = {
+      ...description(files),
+      chapter: { name: 'EPUB Chapter', position: 1, chapterNumber: '1', contentType: 'epub', page: '1' },
+    };
+    const uploaded = await upload(s, files, manifest);
+    assert.equal(uploaded.statusCode, 200, uploaded.body);
+    const entry = uploaded.json();
+
+    const body = await s.app.inject({
+      url: `/api/v1/chapters/${entry.id}/files?${new URLSearchParams({ revision: entry.revision, path: 'content.html' })}`,
+      headers: s.headers,
+    });
+    assert.equal(body.statusCode, 200, body.body);
+    assert.equal(body.body, '<p>epub body</p>');
+
+    const workId = digest(JSON.stringify(['source', '/work']));
+    const catalog = await s.app.inject({ url: `/api/v1/catalog/works/${workId}/chapters`, headers: s.headers });
+    assert.equal(catalog.statusCode, 200, catalog.body);
+    assert.equal(catalog.json().items[0].contentType, 'epub');
+  } finally { await s.close(); }
+});

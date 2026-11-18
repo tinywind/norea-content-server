@@ -12,7 +12,7 @@ import { consoleHeaders, deviceHeaders } from './access.ts';
 const identity = (novelId = 'Book') => ({ pluginId: 'example', novelId, novelPath: '/books/' + novelId });
 const workId = (novelId = 'Book') => digest(JSON.stringify(['example', '/books/' + novelId]));
 const metadata = (novelId = 'Book') => ({ schemaVersion: 1, identity: identity(novelId),
-  novel: { name: novelId, author: null, artist: null, summary: null, status: 'ongoing', rating: null, genres: null, isLocal: false },
+  novel: { name: novelId, author: null, artist: null, summary: null, status: 'Ongoing', rating: null, genres: null, isLocal: false },
   cover: null, chapters: {} });
 const override = (fields: Record<string, unknown>, novelId = 'Book') => ({ schemaVersion: 1, identity: identity(novelId), fields });
 const completed = (value: boolean | null, updatedAt: number) => ({ completed: { value, updatedAt } });
@@ -320,10 +320,16 @@ test('merges an externally synchronized override file and ignores an invalid one
 test('filters browsed works by completion, letting a set override decide over the plugin status', async () => {
   const f = await fixture(false, ['Ongoing', 'Marked', 'Unmarked', 'Cleared']);
   try {
-    for (const [novelId, status] of [['Plugin', 'Completed'], ['Wording', '완결'], ['Lowercase', 'completed'], ['Finished', 'Publishing Finished'],
-      ['Unmarked', 'Completed'], ['Cleared', 'Completed'], ['Unknown', null]] as const) {
+    for (const [novelId, status] of [['Plugin', 'Completed'], ['Finished', 'Publishing Finished'],
+      ['Hiatus', 'On Hiatus'], ['Cancelled', 'Cancelled'], ['Licensed', 'Licensed'], ['Unknown', 'Unknown'],
+      ['Unmarked', 'Completed'], ['Cleared', 'Completed'], ['Void', null]] as const) {
       const saved = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId(novelId), headers: f.headers, payload: { ...metadata(novelId), novel: { ...metadata(novelId).novel, status } } });
       assert.equal(saved.statusCode, 200, saved.body);
+    }
+    for (const invalidStatus of ['완결', 'completed', 'ongoing']) {
+      const rejected = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId('Invalid_' + invalidStatus), headers: f.headers, payload: { ...metadata('Invalid'), novel: { ...metadata('Invalid').novel, status: invalidStatus } } });
+      assert.equal(rejected.statusCode, 400, rejected.body);
+      assert.match(rejected.body, /invalid novel status/);
     }
     for (const [novelId, value] of [['Marked', true], ['Unmarked', false], ['Cleared', null]] as const) {
       assert.equal((await f.put(override(completed(value, 5), novelId), novelId)).statusCode, 200);
@@ -336,7 +342,7 @@ test('filters browsed works by completion, letting a set override decide over th
       return page.items.map((item: { novel: { name: string } }) => item.novel.name);
     };
     assert.deepEqual(await names('completed'), ['Cleared', 'Marked', 'Plugin']);
-    assert.deepEqual(await names('ongoing'), ['Finished', 'Lowercase', 'Ongoing', 'Unknown', 'Unmarked', 'Wording']);
+    assert.deepEqual(await names('ongoing'), ['Cancelled', 'Finished', 'Hiatus', 'Licensed', 'Ongoing', 'Unknown', 'Unmarked', 'Void']);
     assert.equal((await f.app.inject({ url: '/api/v1/catalog/works?completion=done', headers: f.headers })).statusCode, 400);
   } finally { await f.close(); }
 });

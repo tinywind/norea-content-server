@@ -13,7 +13,7 @@ import { consoleHeaders, deviceHeaders } from './access.ts';
 
 export function metadata() {
   return { schemaVersion: 1, identity: { pluginId: 'example', novelId: 'Book', novelPath: '/books/1?lang=ko' },
-    novel: { name: 'Book', author: 'Author', artist: null, summary: 'Summary', status: 'ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
+    novel: { name: 'Book', author: 'Author', artist: null, summary: 'Summary', status: 'Ongoing', rating: 4.5, genres: 'Fantasy', isLocal: false },
     cover: { fileName: 'cover.png', contentType: 'image/png' }, chapters: {} };
 }
 const id = digest(JSON.stringify(['example', '/books/1?lang=ko']));
@@ -379,5 +379,38 @@ test('cover uploads honor the declared target while reads can discover another l
     const fetched = await f.app.inject({ url: `/api/v1/works/${id}/cover`, headers: f.headers });
     assert.equal(fetched.rawPayload.toString(), 'new webp');
     assert.equal(fetched.headers['content-type'], 'image/webp');
+  } finally { await f.close(); }
+});
+
+test('accepts canonical NovelStatus values and null while rejecting non-canonical work statuses', async () => {
+  const f = await fixture();
+  try {
+    const base = metadata();
+    for (const status of ['Completed', 'Ongoing', 'On Hiatus', 'Cancelled', 'Publishing Finished', 'Licensed', 'Unknown', null] as const) {
+      const novelPath = `/books/status/${status ?? 'null'}`;
+      const workId = digest(JSON.stringify(['example', novelPath]));
+      const put = await f.app.inject({
+        method: 'PUT',
+        url: `/api/v1/works/${workId}`,
+        headers: f.headers,
+        payload: { ...base, identity: { pluginId: 'example', novelId: `Book-${status ?? 'null'}`, novelPath }, novel: { ...base.novel, status } },
+      });
+      assert.equal(put.statusCode, 200, `Expected 200 for status=${String(status)}: ${put.body}`);
+      const get = await f.app.inject({ url: `/api/v1/works/${workId}`, headers: f.headers });
+      assert.equal(get.statusCode, 200, get.body);
+      assert.equal(get.json().metadata.novel.status, status);
+    }
+
+    for (const invalidStatus of ['ongoing', 'completed', '완결', '연재중', '휴재', '', 'Unknown Status']) {
+      const workId = digest(JSON.stringify(['example', `/books/invalid/${invalidStatus}`]));
+      const put = await f.app.inject({
+        method: 'PUT',
+        url: `/api/v1/works/${workId}`,
+        headers: f.headers,
+        payload: { ...base, identity: { pluginId: 'example', novelId: `Invalid-${invalidStatus}`, novelPath: `/books/invalid/${invalidStatus}` }, novel: { ...base.novel, status: invalidStatus } },
+      });
+      assert.equal(put.statusCode, 400, `Expected 400 for invalid status=${JSON.stringify(invalidStatus)}: ${put.body}`);
+      assert.match(put.body, /work metadata: invalid novel status/);
+    }
   } finally { await f.close(); }
 });

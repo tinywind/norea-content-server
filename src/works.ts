@@ -14,6 +14,24 @@ import { mergeUserStateComposition } from './user-state-composition.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
 import { readVerifiedRegularFileSync } from './secure-files.ts';
 
+export const NOVEL_STATUS_VALUES = [
+  'Unknown',
+  'Ongoing',
+  'Completed',
+  'Licensed',
+  'Publishing Finished',
+  'Cancelled',
+  'On Hiatus',
+] as const;
+
+export type NovelStatusValue = (typeof NOVEL_STATUS_VALUES)[number];
+
+const NOVEL_STATUS_SET: ReadonlySet<string> = new Set(NOVEL_STATUS_VALUES);
+
+export function isNovelStatus(value: unknown): value is NovelStatusValue {
+  return typeof value === 'string' && NOVEL_STATUS_SET.has(value);
+}
+
 export interface NovelMetadataV1 {
   schemaVersion: 1;
   identity: { pluginId: string; novelId: string; novelPath: string };
@@ -22,7 +40,7 @@ export interface NovelMetadataV1 {
     author: string | null;
     artist: string | null;
     summary: string | null;
-    status: string | null;
+    status: NovelStatusValue | null;
     genres: string | null;
     rating: number | null;
     isLocal: boolean;
@@ -63,6 +81,7 @@ export function parseNovelMetadata(raw: unknown): NovelMetadataV1 {
   const novel = record(value.novel);
   text(novel.name);
   for (const key of ['author', 'artist', 'summary', 'status', 'genres']) text(novel[key] ?? null, true);
+  if (novel.status != null && !isNovelStatus(novel.status)) throw problem(400, 'work metadata: invalid novel status');
   if (novel.rating != null && (typeof novel.rating !== 'number' || !Number.isFinite(novel.rating) || novel.rating < 0 || novel.rating > 5)) throw problem(400, 'work metadata: invalid rating');
   if (novel.isLocal != null && typeof novel.isLocal !== 'boolean') throw problem(400, 'work metadata: invalid local flag');
   const chapters: NovelMetadataV1['chapters'] = {};

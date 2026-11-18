@@ -11,7 +11,7 @@ export interface PackageManifest {
   layout: 'chapter-files';
   identity: { pluginId: string; novelId: string; novelPath: string; chapterPath: string };
   novel: { name: string; author?: string | null; summary?: string | null; isLocal: boolean };
-  chapter: { name: string; position: number; chapterNumber?: string | null; contentType: 'html' | 'text' | 'markdown' | 'pdf'; page: string };
+  chapter: { name: string; position: number; chapterNumber?: string | null; contentType: 'html' | 'text' | 'markdown' | 'pdf' | 'epub'; page: string };
   bodyPath: string;
   files: { path: string; size: number; modifiedAt: number }[];
 }
@@ -64,7 +64,7 @@ export function validateManifest(value: unknown): asserts value is PackageManife
   };
   validUnicode(m);
   for (const v of [m.identity.pluginId, m.identity.novelPath, m.identity.chapterPath, m.novel.name, m.chapter.name]) if (typeof v !== 'string' || !v || v.length > 4096) throw problem(400, 'Invalid package identity or title');
-  if (typeof m.novel.isLocal !== 'boolean' || !Number.isFinite(m.chapter.position) || typeof m.chapter.page !== 'string' || !['html','text','markdown','pdf'].includes(m.chapter.contentType)) throw problem(400, 'Invalid package metadata');
+  if (typeof m.novel.isLocal !== 'boolean' || !Number.isFinite(m.chapter.position) || typeof m.chapter.page !== 'string' || !['html','text','markdown','pdf','epub'].includes(m.chapter.contentType)) throw problem(400, 'Invalid package metadata');
   chapterDirectory(m);
   if (typeof m.bodyPath !== 'string' || !safeArchivePath(m.bodyPath)) throw problem(400, 'Invalid body path');
   for (let index = 0; index < m.files.length; index++) {
