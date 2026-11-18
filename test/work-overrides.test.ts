@@ -444,3 +444,42 @@ test('filters browsed works by completion, letting a set override decide over th
     assert.equal((await f.app.inject({ url: '/api/v1/catalog/works?completion=done', headers: f.headers })).statusCode, 400);
   } finally { await f.close(); }
 });
+
+test('work override and cover updates wake /api/v1/changes long-polls and keep overrideCursor monotonic across work deletion', async () => {
+  const f = await fixture();
+  try {
+    const capabilities = (await f.app.inject({ url: '/api/v1/capabilities', headers: f.headers })).json();
+    assert.equal(capabilities.changeOverrideCursorVersion, 1);
+
+    const initialChanges = (await f.app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=1&overrideAfter=0&waitSeconds=0', headers: f.headers })).json();
+    assert.deepEqual(initialChanges, { catalogCursor: 0, workCursor: 1, overrideCursor: 0 });
+
+    const waitText = f.app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=1&overrideAfter=0&waitSeconds=20', headers: f.headers }).then(r => r.json());
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const putText = await f.put(override(statusField('On Hiatus', 100)));
+    assert.equal(putText.statusCode, 200);
+    const wokeText = await Promise.race([waitText, new Promise((_, reject) => setTimeout(() => reject(new Error('Override PUT did not wake long poll')), 1000))]);
+    assert.equal(wokeText.overrideCursor, putText.json().revision);
+
+    const waitCover = f.app.inject({ url: `/api/v1/changes?catalogAfter=0&workAfter=1&overrideAfter=${wokeText.overrideCursor}&waitSeconds=20`, headers: f.headers }).then(r => r.json());
+    await new Promise(resolve => setTimeout(resolve, 25));
+    const putCover = await f.app.inject({
+      method: 'PUT',
+      url: `/api/v1/works/${workId()}/override/cover?fileName=cover.override.png&updatedAt=200`,
+      headers: { ...f.headers, 'content-type': 'image/png' },
+      payload: Buffer.from('png-override'),
+    });
+    assert.equal(putCover.statusCode, 200);
+    const wokeCover = await Promise.race([waitCover, new Promise((_, reject) => setTimeout(() => reject(new Error('Override cover PUT did not wake long poll')), 1000))]);
+    assert.equal(wokeCover.overrideCursor, putCover.json().revision);
+
+    const deleted = await f.app.inject({ method: 'DELETE', url: `/api/v1/works/${workId()}`, headers: f.headers });
+    assert.equal(deleted.statusCode, 200);
+    const afterDelete = await f.app.inject({
+      url: `/api/v1/changes?catalogAfter=0&workAfter=${deleted.json().sequence}&overrideAfter=${wokeCover.overrideCursor}&waitSeconds=0`,
+      headers: f.headers,
+    });
+    assert.equal(afterDelete.statusCode, 200);
+    assert.equal(afterDelete.json().overrideCursor, wokeCover.overrideCursor);
+  } finally { await f.close(); }
+});

@@ -397,8 +397,8 @@ export function carryWorkOverride(db: DatabaseSync, dataDir: string, targetId: s
   };
 }
 
-export function registerWorkOverrides(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void }): void {
-  const { db, dataDir, requireRead } = context;
+export function registerWorkOverrides(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; notify?: () => void }): void {
+  const { db, dataDir, requireRead, notify } = context;
   const params = { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } };
   app.get<{ Params: { id: string } }>('/api/v1/works/:id/override', { schema: { params, security: [{ bearerAuth: [] }, {}],
     description: 'Read the user-set metadata override of a work and its change-feed revision. A valid sibling override.json synchronized into the work folder is merged first.',
@@ -410,7 +410,9 @@ export function registerWorkOverrides(app: FastifyInstance, context: { db: Datab
     description: 'Merge a WorkOverrideV1 document into the stored override: per field the strictly newer updatedAt wins and a tie keeps the stored entry. The revision advances only when the stored document changes.',
   } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
-    return saveWorkOverride(db, dataDir, request.params.id, request.body);
+    const result = saveWorkOverride(db, dataDir, request.params.id, request.body);
+    if (result.revision > 0) notify?.();
+    return result;
   });
   app.get<{ Params: { id: string } }>('/api/v1/works/:id/override/cover', { schema: { params, security: [{ bearerAuth: [] }, {}],
     description: 'Read the active cover.override image bytes for a work when set.',
@@ -431,7 +433,9 @@ export function registerWorkOverrides(app: FastifyInstance, context: { db: Datab
   }, async (request, reply) => {
     if (!Buffer.isBuffer(request.body)) throw problem(415, 'Raw image bytes are required');
     reply.header('Cache-Control', 'no-store');
-    return saveWorkOverrideCover(db, dataDir, request.params.id, request.query.fileName, request.query.updatedAt, request.body);
+    const result = saveWorkOverrideCover(db, dataDir, request.params.id, request.query.fileName, request.query.updatedAt, request.body);
+    if (result.revision > 0) notify?.();
+    return result;
   });
   app.get<{ Querystring: { after: number; limit: number } }>('/api/v1/work-overrides', { schema: {
     querystring: { type: 'object', properties: { after: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 100 } } },

@@ -52,9 +52,10 @@ test('change polling requires both current cursors and rejects invalid or future
     }
     assert.equal((await s.app.inject({ url: '/api/v1/changes?catalogAfter=1&workAfter=1&waitSeconds=0', headers })).statusCode, 409);
     assert.equal((await s.app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=2&waitSeconds=0', headers })).statusCode, 409);
-    assert.deepEqual((await s.app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=1&waitSeconds=0', headers })).json(), { catalogCursor: 0, workCursor: 1 });
+    assert.equal((await s.app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=1&overrideAfter=1&waitSeconds=0', headers })).statusCode, 409);
+    assert.deepEqual((await s.app.inject({ url: '/api/v1/changes?catalogAfter=0&workAfter=1&waitSeconds=0', headers })).json(), { catalogCursor: 0, workCursor: 1, overrideCursor: 0 });
     const schema = (await s.app.inject('/api/v1/openapi.json')).json();
-    assert.deepEqual(schema.paths['/api/v1/changes'].get.parameters.map((parameter: { name: string }) => parameter.name).sort(), ['catalogAfter', 'waitSeconds', 'workAfter']);
+    assert.deepEqual(schema.paths['/api/v1/changes'].get.parameters.map((parameter: { name: string }) => parameter.name).sort(), ['catalogAfter', 'overrideAfter', 'waitSeconds', 'workAfter']);
     assert.deepEqual(schema.paths['/api/v1/changes'].get.parameters.filter((parameter: { required: boolean }) => parameter.required).map((parameter: { name: string }) => parameter.name).sort(), ['catalogAfter', 'workAfter']);
     assert.ok(Object.keys(schema.paths).every(path => !/\/state|\/accounts|\/sessions/.test(path)));
   } finally { await s.close(); }
@@ -83,7 +84,7 @@ test('long poll timeout reads catalog changes committed by another database conn
     const pending = s.app.inject('/api/v1/changes?catalogAfter=0&workAfter=1&waitSeconds=1').then(response => response.json());
     await delay(30);
     db.prepare('INSERT INTO catalog_changes(chapter_id,entry) VALUES(?,?)').run('external', '{}');
-    assert.deepEqual(await pending, { catalogCursor: 1, workCursor: 1 });
+    assert.deepEqual(await pending, { catalogCursor: 1, workCursor: 1, overrideCursor: 0 });
   } finally { db.close(); await s.close(); }
 });
 
@@ -95,7 +96,7 @@ test('catalog publication and deletion wake anonymous long polls', async () => {
     await delay(20);
     const entry = (await s.app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...headers, 'content-type': multipartType }, payload: await chapterFiles() })).json();
     const first = await Promise.race([pending, delay(1000).then(() => { throw new Error('Catalog publish did not wake long poll'); })]);
-    assert.deepEqual(first, { catalogCursor: entry.sequence, workCursor: 1 });
+    assert.deepEqual(first, { catalogCursor: entry.sequence, workCursor: 1, overrideCursor: 0 });
     const next = s.app.inject(`/api/v1/changes?catalogAfter=${entry.sequence}&workAfter=1&waitSeconds=20`).then(response => response.json());
     await delay(20);
     await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers });
@@ -111,7 +112,7 @@ test('long poll timeout reads durable cursors and shutdown releases pending requ
     const response = await s.app.inject('/api/v1/changes?catalogAfter=0&workAfter=1&waitSeconds=1');
     assert.equal(response.statusCode, 200, response.body);
     assert.ok(performance.now() - start >= 900);
-    assert.deepEqual(response.json(), { catalogCursor: 0, workCursor: 1 });
+    assert.deepEqual(response.json(), { catalogCursor: 0, workCursor: 1, overrideCursor: 0 });
     const pending = s.app.inject('/api/v1/changes?catalogAfter=0&workAfter=1&waitSeconds=20').then(response => response);
     await delay(20);
     const closing = s.app.close();
