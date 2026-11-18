@@ -216,23 +216,25 @@ test('carries the source override into the target without blocking or repeating 
     await f.upload('source'); await f.upload('target');
     const override = (side: string, fields: Record<string, unknown>) => ({ schemaVersion: 1, identity: metadata(side).identity, fields });
     const put = (side: string, fields: Record<string, unknown>) => f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId(side) + '/override', headers: f.headers, payload: override(side, fields) });
-    const saved = await put('source', { completed: { value: true, updatedAt: 20 }, title: { value: 'Source title', updatedAt: 5 }, sourceOnly: { value: 1, updatedAt: 1 } });
+    const saved = await put('source', { status: { value: 'Completed', updatedAt: 20 }, title: { value: 'Source title', updatedAt: 5 }, sourceOnly: { value: 1, updatedAt: 1 } });
     assert.equal(saved.statusCode, 200, saved.body); assert.equal(saved.json().revision, 1);
-    assert.equal((await put('target', { completed: { value: false, updatedAt: 10 }, title: { value: 'Target title', updatedAt: 5 }, targetOnly: { value: null, updatedAt: 2 } })).json().revision, 2);
-    assert.deepEqual((await readdir(join(f.dataDir, 'contents/source/book'))).sort(), ['1', 'novel.json', 'override.json']);
+    assert.equal((await put('target', { status: { value: 'Ongoing', updatedAt: 10 }, title: { value: 'Target title', updatedAt: 5 }, targetOnly: { value: null, updatedAt: 2 } })).json().revision, 2);
+    assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${sourceId}/override/cover?fileName=cover.override.png&updatedAt=25`, headers: { ...f.headers, 'content-type': 'image/png' }, payload: Buffer.from('override-png') })).statusCode, 200);
+    assert.deepEqual((await readdir(join(f.dataDir, 'contents/source/book'))).sort(), ['1', 'cover.override.png', 'novel.json', 'override.json']);
     const payload = f.request();
     const response = await f.submit(payload);
     assert.equal(response.statusCode, 200, response.body);
-    const merged = override('target', { completed: { value: true, updatedAt: 20 }, sourceOnly: { value: 1, updatedAt: 1 },
-      targetOnly: { value: null, updatedAt: 2 }, title: { value: 'Target title', updatedAt: 5 } });
+    const merged = override('target', { cover: { value: 'cover.override.png', updatedAt: 25 }, sourceOnly: { value: 1, updatedAt: 1 },
+      status: { value: 'Completed', updatedAt: 20 }, targetOnly: { value: null, updatedAt: 2 }, title: { value: 'Target title', updatedAt: 5 } });
     const target = await f.app.inject('/api/v1/works/' + targetId + '/override');
-    assert.deepEqual(target.json(), { revision: 3, override: merged });
+    assert.deepEqual(target.json(), { revision: 4, override: merged });
     assert.deepEqual(JSON.parse(await readFile(join(f.dataDir, 'contents/target/book/override.json'), 'utf8')), merged);
+    assert.equal((await readFile(join(f.dataDir, 'contents/target/book/cover.override.png'))).toString(), 'override-png');
     assert.equal((await f.app.inject('/api/v1/works/' + sourceId + '/override')).statusCode, 410);
-    assert.deepEqual(f.db.prepare('SELECT work_id,revision FROM work_overrides').all().map(row => ({ ...row })), [{ work_id: targetId, revision: 3 }]);
+    assert.deepEqual(f.db.prepare('SELECT work_id,revision FROM work_overrides').all().map(row => ({ ...row })), [{ work_id: targetId, revision: 4 }]);
     const replay = await f.submit(payload);
     assert.equal(replay.statusCode, 200); assert.deepEqual(replay.json(), response.json());
-    assert.deepEqual((await f.app.inject('/api/v1/work-overrides')).json(), { items: [{ workId: targetId, revision: 3, override: merged }], cursor: 3, hasMore: false });
+    assert.deepEqual((await f.app.inject('/api/v1/work-overrides')).json(), { items: [{ workId: targetId, revision: 4, override: merged }], cursor: 4, hasMore: false });
   } finally { await f.close(); }
 });
 
@@ -253,7 +255,7 @@ test('carries a synchronized source override file to a target without one and le
     await writeFile(join(g.dataDir, 'contents/source/book/override.json'), JSON.stringify({ schemaVersion: 1, identity: metadata('source').identity, fields }));
     const response = await g.submit(g.request());
     assert.equal(response.statusCode, 200, response.body);
-    const carried = { schemaVersion: 1, identity: metadata('target').identity, fields };
+    const carried = { schemaVersion: 1, identity: metadata('target').identity, fields: { status: { value: 'Completed', updatedAt: 7 } } };
     assert.deepEqual(JSON.parse(await readFile(join(g.dataDir, 'contents/target/book/override.json'), 'utf8')), carried);
     assert.deepEqual((await g.app.inject('/api/v1/works/' + targetId + '/override')).json(), { revision: 1, override: carried });
   } finally { await g.close(); }

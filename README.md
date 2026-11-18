@@ -50,8 +50,9 @@ The server has independent synchronization lanes:
 
 - **Content** — work metadata, covers, chapter packages, availability changes,
   deletions/restores, and chapter-number reconciliation.
-- **Work overrides** — user-set work metadata such as the manual completion
-  flag, merged per field and kept apart from source metadata.
+- **Work overrides** — user-set work metadata overrides (title, author, artist,
+  summary, genres/tags, canonical status, and `cover.override.<ext>` cover image),
+  merged per field and kept apart from source metadata.
 - **Shared user changes** — library membership, categories, reading tuples,
   bookmarks, resume state, and chapter compositions using durable revisions and
   idempotent operation receipts.

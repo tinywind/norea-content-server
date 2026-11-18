@@ -10,7 +10,7 @@ import type { ChapterConflictPolicy, Limits } from './packages.ts';
 import { createChangeNotifications, readChangeCursors } from './changes.ts';
 import { registerAdministration, savedAnonymousRead } from './administration.ts';
 import { rebuildWorkIndex, registerWorks } from './works.ts';
-import { registerWorkOverrides } from './work-overrides.ts';
+import { registerWorkOverrides, upgradeWorkOverrides } from './work-overrides.ts';
 import { registerCatalog } from './catalog.ts';
 import { chapterFileStream, publishChapterFiles } from './chapter-files.ts';
 import { readChapterMediaAsset } from './chapter-media.ts';
@@ -43,7 +43,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   const dataDir = resolve(options.dataDir);
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
-  try { recoverChapterNumberReconciliations(db, dataDir); rebuildWorkIndex(db, dataDir); } catch (error) { db.close(); throw error; }
+  try { recoverChapterNumberReconciliations(db, dataDir); rebuildWorkIndex(db, dataDir); upgradeWorkOverrides(db, dataDir); } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
   const app = Fastify({ bodyLimit: 1024 * 1024, connectionTimeout: options.socketIdleTimeoutMs ?? SOCKET_IDLE_TIMEOUT_MS, requestTimeout: 0, logger: false, trustProxy: false });
   await app.register(rateLimit, { global: true, max: 6000, timeWindow: '1 minute' });
@@ -64,7 +64,7 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   registerUserState(app, db);
   registerUserStateCurrent(app, db);
   await registerDeviceBackups(app, db, dataDir);
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateCurrentVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateCurrentVersion: 2, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, anonymousRead }));
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateCurrentVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateCurrentVersion: 2, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');

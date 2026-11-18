@@ -1,15 +1,18 @@
 import { canonicalChapterNumber, chapterIdentityId } from './chapter-number-mappings.ts';
+import { join } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { problem } from './db.ts';
 import { authenticate } from './auth.ts';
 import { availableChapter, digest } from './packages.ts';
 import type { CatalogEntry } from './packages.ts';
-import { NOVEL_STATUS_VALUES, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { applyWorkOverrideToNovel, overrideCoverBytes, overrideCoverBytesForWork, parseWorkOverride, type WorkOverrideV1 } from './work-overrides.ts';
+import { coverBytes, getWork, NOVEL_STATUS_VALUES, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
 interface WorkSummary {
   id: string;
   sequence: number;
+  overrideRevision?: number;
   identity: NovelMetadataV1['identity'];
   novel: NovelMetadataV1['novel'];
   hasCover: boolean;
@@ -27,7 +30,7 @@ const chapterChangeSchema = { type: 'object', required: ['identity', 'complete',
   complete: { type: 'boolean' }, deleted: { type: 'boolean' }, sequence: count,
 } };
 const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identity', 'novel', 'hasCover', 'chapterCount'], properties: {
-  id: text, sequence: count,
+  id: text, sequence: count, overrideRevision: count,
   identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath'], properties: { pluginId: text, novelId: text, novelPath: text } },
   novel: { type: 'object', required: ['name', 'author', 'artist', 'summary', 'status', 'rating', 'genres', 'isLocal'], properties: { name: text, author: nullableText, artist: nullableText, summary: nullableText, status: { type: ['string', 'null'], enum: [...NOVEL_STATUS_VALUES, null] }, rating: { type: ['number', 'null'], minimum: 0, maximum: 5 }, genres: nullableText, isLocal: { type: 'boolean' } } },
   hasCover: { type: 'boolean' }, chapterCount: count,
@@ -35,13 +38,21 @@ const workSummarySchema = { type: 'object', required: ['id', 'sequence', 'identi
 const pagination = (limit: number) => ({ offset: { ...count, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: limit } });
 const pageSchema = (item: object) => ({ type: 'object', required: ['items', 'total', 'hasMore'], properties: { items: { type: 'array', items: item }, total: count, hasMore: { type: 'boolean' } } });
 const security: Record<string, string[]>[] = [{ bearerAuth: [] }, {}];
+const effectiveWorkName = `CASE
+  WHEN json_type(o.document,'$.fields.name.value')='text' AND trim(json_extract(o.document,'$.fields.name.value'))<>''
+    THEN trim(json_extract(o.document,'$.fields.name.value'))
+  ELSE json_extract(w.entry,'$.metadata.novel.name')
+END`;
 /**
- * 1 for a completed work, 0 otherwise: the user's completed override, else the plugin's exact
- * `Completed` status. Recognizing a source's own completion wording is the plugin's job.
+ * 1 for a completed work, 0 otherwise: the user's status override (`Completed`), legacy
+ * `completed` override, else the plugin's exact `Completed` status.
  */
-const completedWork = `COALESCE(
-  (SELECT CASE json_type(o.document,'$.fields.completed.value') WHEN 'true' THEN 1 WHEN 'false' THEN 0 END FROM work_overrides o WHERE o.work_id=w.id),
-  COALESCE(json_extract(w.entry,'$.metadata.novel.status'),'')='Completed')`;
+const completedWork = `(CASE
+  WHEN json_type(o.document,'$.fields.status.value')='text' THEN json_extract(o.document,'$.fields.status.value')
+  WHEN json_type(o.document,'$.fields.completed.value')='true' THEN 'Completed'
+  WHEN json_type(o.document,'$.fields.completed.value')='false' THEN 'Ongoing'
+  ELSE COALESCE(json_extract(w.entry,'$.metadata.novel.status'),'')
+END='Completed')`;
 
 export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
   const { db, dataDir, requireRead, catalogSchema } = context;
@@ -107,17 +118,52 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
     const { q, source, completion, offset, limit } = request.query;
     const clauses: string[] = []; const args: string[] = [];
     if (source) { clauses.push("json_extract(w.entry,'$.metadata.identity.pluginId')=?"); args.push(source); }
-    if (q) { clauses.push("instr(lower(json_extract(w.entry,'$.metadata.novel.name')),lower(?))>0"); args.push(q); }
+    if (q) { clauses.push(`instr(lower(${effectiveWorkName}),lower(?))>0`); args.push(q); }
     if (completion) clauses.push(`${completedWork}=${completion === 'completed' ? 1 : 0}`);
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const total = (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n;
-    const rows = db.prepare(`SELECT w.id,json_extract(w.entry,'$.sequence') AS sequence,
+    const total = (db.prepare(`SELECT COUNT(*) AS n FROM works w LEFT JOIN work_overrides o ON o.work_id=w.id ${where}`).get(...args) as { n: number }).n;
+    const rows = db.prepare(`SELECT w.id,w.directory,json_extract(w.entry,'$.sequence') AS sequence,
       json_extract(w.entry,'$.metadata.identity') AS identity,json_extract(w.entry,'$.metadata.novel') AS novel,
-      json_extract(w.entry,'$.hasCover') AS hasCover,
+      json_extract(w.entry,'$.hasCover') AS hasCover,o.revision AS overrideRevision,o.document AS overrideDocument,
       (SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS chapterCount
-      FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, limit, offset) as { id: string; sequence: number; identity: string; novel: string; hasCover: number; chapterCount: number }[];
-    const items: WorkSummary[] = rows.map(row => ({ ...row, identity: JSON.parse(row.identity), novel: JSON.parse(row.novel), hasCover: Boolean(row.hasCover) }));
+      FROM works w LEFT JOIN work_overrides o ON o.work_id=w.id ${where} ORDER BY ${effectiveWorkName},w.id LIMIT ? OFFSET ?`).all(...args, limit, offset) as {
+        id: string; directory: string; sequence: number; identity: string; novel: string; hasCover: number;
+        overrideRevision: number | null; overrideDocument: string | null; chapterCount: number;
+      }[];
+    const items: WorkSummary[] = rows.map(row => {
+      let override: WorkOverrideV1 | undefined;
+      if (row.overrideDocument) {
+        try { override = parseWorkOverride(JSON.parse(row.overrideDocument)); } catch { override = undefined; }
+      }
+      const novel = applyWorkOverrideToNovel(JSON.parse(row.novel) as NovelMetadataV1['novel'], override);
+      const overrideCover = override ? overrideCoverBytes(join(dataDir, row.directory), override) : undefined;
+      return {
+        id: row.id,
+        sequence: row.sequence,
+        ...(row.overrideRevision !== null ? { overrideRevision: row.overrideRevision } : {}),
+        identity: JSON.parse(row.identity),
+        novel,
+        hasCover: Boolean(row.hasCover) || overrideCover !== undefined,
+        chapterCount: row.chapterCount,
+      };
+    });
     return { items, total, hasMore: offset + items.length < total };
+  });
+  app.get<{ Params: { id: string } }>('/api/v1/catalog/works/:id/cover', { schema: {
+    security,
+    params: { type: 'object', required: ['id'], properties: { id: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
+    description: 'Read the effective cover image of a work (active cover.override image first, otherwise the source cover).',
+  } }, async (request, reply) => {
+    requireRead(request);
+    const entry = getWork(db, dataDir, request.params.id);
+    const overrideCover = overrideCoverBytesForWork(db, dataDir, entry.id);
+    if (overrideCover) {
+      return reply.header('Cache-Control', 'no-store').header('X-Content-Type-Options', 'nosniff').header('Content-Security-Policy', "default-src 'none'; sandbox").type(overrideCover.contentType ?? 'application/octet-stream').send(overrideCover.bytes);
+    }
+    const row = db.prepare('SELECT directory FROM works WHERE id=?').get(entry.id) as { directory: string } | undefined;
+    const bytes = row ? coverBytes(join(dataDir, row.directory), entry.metadata) : undefined;
+    if (!bytes) throw problem(404, 'Cover not found');
+    return reply.header('Cache-Control', 'no-store').header('X-Content-Type-Options', 'nosniff').header('Content-Security-Policy', "default-src 'none'; sandbox").type(entry.metadata.cover!.contentType ?? 'application/octet-stream').send(bytes);
   });
   app.get('/api/v1/catalog/sources', { schema: {
     security,

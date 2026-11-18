@@ -78,24 +78,28 @@ using recovered files.
 ## Work overrides
 
 User-set work metadata is kept apart from source metadata so that neither a
-metadata refresh nor a reinstall can change it. Capability
-`workOverrideVersion: 1` exposes one `WorkOverrideV1` document per remote work:
+metadata refresh nor a reinstall can change it. Capabilities
+`workOverrideVersion: 1` and `workOverrideCoverVersion: 1` expose one
+`WorkOverrideV1` document and optional `cover.override.<ext>` image per remote work:
 
 ~~~json
 {
   "schemaVersion": 1,
   "identity": { "pluginId": "source-plugin", "novelId": "source-work", "novelPath": "/source/work" },
-  "fields": { "completed": { "value": true, "updatedAt": 1763350000000 } }
+  "fields": { "status": { "value": "Completed", "updatedAt": 1763350000000 } }
 }
 ~~~
 
 `fields` holds at most 64 entries named `^[a-z][A-Za-z0-9]{0,63}$`. Each entry is
-exactly `{ value, updatedAt }`: a string of at most 8192 characters, a finite
-number, a boolean, or null, with a positive safe-integer millisecond timestamp.
-`completed` is the only field the server interprets and must be a boolean or
-null; a null value is a cleared field that is kept so the clearing reaches other
-devices. Other validly shaped fields are stored verbatim. The compact document
-is limited to 256 KiB.
+exactly `{ value, updatedAt }`: a string (`<= 8192` chars, or `<= 65536` for
+`summary`), a finite number, a boolean, or null, with a positive safe-integer
+millisecond timestamp. Known fields validated by the server are `name` (non-empty
+title string or null), `author`, `artist`, `genres`, `summary`, `status`
+(canonical `NovelStatus` constant or null), and `cover` (`cover.override.<ext>` or
+null); legacy `completed` entries automatically upgrade to `status` using the
+same timestamp. A null value is a cleared field that is kept so resetting back
+to the source value reaches other devices. Other validly shaped fields are stored
+verbatim. The compact document is limited to 256 KiB.
 
 Merging is per field: the entry with the strictly greater `updatedAt` wins, a
 tie keeps the stored entry, and fields present on one side are kept. The
@@ -109,6 +113,15 @@ identity is always that of the work being written.
   of the stored document and the body and returns `{ revision, override }`.
   Local works are rejected with 400. A document without fields is not stored and
   reports revision 0.
+- `GET /api/v1/works/:id/override/cover` and
+  `PUT /api/v1/works/:id/override/cover` read and atomically write
+  `cover.override.<ext>` beside `novel.json` and the untouched source `cover.<ext>`.
+  Clearing `fields.cover` removes `cover.override.*` without deleting source
+  `cover.<ext>`.
+- `/api/v1/catalog/works`, `/api/v1/catalog/works/:id/cover`,
+  `/api/v1/admin/works`, and `/api/v1/admin/works/:id/cover` reflect active
+  work overrides while `/api/v1/works/:id` and `/api/v1/works/:id/cover` remain
+  strictly source metadata.
 - `GET /api/v1/work-overrides?after=0&limit=100` follows the read policy and
   returns `{ items: [{ workId, revision, override }], cursor, hasMore }` in
   ascending revision order, one item per work.

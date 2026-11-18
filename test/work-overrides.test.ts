@@ -15,6 +15,7 @@ const metadata = (novelId = 'Book') => ({ schemaVersion: 1, identity: identity(n
   novel: { name: novelId, author: null, artist: null, summary: null, status: 'Ongoing', rating: null, genres: null, isLocal: false },
   cover: null, chapters: {} });
 const override = (fields: Record<string, unknown>, novelId = 'Book') => ({ schemaVersion: 1, identity: identity(novelId), fields });
+const statusField = (value: string | null, updatedAt: number) => ({ status: { value, updatedAt } });
 const completed = (value: boolean | null, updatedAt: number) => ({ completed: { value, updatedAt } });
 const url = (novelId = 'Book') => '/api/v1/works/' + workId(novelId) + '/override';
 
@@ -34,26 +35,31 @@ async function fixture(anonymousRead = false, works = ['Book']) {
   return { app, dataDir, headers, put, get, feed, file, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
 
-test('accepts the contract example, drops unknown top-level keys, and preserves unknown fields verbatim', () => {
+test('accepts metadata overrides, upgrades legacy completed to status, drops unknown top-level keys, and preserves unknown fields verbatim', () => {
   const example = { schemaVersion: 1, identity: { pluginId: 'goodtoon-webtoon', novelId: 'gt-16195', novelPath: '/manga/gt-16195/' },
-    fields: { completed: { value: true, updatedAt: 1763350000000 } } };
+    fields: { status: { value: 'Completed', updatedAt: 1763350000000 } } };
   assert.deepEqual(parseWorkOverride(example), example);
+  assert.deepEqual(parseWorkOverride({ schemaVersion: 1, identity: example.identity, fields: { completed: { value: true, updatedAt: 1763350000000 } } }), example);
   const { schemaVersion: _version, ...unversioned } = example;
   assert.deepEqual(parseWorkOverride(unversioned), example);
-  const fields = { title: { value: 'Custom title', updatedAt: 3 }, rating: { value: 4.5, updatedAt: 2 }, completed: { value: null, updatedAt: 1 },
+  const fields = { name: { value: '  Custom title  ', updatedAt: 3 }, author: { value: 'Custom author', updatedAt: 3 },
+    artist: { value: 'Custom artist', updatedAt: 3 }, summary: { value: 's'.repeat(65536), updatedAt: 4 },
+    genres: { value: 'Action, Drama', updatedAt: 3 }, rating: { value: 4.5, updatedAt: 2 },
+    completed: { value: true, updatedAt: 1 }, status: { value: null, updatedAt: 2 },
     futureFlag: { value: false, updatedAt: Number.MAX_SAFE_INTEGER }, constructor: { value: 'x'.repeat(8192), updatedAt: 5 } };
   const parsed = parseWorkOverride({ ...example, extra: true, fields });
-  assert.deepEqual(parsed, { ...example, fields });
   assert.deepEqual(Object.keys(parsed), ['schemaVersion', 'identity', 'fields']);
-  assert.deepEqual(Object.keys(parsed.fields), ['completed', 'constructor', 'futureFlag', 'rating', 'title']);
+  assert.deepEqual(Object.keys(parsed.fields), ['artist', 'author', 'constructor', 'futureFlag', 'genres', 'name', 'rating', 'status', 'summary']);
+  assert.deepEqual(parsed.fields.name, { value: 'Custom title', updatedAt: 3 });
+  assert.deepEqual(parsed.fields.status, { value: null, updatedAt: 2 });
 });
 
 test('rejects invalid override shapes', () => {
   const entry = { value: true, updatedAt: 1 };
   const invalid: [string, unknown][] = [
     ['not an object', []],
-    ['another version', { ...override(completed(true, 1)), schemaVersion: 2 }],
-    ['a textual version', { ...override(completed(true, 1)), schemaVersion: '1' }],
+    ['another version', { ...override(statusField('Completed', 1)), schemaVersion: 2 }],
+    ['a textual version', { ...override(statusField('Completed', 1)), schemaVersion: '1' }],
     ['a missing identity', { schemaVersion: 1, fields: {} }],
     ['an empty plugin ID', { ...override({}), identity: { ...identity(), pluginId: '' } }],
     ['an unsafe source ID', { ...override({}), identity: { ...identity(), novelId: '../Book' } }],
@@ -65,7 +71,7 @@ test('rejects invalid override shapes', () => {
     ['a numeric field name', override({ '1abc': entry })],
     ['a punctuated field name', override({ 'my-field': entry })],
     ['an overlong field name', override({ ['a'.repeat(65)]: entry })],
-    ['a bare field value', override({ completed: true })],
+    ['a bare field value', override({ status: 'Completed' })],
     ['an extra entry key', override({ note: { ...entry, source: 'device' } })],
     ['a missing timestamp', override({ note: { value: 'text' } })],
     ['a missing value', override({ note: { updatedAt: 1 } })],
@@ -77,6 +83,10 @@ test('rejects invalid override shapes', () => {
     ['an array value', override({ note: { value: [], updatedAt: 1 } })],
     ['a nonfinite number', override({ note: { value: Number.POSITIVE_INFINITY, updatedAt: 1 } })],
     ['an overlong string', override({ note: { value: 'x'.repeat(8193), updatedAt: 1 } })],
+    ['an overlong summary', override({ summary: { value: 'x'.repeat(65537), updatedAt: 1 } })],
+    ['a blank title override', override({ name: { value: '   ', updatedAt: 1 } })],
+    ['an invalid status string', override({ status: { value: '완결', updatedAt: 1 } })],
+    ['an unsafe override cover name', override({ cover: { value: 'cover.jpg', updatedAt: 1 } })],
     ['a textual completion flag', override({ completed: { value: 'yes', updatedAt: 1 } })],
     ['a numeric completion flag', override({ completed: { value: 1, updatedAt: 1 } })],
     ['too many fields', override(Object.fromEntries(Array.from({ length: 65 }, (_item, index) => ['field' + index, entry])))],
@@ -90,27 +100,29 @@ test('rejects invalid override shapes', () => {
 });
 
 test('merges per field: newer wins, a tie keeps the base, and a cleared value propagates', () => {
-  const base = parseWorkOverride(override({ completed: { value: true, updatedAt: 10 }, title: { value: 'Base', updatedAt: 10 }, baseOnly: { value: 1, updatedAt: 1 } }));
-  const incoming = parseWorkOverride({ ...override({ completed: { value: null, updatedAt: 11 }, title: { value: 'Incoming', updatedAt: 10 }, incomingOnly: { value: 'kept', updatedAt: 1 } }),
+  const base = parseWorkOverride(override({ status: { value: 'Completed', updatedAt: 10 }, title: { value: 'Base', updatedAt: 10 }, baseOnly: { value: 1, updatedAt: 1 } }));
+  const incoming = parseWorkOverride({ ...override({ status: { value: null, updatedAt: 11 }, title: { value: 'Incoming', updatedAt: 10 }, incomingOnly: { value: 'kept', updatedAt: 1 } }),
     identity: { pluginId: 'other', novelId: 'Elsewhere', novelPath: '/other' } });
   const merged = mergeWorkOverride(base, incoming);
-  assert.deepEqual(merged, override({ baseOnly: { value: 1, updatedAt: 1 }, completed: { value: null, updatedAt: 11 }, incomingOnly: { value: 'kept', updatedAt: 1 }, title: { value: 'Base', updatedAt: 10 } }));
-  assert.deepEqual(Object.keys(merged.fields), ['baseOnly', 'completed', 'incomingOnly', 'title']);
+  assert.deepEqual(merged, override({ baseOnly: { value: 1, updatedAt: 1 }, incomingOnly: { value: 'kept', updatedAt: 1 }, status: { value: null, updatedAt: 11 }, title: { value: 'Base', updatedAt: 10 } }));
+  assert.deepEqual(Object.keys(merged.fields), ['baseOnly', 'incomingOnly', 'status', 'title']);
   assert.deepEqual(mergeWorkOverride(merged, incoming), merged);
   assert.deepEqual(mergeWorkOverride(merged, merged), merged);
-  const older = parseWorkOverride(override(completed(false, 9)));
+  const older = parseWorkOverride(override(statusField('Ongoing', 9)));
   assert.deepEqual(mergeWorkOverride(base, older), base);
-  assert.deepEqual(mergeWorkOverride(older, base).fields.completed, { value: true, updatedAt: 10 });
+  assert.deepEqual(mergeWorkOverride(older, base).fields.status, { value: 'Completed', updatedAt: 10 });
   const reversed = mergeWorkOverride(incoming, base);
   assert.deepEqual(reversed.identity, incoming.identity);
   assert.deepEqual(reversed.fields.title, { value: 'Incoming', updatedAt: 10 });
-  assert.deepEqual(reversed.fields.completed, merged.fields.completed);
+  assert.deepEqual(reversed.fields.status, merged.fields.status);
 });
 
 test('stores merged overrides with a revision that advances only when the document changes', async () => {
   const f = await fixture();
   try {
-    assert.equal((await f.app.inject('/api/v1/capabilities')).json().workOverrideVersion, 1);
+    const caps = (await f.app.inject('/api/v1/capabilities')).json();
+    assert.equal(caps.workOverrideVersion, 1);
+    assert.equal(caps.workOverrideCoverVersion, 1);
     const missing = await f.get();
     assert.equal(missing.statusCode, 404); assert.equal(missing.json().message, 'Work override not found');
     const empty = await f.put(override({}));
@@ -120,7 +132,7 @@ test('stores merged overrides with a revision that advances only when the docume
 
     const first = await f.put({ ...override({ ...completed(true, 10), futureField: { value: 'kept', updatedAt: 4 } }), ignored: true });
     assert.equal(first.statusCode, 200, first.body);
-    const stored = override({ ...completed(true, 10), futureField: { value: 'kept', updatedAt: 4 } });
+    const stored = override({ futureField: { value: 'kept', updatedAt: 4 }, ...statusField('Completed', 10) });
     assert.deepEqual(first.json(), { revision: 1, override: stored });
     assert.equal(first.headers['cache-control'], 'no-store');
     const read = await f.get();
@@ -129,15 +141,15 @@ test('stores merged overrides with a revision that advances only when the docume
     assert.deepEqual(JSON.parse(await readFile(f.file(), 'utf8')), stored);
     const written = (await stat(f.file())).mtimeMs;
 
-    for (const repeated of [stored, override(completed(false, 10)), override(completed(false, 9)), override({})]) {
+    for (const repeated of [stored, override(statusField('Ongoing', 10)), override(statusField('Ongoing', 9)), override({})]) {
       const response = await f.put(repeated);
       assert.equal(response.statusCode, 200, response.body);
       assert.deepEqual(response.json(), { revision: 1, override: stored });
     }
     assert.equal((await stat(f.file())).mtimeMs, written);
 
-    const cleared = await f.put(override(completed(null, 11)));
-    const next = override({ ...completed(null, 11), futureField: { value: 'kept', updatedAt: 4 } });
+    const cleared = await f.put(override(statusField(null, 11)));
+    const next = override({ futureField: { value: 'kept', updatedAt: 4 }, ...statusField(null, 11) });
     assert.deepEqual(cleared.json(), { revision: 2, override: next });
     assert.deepEqual((await f.get()).json(), { revision: 2, override: next });
     assert.deepEqual(JSON.parse(await readFile(f.file(), 'utf8')), next);
@@ -145,7 +157,7 @@ test('stores merged overrides with a revision that advances only when the docume
     const restarted = await buildApp({ dataDir: f.dataDir, anonymousRead: false });
     try {
       assert.deepEqual((await restarted.inject({ url: url(), headers: f.headers })).json(), { revision: 2, override: next });
-      const later = await restarted.inject({ method: 'PUT', url: url(), headers: f.headers, payload: override(completed(false, 12)) });
+      const later = await restarted.inject({ method: 'PUT', url: url(), headers: f.headers, payload: override(statusField('Ongoing', 12)) });
       assert.equal(later.json().revision, 3);
     } finally { await restarted.close(); }
   } finally { await f.close(); }
@@ -210,9 +222,9 @@ test('pages the change feed in revision order with one entry per work and never 
     assert.equal((await f.put(override(completed(false, 2)))).json().revision, 4);
     const all = (await f.feed()).json();
     assert.deepEqual(all, { items: [
-      { workId: workId('Second'), revision: 2, override: override(completed(false, 1), 'Second') },
-      { workId: workId('Third'), revision: 3, override: override(completed(null, 1), 'Third') },
-      { workId: workId(), revision: 4, override: override(completed(false, 2)) },
+      { workId: workId('Second'), revision: 2, override: override(statusField('Ongoing', 1), 'Second') },
+      { workId: workId('Third'), revision: 3, override: override(statusField(null, 1), 'Third') },
+      { workId: workId(), revision: 4, override: override(statusField('Ongoing', 2)) },
     ], cursor: 4, hasMore: false });
     const first = (await f.feed('?limit=2')).json();
     assert.deepEqual(first.items.map((item: { revision: number }) => item.revision), [2, 3]);
@@ -226,7 +238,7 @@ test('pages the change feed in revision order with one entry per work and never 
 
     assert.equal((await f.app.inject({ method: 'DELETE', url: '/api/v1/works/' + workId(), headers: f.headers })).statusCode, 200);
     assert.deepEqual((await f.feed()).json().items.map((item: { revision: number }) => item.revision), [2, 3]);
-    assert.equal((await f.put(override(completed(true, 2), 'Second'), 'Second')).json().revision, 5);
+    assert.equal((await f.put(override(statusField('Completed', 2), 'Second'), 'Second')).json().revision, 5);
     assert.deepEqual((await f.feed('?after=4')).json().items.map((item: { workId: string }) => item.workId), [workId('Second')]);
   } finally { await f.close(); }
 });
@@ -234,7 +246,7 @@ test('pages the change feed in revision order with one entry per work and never 
 test('reads follow the anonymous-read policy while uploads always require a device key', async () => {
   const open = await fixture(true);
   try {
-    assert.equal((await open.put(override(completed(true, 1)))).statusCode, 200);
+    assert.equal((await open.put(override(statusField('Completed', 1)))).statusCode, 200);
     assert.equal((await open.app.inject(url())).statusCode, 200);
     assert.equal((await open.app.inject('/api/v1/work-overrides')).statusCode, 200);
     const unknown = { authorization: 'Bearer ' + '0'.repeat(64) };
@@ -242,16 +254,16 @@ test('reads follow the anonymous-read policy while uploads always require a devi
     assert.equal((await open.app.inject({ url: '/api/v1/work-overrides', headers: unknown })).statusCode, 401);
     const admin = await consoleHeaders(open.app, open.dataDir);
     assert.equal((await open.app.inject({ url: url(), headers: admin })).statusCode, 200);
-    const payload = override(completed(false, 2));
+    const payload = override(statusField('Ongoing', 2));
     assert.equal((await open.app.inject({ method: 'PUT', url: url(), payload })).statusCode, 401);
     assert.equal((await open.app.inject({ method: 'PUT', url: url(), headers: unknown, payload })).statusCode, 401);
     const denied = await open.app.inject({ method: 'PUT', url: url(), headers: admin, payload });
     assert.equal(denied.statusCode, 403); assert.equal(denied.json().message, 'Device key required');
-    assert.deepEqual((await open.get()).json(), { revision: 1, override: override(completed(true, 1)) });
+    assert.deepEqual((await open.get()).json(), { revision: 1, override: override(statusField('Completed', 1)) });
   } finally { await open.close(); }
   const closed = await fixture(false);
   try {
-    assert.equal((await closed.put(override(completed(true, 1)))).statusCode, 200);
+    assert.equal((await closed.put(override(statusField('Completed', 1)))).statusCode, 200);
     assert.equal((await closed.app.inject(url())).statusCode, 401);
     assert.equal((await closed.app.inject('/api/v1/work-overrides')).statusCode, 401);
     assert.equal((await closed.get()).statusCode, 200);
@@ -259,14 +271,14 @@ test('reads follow the anonymous-read policy while uploads always require a devi
     const db = openDatabase(closed.dataDir);
     try { db.prepare('UPDATE devices SET blocked=1').run(); } finally { db.close(); }
     assert.equal((await closed.get()).statusCode, 403);
-    assert.equal((await closed.put(override(completed(false, 2)))).statusCode, 403);
+    assert.equal((await closed.put(override(statusField('Ongoing', 2)))).statusCode, 403);
   } finally { await closed.close(); }
 });
 
 for (const access of ['console', 'device']) test(`${access} work deletion removes the override and a restore does not resurrect it`, async () => {
   const f = await fixture();
   try {
-    assert.equal((await f.put(override(completed(true, 1)))).json().revision, 1);
+    assert.equal((await f.put(override(statusField('Completed', 1)))).json().revision, 1);
     const removed = await f.app.inject({ method: 'DELETE', url: `/api/v1/${access === 'console' ? 'admin/' : ''}works/${workId()}`,
       headers: access === 'console' ? await consoleHeaders(f.app, f.dataDir) : f.headers });
     assert.equal(removed.statusCode, 200, removed.body);
@@ -276,18 +288,18 @@ for (const access of ['console', 'device']) test(`${access} work deletion remove
     assert.deepEqual((await f.feed()).json(), { items: [], cursor: 0, hasMore: false });
     const gone = await f.get();
     assert.equal(gone.statusCode, 410); assert.equal(gone.json().message, 'Work was deleted from the server');
-    assert.equal((await f.put(override(completed(false, 2)))).statusCode, 410);
+    assert.equal((await f.put(override(statusField('Ongoing', 2)))).statusCode, 410);
     assert.equal((await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId() + '?restore=true', headers: f.headers, payload: metadata() })).statusCode, 200);
     const restored = await f.get();
     assert.equal(restored.statusCode, 404); assert.equal(restored.json().message, 'Work override not found');
-    assert.deepEqual((await f.put(override(completed(false, 2)))).json(), { revision: 2, override: override(completed(false, 2)) });
+    assert.deepEqual((await f.put(override(statusField('Ongoing', 2)))).json(), { revision: 2, override: override(statusField('Ongoing', 2)) });
   } finally { await f.close(); }
 });
 
 test('merges an externally synchronized override file and ignores an invalid one', async () => {
   const f = await fixture();
   try {
-    const external = override({ ...completed(true, 5), title: { value: 'From another device', updatedAt: 5 } });
+    const external = override({ ...statusField('Completed', 5), title: { value: 'From another device', updatedAt: 5 } });
     await writeFile(f.file(), JSON.stringify(external));
     assert.deepEqual((await f.feed()).json().items, []);
     assert.deepEqual((await f.get()).json(), { revision: 1, override: external });
@@ -295,17 +307,17 @@ test('merges an externally synchronized override file and ignores an invalid one
     assert.deepEqual((await f.get()).json(), { revision: 1, override: external });
 
     await writeFile(f.file(), JSON.stringify(override({ ...completed(false, 6), title: { value: 'Stale', updatedAt: 4 } }), null, 4));
-    const merged = override({ ...completed(false, 6), title: { value: 'From another device', updatedAt: 5 } });
+    const merged = override({ ...statusField('Ongoing', 6), title: { value: 'From another device', updatedAt: 5 } });
     assert.deepEqual((await f.get()).json(), { revision: 2, override: merged });
     assert.deepEqual(JSON.parse(await readFile(f.file(), 'utf8')), merged);
 
     await writeFile(f.file(), JSON.stringify(override({ note: { value: 'file', updatedAt: 7 } })));
     const uploaded = await f.put(override(completed(true, 8)));
-    const combined = override({ ...completed(true, 8), note: { value: 'file', updatedAt: 7 }, title: { value: 'From another device', updatedAt: 5 } });
+    const combined = override({ note: { value: 'file', updatedAt: 7 }, ...statusField('Completed', 8), title: { value: 'From another device', updatedAt: 5 } });
     assert.deepEqual(uploaded.json(), { revision: 3, override: combined });
     assert.deepEqual(JSON.parse(await readFile(f.file(), 'utf8')), combined);
 
-    for (const invalid of ['{ not json', JSON.stringify(override({ completed: { value: 'yes', updatedAt: 99 } })), JSON.stringify(override(completed(false, 99), 'Other'))]) {
+    for (const invalid of ['{ not json', JSON.stringify(override({ completed: { value: 'yes', updatedAt: 99 } })), JSON.stringify(override(statusField('Ongoing', 99), 'Other'))]) {
       await writeFile(f.file(), invalid);
       assert.deepEqual((await f.get()).json(), { revision: 3, override: combined });
       assert.deepEqual(JSON.parse(await readFile(f.file(), 'utf8')), combined);
@@ -315,6 +327,92 @@ test('merges an externally synchronized override file and ignores an invalid one
     assert.deepEqual(JSON.parse(await readFile(f.file(), 'utf8')), combined);
     assert.deepEqual((await f.feed()).json().items.map((item: { revision: number; override: WorkOverrideV1 }) => [item.revision, item.override]), [[3, combined]]);
   } finally { await f.close(); }
+});
+
+test('stores and clears cover.override without removing the source cover and reflects overrides in catalog and admin', async () => {
+  const f = await fixture(true, ['Book']);
+  try {
+    const withCover = { ...metadata('Book'), cover: { fileName: 'cover.jpg', contentType: 'image/jpeg' } };
+    assert.equal((await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId('Book'), headers: f.headers, payload: withCover })).statusCode, 200);
+    assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/works/${workId('Book')}/cover`, headers: { ...f.headers, 'content-type': 'image/jpeg' }, payload: Buffer.from('source-jpg') })).statusCode, 200);
+
+    const coverPut = await f.app.inject({
+      method: 'PUT',
+      url: `/api/v1/works/${workId('Book')}/override/cover?fileName=cover.override.png&updatedAt=15`,
+      headers: { ...f.headers, 'content-type': 'image/png' },
+      payload: Buffer.from('override-png'),
+    });
+    assert.equal(coverPut.statusCode, 200, coverPut.body);
+    assert.equal(coverPut.json().revision, 1);
+    const workDir = join(f.dataDir, 'contents/example/Book');
+    assert.equal((await readFile(join(workDir, 'cover.jpg'))).toString(), 'source-jpg');
+    assert.equal((await readFile(join(workDir, 'cover.override.png'))).toString(), 'override-png');
+
+    assert.equal((await f.put(override({
+      name: { value: 'Renamed Title', updatedAt: 16 },
+      author: { value: 'Custom Author', updatedAt: 16 },
+      artist: { value: 'Custom Artist', updatedAt: 16 },
+      genres: { value: 'Fantasy, Drama', updatedAt: 16 },
+      summary: { value: 'Custom summary', updatedAt: 16 },
+      status: { value: 'On Hiatus', updatedAt: 16 },
+    }))).statusCode, 200);
+
+    // Source endpoints stay untouched so device source metadata comparison stays exact.
+    const rawWork = (await f.app.inject({ url: '/api/v1/works/' + workId('Book'), headers: f.headers })).json();
+    assert.equal(rawWork.metadata.novel.name, 'Book');
+    const rawCover = await f.app.inject({ url: `/api/v1/works/${workId('Book')}/cover`, headers: f.headers });
+    assert.equal(rawCover.rawPayload.toString(), 'source-jpg');
+
+    // Override cover and catalog/admin views reflect the overridden metadata and cover.override image.
+    const overrideCoverRes = await f.app.inject({ url: `/api/v1/works/${workId('Book')}/override/cover`, headers: f.headers });
+    assert.equal(overrideCoverRes.statusCode, 200);
+    assert.equal(overrideCoverRes.rawPayload.toString(), 'override-png');
+
+    const catalogPage = (await f.app.inject('/api/v1/catalog/works?q=Renamed')).json();
+    assert.equal(catalogPage.total, 1);
+    assert.equal(catalogPage.items[0].overrideRevision, 2);
+    assert.deepEqual(catalogPage.items[0].novel, {
+      name: 'Renamed Title', author: 'Custom Author', artist: 'Custom Artist', summary: 'Custom summary',
+      status: 'On Hiatus', rating: null, genres: 'Fantasy, Drama', isLocal: false,
+    });
+    const catalogCover = await f.app.inject(`/api/v1/catalog/works/${workId('Book')}/cover`);
+    assert.equal(catalogCover.rawPayload.toString(), 'override-png');
+
+    const adminHeaders = await consoleHeaders(f.app, f.dataDir);
+    const adminWorks = (await f.app.inject({ url: '/api/v1/admin/works?search=Renamed', headers: adminHeaders })).json();
+    assert.equal(adminWorks.total, 1);
+    assert.equal(adminWorks.items[0].metadata.novel.name, 'Renamed Title');
+    assert.equal((await f.app.inject({ url: `/api/v1/admin/works/${workId('Book')}/cover`, headers: adminHeaders })).rawPayload.toString(), 'override-png');
+
+    // Clearing the cover override removes cover.override.png while keeping cover.jpg intact.
+    assert.equal((await f.put(override({ cover: { value: null, updatedAt: 17 } }))).statusCode, 200);
+    assert.equal(existsSync(join(workDir, 'cover.override.png')), false);
+    assert.equal((await readFile(join(workDir, 'cover.jpg'))).toString(), 'source-jpg');
+    assert.equal((await f.app.inject(`/api/v1/catalog/works/${workId('Book')}/cover`)).rawPayload.toString(), 'source-jpg');
+    assert.equal((await f.app.inject(`/api/v1/works/${workId('Book')}/override/cover`)).statusCode, 404);
+  } finally { await f.close(); }
+});
+
+test('upgrades legacy completed overrides in SQLite and override.json on server startup', async () => {
+  await mkdir('.tmp', { recursive: true });
+  const dataDir = await mkdtemp(resolve('.tmp/work-overrides-upgrade-'));
+  let app = await buildApp({ dataDir, anonymousRead: true });
+  try {
+    const headers = await deviceHeaders(app);
+    await app.inject({ method: 'PUT', url: '/api/v1/works/' + workId(), headers, payload: metadata() });
+    await app.close();
+    const db = openDatabase(dataDir);
+    try {
+      const legacy = override(completed(true, 12345));
+      db.prepare('INSERT INTO work_override_revision(singleton,revision) VALUES(1,1)').run();
+      db.prepare('INSERT INTO work_overrides(work_id,revision,document) VALUES(?,1,?)').run(workId(), JSON.stringify(legacy));
+      await writeFile(join(dataDir, 'contents/example/Book/override.json'), JSON.stringify(legacy, null, 2));
+    } finally { db.close(); }
+    app = await buildApp({ dataDir, anonymousRead: true });
+    const expected = override(statusField('Completed', 12345));
+    assert.deepEqual((await app.inject('/api/v1/works/' + workId() + '/override')).json(), { revision: 2, override: expected });
+    assert.deepEqual(JSON.parse(await readFile(join(dataDir, 'contents/example/Book/override.json'), 'utf8')), expected);
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
 test('filters browsed works by completion, letting a set override decide over the plugin status', async () => {

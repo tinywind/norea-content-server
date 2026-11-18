@@ -11,7 +11,7 @@ import { problem } from './db.ts';
 import { assertMigrationNotRevoked, readWorkMigrations, readWorkMigration, recordWorkMigrationLineage, type MigrationChapterDecision, type MigrationLineageChapterDecision, type MigrationLineageMapping } from './work-migration-lineage.ts';
 import { isMigrationTextBody } from './migration-text-body.ts';
 import { availableChapter, chapterRow, chapterStoragePath, digest, type CatalogEntry, type Limits } from './packages.ts';
-import { coverBytes, deleteWork, getWork, isCoverFile, metadataByteLimit, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { coverBytes, deleteWork, getWork, isCoverFile, isOverrideCoverFile, metadataByteLimit, type NovelMetadataV1, type WorkEntry } from './works.ts';
 import { carryWorkOverride, currentWorkOverride } from './work-overrides.ts';
 import { readVerifiedRegularFileSync, regularFileSignature } from './secure-files.ts';
 
@@ -144,7 +144,7 @@ function sourceFolderFence(dataDir: string, work: WorkRecord, rows: ChapterRecor
   }
   const names = readdirSync(folder).sort();
   const metadataFiles: FileFence[] = [];
-  for (const name of names.filter(isCoverFile)) {
+  for (const name of names.filter(item => isCoverFile(item) || isOverrideCoverFile(item))) {
     const path = join(folder, name);
     if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink()) conflict('source cover is not a regular file');
     allowed.add(name); metadataFiles.push(fileFence(path));

@@ -14,6 +14,8 @@ import { mergeUserStateComposition } from './user-state-composition.ts';
 import { digest, recordEntry, validateStorageIdentity, type CatalogEntry } from './packages.ts';
 import { readVerifiedRegularFileSync } from './secure-files.ts';
 
+import { applyWorkOverrideToNovel, overrideCoverBytes, overrideCoverBytesForWork, parseWorkOverride, type WorkOverrideV1 } from './work-overrides.ts';
+
 export const NOVEL_STATUS_VALUES = [
   'Unknown',
   'Ongoing',
@@ -174,6 +176,7 @@ export function coverBytes(directory: string, metadata: NovelMetadataV1): Buffer
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
 }
 export const isCoverFile = (name: string) => /^cover\.(avif|bmp|gif|img|jpe?g|png|svg|webp)$/.test(name);
+export const isOverrideCoverFile = (name: string) => /^cover\.override\.(avif|bmp|gif|img|jpe?g|png|svg|webp)$/.test(name);
 function discoverCover(directory: string, preferred: NovelMetadataV1['cover']): NovelMetadataV1['cover'] {
   noLinks(directory);
   if (!existsSync(directory)) return preferred;
@@ -515,21 +518,39 @@ export function registerWorks(app: FastifyInstance, context: { db: DatabaseSync;
   });
   for (const prefix of ['/api/v1/works', '/api/v1/admin/works']) {
     app.get<{ Params: { id: string } }>(`${prefix}/:id/cover`, { schema: { params } }, async (request, reply) => {
-      if (prefix.includes('/admin/')) authenticate(db, request, true); else requireRead(request);
+      const isAdmin = prefix.includes('/admin/');
+      if (isAdmin) authenticate(db, request, true); else requireRead(request);
       const entry = getWork(db, dataDir, request.params.id);
+      const overrideCover = isAdmin ? overrideCoverBytesForWork(db, dataDir, entry.id) : undefined;
+      if (overrideCover) {
+        return reply.header('Cache-Control', 'no-store').header('X-Content-Type-Options', 'nosniff').header('Content-Security-Policy', "default-src 'none'; sandbox").type(overrideCover.contentType ?? 'application/octet-stream').send(overrideCover.bytes);
+      }
       const bytes = coverBytes(join(dataDir, rowFor(db, entry.id)!.directory), entry.metadata); if (!bytes) throw problem(404, 'Cover not found');
       return reply.header('Cache-Control', 'no-store').header('X-Content-Type-Options', 'nosniff').header('Content-Security-Policy', "default-src 'none'; sandbox").type(entry.metadata.cover!.contentType ?? 'application/octet-stream').send(bytes);
     });
   }
   app.get<{ Querystring: { search: string; offset: number; limit: number } }>('/api/v1/admin/works', { schema: { querystring: { type: 'object', properties: { search: { type: 'string', maxLength: 500, default: '' }, offset: { type: 'integer', minimum: 0, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100, default: 50 } } } } }, async (request, reply) => {
     authenticate(db, request, true); reply.header('Cache-Control', 'no-store');
-    const where = "WHERE (?='' OR instr(lower(json_extract(w.entry,'$.metadata.novel.name') || ' ' || json_extract(w.entry,'$.metadata.identity.pluginId')),lower(?))>0)";
+    const effectiveName = "CASE WHEN json_type(o.document,'$.fields.name.value')='text' AND trim(json_extract(o.document,'$.fields.name.value'))<>'' THEN trim(json_extract(o.document,'$.fields.name.value')) ELSE json_extract(w.entry,'$.metadata.novel.name') END";
+    const where = `WHERE (?='' OR instr(lower(${effectiveName} || ' ' || json_extract(w.entry,'$.metadata.identity.pluginId')),lower(?))>0)`;
     const args = [request.query.search, request.query.search];
-    const rows = db.prepare(`SELECT w.entry,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS downloadedChapters FROM works w ${where} ORDER BY json_extract(w.entry,'$.metadata.novel.name'),w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { entry: string; downloadedChapters: number }[];
+    const rows = db.prepare(`SELECT w.directory,w.entry,o.document AS overrideDocument,(SELECT COUNT(*) FROM chapters c WHERE c.work_id=w.id AND c.deleted_at IS NULL AND c.path IS NOT NULL) AS downloadedChapters FROM works w LEFT JOIN work_overrides o ON o.work_id=w.id ${where} ORDER BY ${effectiveName},w.id LIMIT ? OFFSET ?`).all(...args, request.query.limit, request.query.offset) as { directory: string; entry: string; overrideDocument: string | null; downloadedChapters: number }[];
     return { items: rows.map(row => {
       const entry = JSON.parse(row.entry) as WorkEntry;
+      let override: WorkOverrideV1 | undefined;
+      if (row.overrideDocument) {
+        try { override = parseWorkOverride(JSON.parse(row.overrideDocument)); } catch { override = undefined; }
+      }
       const { chapters, ...metadata } = entry.metadata;
-      return { ...entry, metadata, chapterCount: Object.keys(chapters).length, downloadedChapters: row.downloadedChapters };
-    }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w ${where}`).get(...args) as { n: number }).n };
+      const effectiveNovel = applyWorkOverrideToNovel(metadata.novel, override);
+      const overrideCover = override ? overrideCoverBytes(join(dataDir, row.directory), override) : undefined;
+      return {
+        ...entry,
+        hasCover: entry.hasCover || overrideCover !== undefined,
+        metadata: { ...metadata, novel: effectiveNovel },
+        chapterCount: Object.keys(chapters).length,
+        downloadedChapters: row.downloadedChapters,
+      };
+    }), total: (db.prepare(`SELECT COUNT(*) AS n FROM works w LEFT JOIN work_overrides o ON o.work_id=w.id ${where}`).get(...args) as { n: number }).n };
   });
 }
