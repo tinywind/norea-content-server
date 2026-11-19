@@ -101,9 +101,9 @@ function dbTableChecksum(db: DatabaseSync, sql: string, ...params: (string | num
 }
 
 function userStateChecksum(db: DatabaseSync): string {
-  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_state_current_records'").get();
+  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_state_records'").get();
   if (!exists) return 'none';
-  return dbTableChecksum(db, 'SELECT entity_key,kind,item FROM user_state_current_records ORDER BY entity_key');
+  return dbTableChecksum(db, 'SELECT entity_key,kind,revision,record FROM user_state_records ORDER BY entity_key');
 }
 
 /**

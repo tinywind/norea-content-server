@@ -42,11 +42,11 @@ export type StoredWorkMigrationLineage = Omit<WorkMigrationLineage, 'sequence' |
 export interface WorkMigrationPage { items: WorkMigrationLineage[]; cursor: number; hasMore: boolean }
 
 /** Called inside the same transaction as source retirement and its receipt. */
-export function recordWorkMigrationLineage(db: DatabaseSync, entry: StoredWorkMigrationLineage): void {
+export function recordWorkMigrationLineage(db: DatabaseSync, entry: StoredWorkMigrationLineage, now = Date.now()): void {
   if (!db.isTransaction) throw new Error('Migration lineage must commit with source retirement');
   db.prepare('INSERT INTO work_migration_lineage(operation_id,source_work_id,target_work_id,entry) VALUES(?,?,?,?)')
     .run(entry.operationId, entry.sourceWork.id, entry.targetWork.id, JSON.stringify(entry));
-  db.prepare('INSERT INTO work_migration_events(operation_id,active) VALUES(?,1)').run(entry.operationId);
+  db.prepare('INSERT INTO work_migration_events(operation_id,active,retired_at) VALUES(?,1,?)').run(entry.operationId, now);
 }
 
 /** Explicit restoration revokes migration exclusions without reversing migrated user data. */

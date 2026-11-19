@@ -26,6 +26,7 @@ interface StoredBackup extends DeviceBackupMetadata { revision: string }
 function deviceName(value: string): string {
   const name = value.trim();
   if (!name || name.length > 200 || /[\u0000-\u001f\u007f]/u.test(name)) throw problem(400, 'A device name of 1–200 characters is required');
+  if (name === '.' || name === '..') throw problem(400, 'Device name cannot be "." or ".."');
   return name;
 }
 const slotKey = (name: string) => createHash('sha256').update(name).digest('hex');
@@ -185,16 +186,34 @@ export class DeviceBackupStore {
       if (!published) await rm(blob, { force: true });
     }
   }
+
+  async delete(name: string): Promise<{ deleted: true; deviceName: string }> {
+    const normalized = deviceName(name);
+    const key = slotKey(normalized);
+    return this.locked(key, async () => {
+      const stored = await this.readSlot(key);
+      if (!stored) throw problem(404, 'No backup exists for this device');
+      await rm(join(this.slots, `${key}.json`), { force: true });
+      await syncDirectory(this.slots);
+      await rm(this.blobPath(key, stored), { force: true }).catch(() => {});
+      await syncDirectory(this.blobs).catch(() => {});
+      return { deleted: true, deviceName: stored.deviceName };
+    });
+  }
 }
 
-const metadataSchema = {
+export const deviceBackupMetadataSchema = {
   type: 'object', required: ['deviceName', 'updatedAt', 'size', 'sha256'], additionalProperties: false,
   properties: { deviceName: { type: 'string' }, updatedAt: { type: 'integer' }, size: { type: 'integer' }, sha256: { type: 'string' } },
 };
-const paramsSchema = { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 1, maxLength: 200 } } };
+export const deviceBackupParamsSchema = { type: 'object', required: ['name'], properties: { name: { type: 'string', minLength: 1, maxLength: 200 } } };
+export const deviceBackupDeleteResponseSchema = {
+  type: 'object', required: ['deleted', 'deviceName'], additionalProperties: false,
+  properties: { deleted: { const: true, type: 'boolean' }, deviceName: { type: 'string' } },
+};
 
-export async function registerDeviceBackups(app: FastifyInstance, db: DatabaseSync, dataDir: string): Promise<void> {
-  const store = new DeviceBackupStore(dataDir);
+export async function registerDeviceBackups(app: FastifyInstance, db: DatabaseSync, storeOrDataDir: DeviceBackupStore | string): Promise<void> {
+  const store = typeof storeOrDataDir === 'string' ? new DeviceBackupStore(storeOrDataDir) : storeOrDataDir;
   await app.register(async scoped => {
     // Other APIs may inherit a buffered parser; override it only in this child
     // context so backup streams bypass the normal JSON-sized body buffer.
@@ -205,7 +224,7 @@ export async function registerDeviceBackups(app: FastifyInstance, db: DatabaseSy
       authenticateDevice(db, request);
     });
     scoped.get('/api/v1/device-backups', { schema: {
-      security: [{ bearerAuth: [] }], response: { 200: { type: 'object', required: ['items'], properties: { items: { type: 'array', items: metadataSchema } } } },
+      security: [{ bearerAuth: [] }], response: { 200: { type: 'object', required: ['items'], properties: { items: { type: 'array', items: deviceBackupMetadataSchema } } } },
     } }, async () => ({ items: await store.list() }));
     scoped.put<{ Params: { name: string }; Body: Readable }>('/api/v1/device-backups/:name', {
       bodyLimit: DEVICE_BACKUP_MAX_BYTES,
@@ -214,9 +233,9 @@ export async function registerDeviceBackups(app: FastifyInstance, db: DatabaseSy
         if (Number(request.headers['content-length']) > DEVICE_BACKUP_MAX_BYTES) throw problem(413, 'Device backup exceeds the 512 MiB limit');
       },
       schema: {
-        security: [{ bearerAuth: [] }], consumes: ['application/octet-stream'], params: paramsSchema,
+        security: [{ bearerAuth: [] }], consumes: ['application/octet-stream'], params: deviceBackupParamsSchema,
         headers: { type: 'object', required: ['x-backup-sha256'], properties: { 'x-backup-sha256': { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
-        response: { 200: metadataSchema },
+        response: { 200: deviceBackupMetadataSchema },
         description: 'Store an opaque full-device backup archive under the device name. The latest completed upload atomically replaces that name; body maximum is 512 MiB. All registered, unblocked devices can list and restore these backups.',
       },
     }, async request => store.put(request.params.name, request.body, request.headers['x-backup-sha256'] as string, {
@@ -224,7 +243,7 @@ export async function registerDeviceBackups(app: FastifyInstance, db: DatabaseSy
       beforePublish: () => authenticateDevice(db, request),
     }));
     scoped.get<{ Params: { name: string }; Querystring: { sha256?: string } }>('/api/v1/device-backups/:name', { schema: {
-      security: [{ bearerAuth: [] }], params: paramsSchema,
+      security: [{ bearerAuth: [] }], params: deviceBackupParamsSchema,
       querystring: { type: 'object', additionalProperties: false, properties: { sha256: { type: 'string', pattern: '^[0-9a-f]{64}$' } } },
     } }, async (request, reply) => {
       const saved = await store.get(request.params.name, request.query.sha256);
@@ -232,5 +251,10 @@ export async function registerDeviceBackups(app: FastifyInstance, db: DatabaseSy
         .header('ETag', `"${saved.metadata.sha256}"`).header('X-Content-Type-Options', 'nosniff')
         .type('application/octet-stream').send(saved.body);
     });
+    scoped.delete<{ Params: { name: string } }>('/api/v1/device-backups/:name', { schema: {
+      security: [{ bearerAuth: [] }], params: deviceBackupParamsSchema,
+      response: { 200: deviceBackupDeleteResponseSchema },
+      description: 'Delete a stored device backup archive by device name.',
+    } }, async request => store.delete(request.params.name));
   });
 }

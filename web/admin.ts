@@ -1,8 +1,44 @@
 export {};
 
-type View = 'Overview' | 'Plugins' | 'Storage' | 'Content' | 'Jobs' | 'Devices' | 'Settings';
+type View = 'Overview' | 'Plugins' | 'Storage' | 'Content' | 'Jobs' | 'Devices' | 'User state' | 'Settings';
 type Child = Node | string | number | null | undefined;
 interface Device { id: string; deviceName: string; createdAt: number | string; lastSeenAt: number | string | null; blocked: boolean }
+interface DeviceBackup { deviceName: string; updatedAt: number; size: number; sha256: string }
+interface UserStateTableStat { name: string; rows: number; pages: number; bytes: number; tableBytes: number; indexBytes: number; payloadBytes: number }
+interface UserStateKindStat { total: number; active: number; tombstones: number }
+interface UserStateRetentionConfig {
+  pruneNonLibraryReading: { enabled: boolean; days: number };
+  stripReadingTimestamps: { enabled: boolean; days: number };
+  slidingWindow: { enabled: boolean; months: number };
+  tombstoneGc: { graceDays: number };
+}
+interface UserStateStats {
+  workspaceId: string;
+  epoch: string;
+  headRevision: number;
+  compactedThrough: number;
+  seedAllowed: boolean;
+  seedCutoffAt: number | null;
+  lastGcAt: number | null;
+  retention: UserStateRetentionConfig;
+  autoVacuum: number;
+  freelistPages: number;
+  pageSize: number;
+  pageCount: number;
+  dbBytes: number;
+  walBytes: number;
+  tables: UserStateTableStat[];
+  records: {
+    total: number;
+    active: number;
+    tombstones: number;
+    tombstonesEligibleForGc: number;
+    byKind: Record<string, UserStateKindStat>;
+  };
+  changes: { total: number; active: number; superseded: number; compactable: number };
+  operations: { total: number; withResult: number; prunableBodies: number; prunableFingerprints: number };
+  categoryAliases: { total: number; dangling: number };
+}
 interface Plugin { id: string; name: string; url: string; enabled: boolean; updatedAt: number | string; sources: { id: string; name: string; version: string; installMode?: string }[] }
 interface StorageSettings { path: string; mode: 'manual' | 'periodic' | 'changes'; intervalMinutes: number; enabled: boolean; lastScanAt?: number | string | null }
 interface Job { id: string; rootId: string; rootName: string; status: string; startedAt: number | string; finishedAt?: number | string; error?: string; summary?: { registered: number; unchanged: number; skipped: number; failed: number; removed: number; scanned: number; cancelled: boolean } }
@@ -41,7 +77,8 @@ const descriptions: Record<View, string> = {
   Storage: 'Inspect the content directory and scan for new or changed files.',
   Content: 'Browse works and metadata, inspect chapters, and delete server copies.',
   Jobs: 'Follow scans and inspect the outcome of every discovered file.',
-  Devices: 'Inspect registered devices and block or restore their access.',
+  Devices: 'Inspect registered devices, manage stored device backups, and block or restore access.',
+  'User state': 'Inspect user-state storage, compact or reset the workspace, and configure retention.',
   Settings: 'Control anonymous reading and inspect server configuration.',
 };
 const iconPaths: Record<View, string> = {
@@ -51,16 +88,20 @@ const iconPaths: Record<View, string> = {
   Content: 'M4 3h6a2 2 0 0 1 2 2v15a3 3 0 0 0-3-2H4zM12 5a2 2 0 0 1 2-2h6v15h-5a3 3 0 0 0-3 2',
   Jobs: 'M4 5h10M4 11h8M4 17h6M15 13l5 3-5 3z',
   Devices: 'M6 2h10v18H6zM9 17h4',
+  'User state': 'M11 3a8 8 0 1 0 8 8M11 7v4l3 2M16 3v4h4',
   Settings: 'M3 6h16M3 16h16M7 3v6M15 13v6',
 };
 
+function viewSlug(name: View): string {
+  return name.toLowerCase().replace(/\s+/g, '-');
+}
 function setToken(value: string) {
   token = value;
   if (value) sessionStorage.setItem(sessionKey, value); else sessionStorage.removeItem(sessionKey);
 }
 function routeView(): View {
   const name = location.pathname.replace(/\/$/, '').split('/').at(-1);
-  return (Object.keys(descriptions) as View[]).find(item => item.toLowerCase() === name) ?? 'Overview';
+  return (Object.keys(descriptions) as View[]).find(item => viewSlug(item) === name) ?? 'Overview';
 }
 function queryOffset(key = 'offset') {
   const value = Number(new URLSearchParams(location.search).get(key));
@@ -203,7 +244,7 @@ function login(error?: string) {
 function shell() {
   nav = el('nav', 'nav'); nav.setAttribute('aria-label', 'Administration');
   for (const name of Object.keys(descriptions) as View[]) {
-    const link = el('a', '', icon(name), name); link.href = `/admin/${name.toLowerCase()}`; link.dataset.view = name;
+    const link = el('a', '', icon(name), name); link.href = `/admin/${viewSlug(name)}`; link.dataset.view = name;
     link.addEventListener('click', event => {
       if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
       event.preventDefault(); void navigate(name);
@@ -217,7 +258,7 @@ function shell() {
     el('div', 'sidebar-footer', el('strong', '', 'Console session'), action('Sign out', async () => { await api('/console-sessions/current', 'DELETE'); setToken(''); login(); }))), main));
 }
 async function navigate(next: View, push = true) {
-  const path = `/admin/${next.toLowerCase()}`;
+  const path = `/admin/${viewSlug(next)}`;
   if (push && location.pathname + location.search !== path) history.pushState(null, '', path);
   else if (location.pathname.replace(/\/$/, '') !== path) history.replaceState(null, '', path + location.search);
   stopPolling(); clearCovers(); const current = ++generation; view = next;
@@ -228,7 +269,7 @@ async function navigate(next: View, push = true) {
   }
   page.replaceChildren(el('div', 'loading', 'Loading…')); document.title = `${next} · Norea`;
   try {
-    const render = { Overview: overview, Plugins: plugins, Storage: storage, Content: contentRoute, Jobs: jobs, Devices: devices, Settings: settings }[next];
+    const render = { Overview: overview, Plugins: plugins, Storage: storage, Content: contentRoute, Jobs: jobs, Devices: devices, 'User state': userState, Settings: settings }[next];
     await render(current);
   } catch (error) { if (current === generation) page.replaceChildren(el('div', 'notice error', message(error)), action('Try again', () => navigate(next, false))); }
 }
@@ -512,7 +553,11 @@ async function jobs(current: number) {
 }
 
 async function devices(current: number) {
-  const data = await api<{ items: Device[] }>('/admin/devices'); if (current !== generation) return;
+  const [data, backupsData] = await Promise.all([
+    api<{ items: Device[] }>('/admin/devices'),
+    api<{ items: DeviceBackup[] }>('/admin/device-backups'),
+  ]);
+  if (current !== generation) return;
   const list = panel('Registered devices', `${data.items.length} devices`); list.body.className = '';
   list.body.append(table(['Device', 'Registered', 'Last seen', 'Status', 'Access'], data.items.map(device => [
     el('div', '', el('div', 'cell-title', device.deviceName), el('div', 'hint mono', device.id.slice(0, 8))),
@@ -527,7 +572,135 @@ async function devices(current: number) {
       await navigate('Devices');
     }, device.blocked ? 'small' : 'small danger'),
   ]), 'No devices have connected yet.'));
-  page.replaceChildren(el('div', 'notice', 'New devices are allowed automatically. Blocking applies to the selected device key; a new key is treated as a new device. Anonymous reading, when enabled, remains available without a device key.'), list.node);
+  const backups = panel('Device backups', `${backupsData.items.length} stored archives`); backups.body.className = '';
+  backups.body.append(table(['Device name', 'Size', 'Updated', 'SHA-256', 'Actions'], backupsData.items.map(backup => [
+    el('div', 'cell-title', backup.deviceName),
+    bytes(backup.size),
+    date(backup.updatedAt),
+    el('span', 'mono', backup.sha256.slice(0, 16)),
+    action('Delete', async () => {
+      if (!confirm(`Delete stored backup archive for “${backup.deviceName}”? Local device databases remain untouched.`)) return;
+      await api(`/admin/device-backups/${encodeURIComponent(backup.deviceName)}`, 'DELETE');
+      if (current !== generation) return;
+      await navigate('Devices');
+      notify(`Deleted backup for “${backup.deviceName}”.`);
+    }, 'small danger'),
+  ]), 'No device backups stored on the server.'));
+  page.replaceChildren(
+    el('div', 'notice', 'New devices are allowed automatically. Blocking applies to the selected device key; a new key is treated as a new device. Anonymous reading, when enabled, remains available without a device key.'),
+    list.node,
+    backups.node,
+  );
+}
+
+async function userState(current: number) {
+  const data = await api<UserStateStats>('/admin/user-state');
+  if (current !== generation) return;
+  const totalUserStateBytes = data.tables.reduce((sum, item) => sum + item.bytes, 0);
+  const stats = el('div', 'stats');
+  for (const [label, value, detail] of [
+    ['Head revision', data.headRevision.toLocaleString(), `Compacted through ${data.compactedThrough.toLocaleString()}`],
+    ['Active records', data.records.active.toLocaleString(), `${data.records.tombstones.toLocaleString()} tombstones (${data.records.tombstonesEligibleForGc.toLocaleString()} GC-eligible)`],
+    ['User-state DB size', bytes(totalUserStateBytes), `of ${bytes(data.dbBytes)} total DB`],
+    ['Freelist / WAL', `${data.freelistPages.toLocaleString()} pages`, `${bytes(data.walBytes)} WAL · auto-vacuum ${data.autoVacuum === 2 ? 'incremental' : String(data.autoVacuum)}`],
+  ]) stats.append(el('div', 'stat', el('div', 'stat-label', label), el('div', 'stat-value', value), el('div', 'stat-detail', detail)));
+
+  const workspace = panel('Workspace & maintenance', 'Compact superseded changes, reclaim free SQLite pages, or rotate the workspace epoch.');
+  workspace.body.append(
+    details([
+      ['Workspace ID', el('span', 'mono', data.workspaceId)],
+      ['Epoch', el('span', 'mono', data.epoch)],
+      ['Head revision', data.headRevision.toLocaleString()],
+      ['Compacted through', data.compactedThrough.toLocaleString()],
+      ['Seed allowed', data.seedAllowed ? 'Yes' : 'Blocked (compacted history)'],
+      ['Seed cutoff', data.seedCutoffAt ? date(data.seedCutoffAt) : 'None'],
+      ['Last GC', date(data.lastGcAt)],
+      ['SQLite page size / count', `${bytes(data.pageSize)} × ${data.pageCount.toLocaleString()}`],
+    ]),
+    el('div', 'form-actions',
+      action('Compact & vacuum', async () => {
+        const res = await api<{ maintenance: { deletedChanges: number; nulledOperationBodies: number; deletedOperations: number; gcDeletedRecords: number } }>('/admin/user-state/compact', 'POST', {});
+        if (current !== generation) return;
+        await navigate('User state');
+        notify(`Compaction complete: ${res.maintenance.deletedChanges} changes, ${res.maintenance.nulledOperationBodies} bodies nulled, ${res.maintenance.deletedOperations} operations pruned, ${res.maintenance.gcDeletedRecords} records GC'd.`);
+      }, 'primary'),
+      action('Reset workspace epoch', async () => {
+        if (!confirm('Reset the shared user-state workspace and rotate its epoch? This clears all server user_state_* records, changes, receipts, and category aliases. Local device data and server catalog files remain untouched; devices will prompt to re-seed or start fresh.')) return;
+        await api('/admin/user-state/reset', 'POST', {});
+        if (current !== generation) return;
+        await navigate('User state');
+        notify('Workspace epoch rotated and server user-state cleared.');
+      }, 'danger'),
+    ),
+  );
+
+  const tableNotes = (name: string): string => {
+    if (name === 'user_state_changes') return `${data.changes.active.toLocaleString()} active · ${data.changes.superseded.toLocaleString()} superseded (${data.changes.compactable.toLocaleString()} compactable)`;
+    if (name === 'user_state_operations') return `${data.operations.withResult.toLocaleString()} with receipt · ${data.operations.prunableBodies.toLocaleString()} prunable bodies · ${data.operations.prunableFingerprints.toLocaleString()} prunable fingerprints`;
+    if (name === 'user_state_category_aliases') return `${data.categoryAliases.dangling.toLocaleString()} dangling`;
+    if (name === 'user_state_records') return `${data.records.active.toLocaleString()} active · ${data.records.tombstones.toLocaleString()} tombstones`;
+    return '—';
+  };
+  const storageBreakdown = panel('Storage breakdown', 'Per-table SQLite allocation and active vs. tombstone counts across entity kinds.');
+  storageBreakdown.body.append(
+    table(
+      ['Table', 'Rows', 'Allocated bytes', 'Payload bytes', 'Notes'],
+      data.tables.map(item => [
+        el('span', 'mono', item.name),
+        item.rows.toLocaleString(),
+        bytes(item.bytes),
+        bytes(item.payloadBytes),
+        tableNotes(item.name),
+      ]),
+      'No user-state tables found.',
+    ),
+    table(
+      ['Entity kind', 'Active', 'Tombstones', 'Total'],
+      Object.entries(data.records.byKind).map(([kind, counts]) => [
+        el('span', 'mono', kind),
+        counts.active.toLocaleString(),
+        counts.tombstones.toLocaleString(),
+        counts.total.toLocaleString(),
+      ]),
+      'No records stored.',
+    ),
+  );
+
+  const retention = panel('Retention policies', 'All retention policies are opt-in and disabled by default.');
+  const form = el('form'); const errors = el('div');
+  const p2aEnabled = input('p2aEnabled', 'checkbox', '', false); p2aEnabled.checked = data.retention.pruneNonLibraryReading.enabled;
+  const p2aDays = input('p2aDays', 'number', String(data.retention.pruneNonLibraryReading.days)); p2aDays.min = '1'; p2aDays.max = '36500'; p2aDays.step = '1';
+  const p2bEnabled = input('p2bEnabled', 'checkbox', '', false); p2bEnabled.checked = data.retention.stripReadingTimestamps.enabled;
+  const p2bDays = input('p2bDays', 'number', String(data.retention.stripReadingTimestamps.days)); p2bDays.min = '1'; p2bDays.max = '36500'; p2bDays.step = '1';
+  const p2cEnabled = input('p2cEnabled', 'checkbox', '', false); p2cEnabled.checked = data.retention.slidingWindow.enabled;
+  const p2cMonths = input('p2cMonths', 'number', String(data.retention.slidingWindow.months)); p2cMonths.min = '1'; p2cMonths.max = '1200'; p2cMonths.step = '1';
+  const gcDays = input('gcDays', 'number', String(data.retention.tombstoneGc.graceDays)); gcDays.min = '0'; gcDays.max = '3650'; gcDays.step = '1';
+  form.append(
+    el('label', 'check-field', p2aEnabled, '2-A: Prune reading & resume history for non-library works'),
+    el('label', 'check-field', p2bEnabled, '2-B: Strip read timestamps & resume position while preserving progress%'),
+    el('label', 'check-field', p2cEnabled, '2-C: Server sliding-window retention (retain local device history)'),
+    el('div', 'form-grid',
+      field('2-A non-library retention (days)', p2aDays),
+      field('2-B timestamp retention (days)', p2bDays),
+      field('2-C sliding window (months)', p2cMonths),
+      field('Physical tombstone GC grace (days)', gcDays),
+    ),
+    el('div', 'form-actions', submit(form, 'Save retention policies', async () => {
+      await api('/admin/user-state/retention', 'PATCH', {
+        pruneNonLibraryReading: { enabled: p2aEnabled.checked, days: Number(p2aDays.value) },
+        stripReadingTimestamps: { enabled: p2bEnabled.checked, days: Number(p2bDays.value) },
+        slidingWindow: { enabled: p2cEnabled.checked, months: Number(p2cMonths.value) },
+        tombstoneGc: { graceDays: Number(gcDays.value) },
+      });
+      if (current !== generation) return;
+      await navigate('User state');
+      notify('Retention policies saved.');
+    }, errors)),
+    errors,
+  );
+  retention.body.append(form);
+
+  page.replaceChildren(stats, workspace.node, storageBreakdown.node, retention.node);
 }
 
 async function settings(current: number) {

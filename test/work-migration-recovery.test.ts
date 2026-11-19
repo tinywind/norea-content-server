@@ -99,20 +99,25 @@ test('recovers discarded server-only chapters from backup without reviving tombs
     saveWork(liveDb, liveDataDir, targetMeta);
     const liveApp = await buildApp({ dataDir: liveDataDir, anonymousRead: true });
     const liveHeaders = await deviceHeaders(liveApp);
-    const scope = (await liveApp.inject({ url: '/api/v1/user-state/current', headers: liveHeaders })).json();
+    const scope = (await liveApp.inject({ url: '/api/v1/user-state', headers: liveHeaders })).json();
     const publishState = await liveApp.inject({
       method: 'POST',
-      url: '/api/v1/user-state/current',
+      url: '/api/v1/user-state/merge',
       headers: liveHeaders,
       payload: {
-        ...scope,
-        items: [
+        workspaceId: scope.workspaceId,
+        epoch: scope.epoch,
+        operations: [
           {
+            operationId: randomUUID(),
             entity: { kind: 'reading', work: { pluginId: 'bookkor-novel', sourceNovelId: '6951', novelPath: '/bookkor/6951', name: 'How an A-Rank Hunter Lives' }, chapter: { chapterPath: '/bookkor/6951-ep-1' } },
+            baseRevision: 0,
             value: { progress: 100, unread: false, readAt: 12345 },
           },
           {
+            operationId: randomUUID(),
             entity: { kind: 'bookmark', work: { pluginId: 'bookkor-novel', sourceNovelId: '6951', novelPath: '/bookkor/6951', name: 'How an A-Rank Hunter Lives' }, chapter: { chapterPath: '/bookkor/6951-ep-5' } },
+            baseRevision: 0,
             value: { bookmarked: true },
           },
         ],
@@ -179,8 +184,13 @@ test('recovers discarded server-only chapters from backup without reviving tombs
     assert.equal(anchorStatAfter.ino, anchorStatBefore.ino);
     assert.equal(anchorStatAfter.mtimeMs, anchorStatBefore.mtimeMs);
 
-    const viewAfter = (await liveApp.inject({ url: '/api/v1/user-state/current', headers: liveHeaders })).json();
-    assert.equal(viewAfter.items.length, 2);
+    const viewAfter = (await liveApp.inject({
+      method: 'POST',
+      url: '/api/v1/user-state/read',
+      headers: liveHeaders,
+      payload: { workspaceId: scope.workspaceId, epoch: scope.epoch, after: 0, limit: 100 },
+    })).json();
+    assert.equal(viewAfter.records.length, 2);
 
     // 5. Idempotency: second run skips all 10 without advancing catalog sequence or creating duplicates
     const seqBeforeReplay = (liveDb.prepare('SELECT max(sequence) AS n FROM catalog_changes').get() as { n: number }).n;

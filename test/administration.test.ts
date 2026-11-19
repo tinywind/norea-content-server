@@ -127,7 +127,7 @@ test('access policy survives restart and protects anonymous reads immediately', 
 test('console HTML has a strict local-only content policy and catalog supports empty search', async () => {
   const s = await setup();
   try {
-    for (const page of ['overview', 'plugins', 'storage', 'content', 'jobs', 'devices', 'settings']) {
+    for (const page of ['overview', 'plugins', 'storage', 'content', 'jobs', 'devices', 'user-state', 'settings']) {
       for (const suffix of ['', '/']) {
         const route = await s.app.inject(`/admin/${page}${suffix}`);
         assert.equal(route.statusCode, 200); assert.match(route.headers['content-type'] as string, /text\/html/);
@@ -305,4 +305,190 @@ test('failed scans flush pending result items before persisting their final stat
       assert.equal(detail.job.summary.scanned, 1); assert.equal(detail.job.summary.skipped, 1);
     } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
   } finally { await s.close(); }
+});
+
+test('admin user-state telemetry, manual compact, retention config, and workspace epoch reset preserve catalog and migrations', async () => {
+  await mkdir('.tmp', { recursive: true });
+  const root = await mkdtemp(resolve('.tmp', 'admin-user-state-'));
+  const dataDir = join(root, 'server');
+  let clock = Date.now();
+  const app = await buildApp({
+    dataDir,
+    userStateMaintenance: {
+      now: () => clock,
+      compactionIntervalMs: 0,
+      supersededGraceMs: 1_000,
+      operationBodyRetentionMs: 1_000,
+      operationFingerprintRetentionMs: 2_000,
+      tombstoneGraceMs: 5_000,
+    },
+  });
+  try {
+    const admin = await consoleHeaders(app, dataDir);
+    const device = await deviceHeaders(app, 'Admin-Test-Device');
+    const jsAsset = await app.inject('/admin/admin.js');
+    assert.equal(jsAsset.statusCode, 200);
+    assert.match(jsAsset.headers['content-type'] as string, /text\/javascript/);
+
+    // Auth boundaries on admin user-state endpoints.
+    for (const [method, url, payload] of [
+      ['GET', '/api/v1/admin/user-state', undefined],
+      ['POST', '/api/v1/admin/user-state/compact', {}],
+      ['POST', '/api/v1/admin/user-state/reset', {}],
+      ['PATCH', '/api/v1/admin/user-state/retention', { tombstoneGc: { graceDays: 10 } }],
+    ] as const) {
+      assert.equal((await app.inject({ method, url, payload })).statusCode, 401);
+      assert.equal((await app.inject({ method, url, payload, headers: device })).statusCode, 403);
+    }
+
+    const ws = (await app.inject({ url: '/api/v1/user-state', headers: device })).json();
+    const scope = { workspaceId: ws.workspaceId, epoch: ws.epoch };
+    const work = { pluginId: 'example-source', sourceNovelId: 'n1', novelPath: '/n1', name: 'N1' };
+
+    // Create records across all 7 kinds (including active and tombstones) + superseded change + alias.
+    const merge1 = (await app.inject({
+      method: 'POST',
+      url: '/api/v1/user-state/merge',
+      headers: device,
+      payload: {
+        ...scope,
+        operations: [
+          { operationId: 'op-lib-1', entity: { kind: 'library', work }, baseRevision: 0, value: { inLibrary: true, addedAt: 100 } },
+          { operationId: 'op-read-1', entity: { kind: 'reading', work, chapter: { chapterPath: '/c1' } }, baseRevision: 0, value: { progress: 50, unread: false, readAt: 100 } },
+          { operationId: 'op-read-tomb', entity: { kind: 'reading', work, chapter: { chapterPath: '/c2' } }, baseRevision: 0, value: { progress: 0, unread: true, readAt: null } },
+          { operationId: 'op-bm-tomb', entity: { kind: 'bookmark', work, chapter: { chapterPath: '/c1' } }, baseRevision: 0, value: { bookmarked: false } },
+          { operationId: 'op-cat-1', entity: { kind: 'category', categoryId: 'cat-1' }, baseRevision: 0, value: { name: 'Shelf', sort: 1, deleted: false } },
+          { operationId: 'op-cat-alias', entity: { kind: 'category', categoryId: 'cat-alias' }, baseRevision: 0, value: { name: 'Shelf', sort: 2, deleted: false } },
+          { operationId: 'op-mem-1', entity: { kind: 'membership', work, categoryId: 'cat-1' }, baseRevision: 0, value: { included: true } },
+          { operationId: 'op-res-1', entity: { kind: 'resume', work }, baseRevision: 0, value: { chapter: null, anchor: null, openedAt: null } },
+          { operationId: 'op-comp-1', entity: { kind: 'composition', work }, baseRevision: 0, value: { composition: { version: 1, updatedAt: 1, entries: [] } } },
+        ],
+      },
+    })).json();
+    assert.equal(merge1.headRevision, 8);
+    // Supersede library entry.
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/user-state/merge',
+      headers: device,
+      payload: {
+        ...scope,
+        operations: [
+          { operationId: 'op-lib-2', entity: { kind: 'library', work }, baseRevision: 1, value: { inLibrary: false, addedAt: null } },
+        ],
+      },
+    });
+
+    clock += 3_000;
+    const statsRes = await app.inject({ url: '/api/v1/admin/user-state', headers: admin });
+    assert.equal(statsRes.statusCode, 200, statsRes.body);
+    const stats = statsRes.json();
+    assert.equal(stats.workspaceId, ws.workspaceId);
+    assert.equal(stats.epoch, ws.epoch);
+    assert.equal(stats.headRevision, 9);
+    assert.equal(stats.compactedThrough, 0);
+    assert.equal(stats.seedAllowed, true);
+    assert.equal(stats.seedCutoffAt, null);
+    assert.equal(stats.autoVacuum, 2);
+    assert.equal(stats.tables.length, 5);
+    assert.ok(stats.tables.every((t: { bytes: number; rows: number }) => typeof t.bytes === 'number' && typeof t.rows === 'number'));
+    assert.equal(stats.records.total, 8);
+    assert.equal(stats.records.active, 4); // reading(c1), category(cat-1), membership, composition
+    assert.equal(stats.records.tombstones, 4); // reading(c2), bookmark, library(false), resume(null)
+    assert.equal(stats.records.byKind.reading.active, 1);
+    assert.equal(stats.records.byKind.reading.tombstones, 1);
+    assert.equal(stats.records.byKind.library.tombstones, 1);
+    assert.equal(stats.records.byKind.bookmark.tombstones, 1);
+    assert.equal(stats.records.byKind.resume.tombstones, 1);
+    assert.equal(stats.records.byKind.category.active, 1);
+    assert.equal(stats.records.byKind.membership.active, 1);
+    assert.equal(stats.records.byKind.composition.active, 1);
+    assert.equal(stats.changes.superseded, 1);
+    assert.equal(stats.changes.compactable, 1);
+    assert.equal(stats.operations.prunableBodies, 10);
+    assert.equal(stats.operations.prunableFingerprints, 10);
+    assert.equal(stats.categoryAliases.total, 1);
+    assert.equal(stats.retention.pruneNonLibraryReading.enabled, false);
+    assert.equal(stats.retention.stripReadingTimestamps.enabled, false);
+    assert.equal(stats.retention.slidingWindow.enabled, false);
+    assert.equal(stats.retention.tombstoneGc.graceDays, 30);
+
+    // Retention validation & persistence.
+    for (const invalid of [
+      {},
+      { unknown: 1 },
+      { pruneNonLibraryReading: {} },
+      { pruneNonLibraryReading: { unknown: 1 } },
+      { pruneNonLibraryReading: { days: 0 } },
+      { slidingWindow: { months: 0 } },
+      { tombstoneGc: { graceDays: -1 } },
+    ]) {
+      assert.equal((await app.inject({ method: 'PATCH', url: '/api/v1/admin/user-state/retention', headers: admin, payload: invalid })).statusCode, 400);
+    }
+    const patchRes = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/admin/user-state/retention',
+      headers: admin,
+      payload: { slidingWindow: { enabled: true, months: 6 } },
+    });
+    assert.equal(patchRes.statusCode, 200, patchRes.body);
+    assert.equal(patchRes.json().retention.slidingWindow.enabled, true);
+    assert.equal(patchRes.json().retention.slidingWindow.months, 6);
+    assert.ok(typeof patchRes.json().state.seedCutoffAt === 'number');
+
+    // Manual compact + full vacuum zeroes freelistPages & walBytes.
+    const compactRes = await app.inject({ method: 'POST', url: '/api/v1/admin/user-state/compact', headers: admin, payload: {} });
+    assert.equal(compactRes.statusCode, 200, compactRes.body);
+    assert.equal(compactRes.json().state.freelistPages, 0);
+    assert.equal(compactRes.json().state.walBytes, 0);
+
+    // Insert non-user-state witnesses (reading_state_entries, admin_settings, work_migration_lineage) to verify reset preserves them.
+    const { openDatabase } = await import('../src/db.ts');
+    const db = openDatabase(dataDir);
+    try {
+      db.prepare('INSERT INTO reading_state_entries(profile_hash,entry_key,entry) VALUES(?,?,?)').run('p1', 'k1', '{"progress":10}');
+      db.prepare('INSERT INTO admin_settings(key,value) VALUES(?,?)').run('witness', '"keep"');
+    } finally { db.close(); }
+
+    const resetRes = await app.inject({ method: 'POST', url: '/api/v1/admin/user-state/reset', headers: admin });
+    assert.equal(resetRes.statusCode, 200, resetRes.body);
+    const resetBody = resetRes.json();
+    assert.equal(resetBody.reset, true);
+    assert.equal(resetBody.previousEpoch, ws.epoch);
+    assert.notEqual(resetBody.state.epoch, ws.epoch);
+    assert.equal(resetBody.state.workspaceId, ws.workspaceId);
+    assert.equal(resetBody.state.headRevision, 0);
+    assert.equal(resetBody.state.compactedThrough, 0);
+    assert.equal(resetBody.state.seedAllowed, true);
+    assert.equal(resetBody.state.seedCutoffAt, null);
+    assert.equal(resetBody.state.records.total, 0);
+    assert.equal(resetBody.state.changes.total, 0);
+    assert.equal(resetBody.state.operations.total, 0);
+    assert.equal(resetBody.state.categoryAliases.total, 0);
+
+    // Old epoch client gets 409.
+    assert.equal((await app.inject({
+      method: 'POST',
+      url: '/api/v1/user-state/read',
+      headers: device,
+      payload: { ...scope, after: 0 },
+    })).statusCode, 409);
+
+    // Restart preserves headRevision === 0 and non-user-state tables.
+    await app.close();
+    const restarted = await buildApp({ dataDir });
+    try {
+      const wsAfterRestart = (await restarted.inject({ url: '/api/v1/user-state', headers: device })).json();
+      assert.equal(wsAfterRestart.epoch, resetBody.state.epoch);
+      assert.equal(wsAfterRestart.headRevision, 0);
+      const verifyDb = openDatabase(dataDir);
+      try {
+        assert.equal(verifyDb.prepare('SELECT COUNT(*) AS n FROM reading_state_entries').get()?.n, 1);
+        assert.equal(verifyDb.prepare('SELECT value FROM admin_settings WHERE key=?').get('witness')?.value, '"keep"');
+      } finally { verifyDb.close(); }
+    } finally { await restarted.close(); }
+  } finally {
+    await app.close().catch(() => {});
+    await rm(root, { recursive: true, force: true });
+  }
 });

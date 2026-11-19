@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -26,9 +27,9 @@ async function fixture() {
   const dataDir = await mkdtemp(join(tmpdir(), 'norea-user-state-composition-'));
   const app = await buildApp({ dataDir });
   const headers = await deviceHeaders(app);
-  const { workspaceId, epoch } = (await app.inject({ url: '/api/v1/user-state/current', headers })).json();
-  const share = (document: ChapterCompositionV1) => app.inject({ method: 'POST', url: '/api/v1/user-state/current', headers, payload: {
-    version: 2, workspaceId, epoch, items: [{ entity: { kind: 'composition', work: { pluginId: identity.pluginId, sourceNovelId: identity.novelId, novelPath: identity.novelPath, name: 'Book' } }, value: { composition: document } }],
+  const { workspaceId, epoch } = (await app.inject({ url: '/api/v1/user-state', headers })).json();
+  const share = (document: ChapterCompositionV1) => app.inject({ method: 'POST', url: '/api/v1/user-state/merge', headers, payload: {
+    workspaceId, epoch, operations: [{ operationId: randomUUID(), entity: { kind: 'composition', work: { pluginId: identity.pluginId, sourceNovelId: identity.novelId, novelPath: identity.novelPath, name: 'Book' } }, baseRevision: 0, value: { composition: document } }],
   } });
   const put = (document?: ChapterCompositionV1) => app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers, payload: metadata(document) });
   const directory = join(dataDir, 'contents', identity.pluginId, identity.novelId);
@@ -62,7 +63,7 @@ test('shared manual choices win over newer metadata clocks while exact provider 
     const backwardsClock = structuredClone(shared); backwardsClock.updatedAt = 1; backwardsClock.entries[0].user.name = 'New intent from a slower clock';
     successful(await f.share(backwardsClock));
     const replayed = successful(await f.put(incoming)).metadata.chapterComposition as ChapterCompositionV1;
-    assert.equal(replayed.entries[0].user.name, 'Shared manual title');
+    assert.equal(replayed.entries[0].user.name, 'New intent from a slower clock');
     assert.equal(replayed.entries[0].sources[0].name, 'Refreshed provider title');
     assert.equal(replayed.entries.length, 3);
     assert.equal(await readFile(f.file, 'utf8'), JSON.stringify(successful(await f.put(incoming)).metadata, null, 2) + '\n');
@@ -205,11 +206,13 @@ test('opening a genuine pre-user-state schema adds an empty namespace without im
     try {
       checksum = db.prepare('SELECT checksum FROM schema_state').get()?.checksum;
       db.prepare('INSERT INTO reading_state_entries(profile_hash,entry_key,entry) VALUES(?,?,?)').run('pre-existing-private-scope', 'a-chapter', '{}');
-      for (const table of ['user_state_current_records', 'user_state_current_meta', 'user_state_category_aliases', 'user_state_operations', 'user_state_changes', 'user_state_records', 'user_state_meta']) db.exec(`DROP TABLE ${table}`);
+      for (const table of ['user_state_category_aliases', 'user_state_operations', 'user_state_changes', 'user_state_records', 'user_state_meta']) db.exec(`DROP TABLE ${table}`);
     } finally { db.close(); }
     next = await buildApp({ dataDir: f.dataDir });
-    const workspace = successful(await next.inject({ url: '/api/v1/user-state/current', headers: f.headers }));
-    assert.deepEqual(workspace.items, []);
+    const workspace = successful(await next.inject({ url: '/api/v1/user-state', headers: f.headers }));
+    assert.equal(workspace.headRevision, 0);
+    const readBack = successful(await next.inject({ method: 'POST', url: '/api/v1/user-state/read', headers: f.headers, payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, after: 0 } }));
+    assert.deepEqual(readBack.records, []);
     assert.deepEqual(await readFile(f.file), bytes);
     assert.deepEqual(await readFile(join(f.dataDir, 'admin-password.hash')), password);
     const check = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));

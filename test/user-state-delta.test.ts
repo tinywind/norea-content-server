@@ -69,6 +69,8 @@ test('user state has one stable namespace shared by admitted devices, not their 
     assert.equal(capabilities.userStateVersion, 1);
     assert.equal(capabilities.userStateBulkVersion, 1);
     assert.equal(capabilities.userStateOpaqueIdentityVersion, 1);
+    assert.equal(capabilities.userStateRetentionVersion, 1);
+    assert.equal(capabilities.userStateCurrentVersion, undefined);
     assert.equal(capabilities.readingStateVersion, 1);
     assert.equal(capabilities.deviceBackupVersion, 1);
     const a = result(await f.merge([operation(library(), { inLibrary: true, addedAt: 123 })]));
@@ -122,12 +124,7 @@ test('portable identity ignores names/local row IDs, folds only ASCII source IDs
     const opaqueRecords = page(await f.read()).records;
     assert(opaqueRecords.some(record => record.entity.kind === 'library' && record.entity.work.sourceNovelId === null));
     assert(opaqueRecords.some(record => record.entity.kind === 'reading' && record.entity.chapter.chapterPath === 'norea-folder:1'));
-    const currentReply = await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers });
-    assert.equal(currentReply.statusCode, 200, currentReply.body);
-    const currentItems = currentReply.json().items as { entity: UserStateEntity }[];
-    assert(!currentItems.some(item => 'work' in item.entity && item.entity.work.sourceNovelId === null));
-    assert(!currentItems.some(item => (item.entity.kind === 'reading' || item.entity.kind === 'bookmark') &&
-      item.entity.chapter.chapterPath === 'norea-folder:1'));
+    assert.equal((await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers })).statusCode, 404);
     for (const bad of [
       { ...operation(library(), { inLibrary: true, addedAt: null }), localDatabaseId: 1 },
       { ...operation(library(), { inLibrary: true, addedAt: null }), entity: { kind: 'library', work: { ...work(), localId: 1 } } },

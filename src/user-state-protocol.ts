@@ -84,6 +84,19 @@ export interface UserStateMergeResult {
 export interface UserStateMergeResponse extends UserStateWorkspace {
   results: UserStateMergeResult[];
 }
+export interface UserStateRetentionState extends UserStateWorkspace {
+  compactedThrough: number;
+  seedAllowed: boolean;
+  seedCutoffAt: number | null;
+}
+export interface UserStateSnapshotResponse extends UserStateWorkspace {
+  snapshotRevision: number;
+  nextEntityKey: string | null;
+  hasMore: boolean;
+  seedAllowed: boolean;
+  seedCutoffAt: number | null;
+  records: UserStateRecord[];
+}
 export interface UserStateConflict {
   id: string;
   categoryName?: string;
@@ -326,7 +339,7 @@ export function parseUserStateMergeResult(value: unknown): UserStateMergeResult 
   const statuses: readonly unknown[] = ["applied", "unchanged", "seed-skipped", "conflict", "aliased"];
   if (!statuses.includes(row.status)) fail("invalid merge result status");
   const current = row.current === null ? null : parseUserStateRecord(row.current);
-  if (row.status !== "conflict" && !current) fail("an acknowledged change must include its record");
+  if (row.status !== "conflict" && row.status !== "seed-skipped" && !current) fail("an acknowledged change must include its record");
   let categoryAlias: { from: string; to: string } | undefined;
   if (row.categoryAlias !== undefined) {
     const alias = object(row.categoryAlias, ["from", "to"], "category alias");
@@ -350,6 +363,39 @@ export function parseUserStateMergeResponse(value: unknown): UserStateMergeRespo
   if (new Set(results.map(result => result.operationId)).size !== results.length) fail("duplicate operation acknowledgement");
   if (results.some(result => result.current && result.current.revision > workspace.headRevision)) fail("record exceeds the acknowledged head");
   return { ...workspace, results };
+}
+export function parseUserStateRetentionState(value: unknown): UserStateRetentionState {
+  const row = object(value, ["version", "workspaceId", "epoch", "headRevision", "compactedThrough", "seedAllowed", "seedCutoffAt"], "retention state");
+  const workspace = workspaceFields(row);
+  const compactedThrough = integer(row.compactedThrough, "compacted boundary");
+  if (compactedThrough > workspace.headRevision) fail("inconsistent compacted boundary");
+  const seedAllowed = bool(row.seedAllowed, "seed allowed flag");
+  const seedCutoffAt = nullableTime(row.seedCutoffAt, "seed cutoff time");
+  return { ...workspace, compactedThrough, seedAllowed, seedCutoffAt };
+}
+export function parseUserStateSnapshotResponse(value: unknown): UserStateSnapshotResponse {
+  const row = object(
+    value,
+    ["version", "workspaceId", "epoch", "headRevision", "snapshotRevision", "nextEntityKey", "hasMore", "seedAllowed", "seedCutoffAt", "records"],
+    "snapshot response",
+  );
+  const workspace = workspaceFields(row);
+  const snapshotRevision = integer(row.snapshotRevision, "snapshot revision");
+  if (snapshotRevision > workspace.headRevision) fail("snapshot revision exceeds the head revision");
+  const hasMore = bool(row.hasMore, "has more flag");
+  const nextEntityKey = row.nextEntityKey === null ? null : textValue(row.nextEntityKey, "next entity key", 131072);
+  if (nextEntityKey !== null && new TextEncoder().encode(nextEntityKey).byteLength > 131072) {
+    fail("invalid next entity key");
+  }
+  if (hasMore && nextEntityKey === null) fail("continuing snapshot page must provide a cursor");
+  if (!hasMore && nextEntityKey !== null) fail("final snapshot page must not provide a cursor");
+  const seedAllowed = bool(row.seedAllowed, "seed allowed flag");
+  const seedCutoffAt = nullableTime(row.seedCutoffAt, "seed cutoff time");
+  if (!Array.isArray(row.records)) fail("invalid snapshot record page");
+  const records = row.records.map(parseUserStateRecord);
+  if (records.some(record => record.revision > snapshotRevision)) fail("record exceeds the snapshot revision");
+  if (hasMore && !records.length) fail("continuing snapshot page must include records");
+  return { ...workspace, snapshotRevision, nextEntityKey, hasMore, seedAllowed, seedCutoffAt, records };
 }
 
 /** Stable encoding also rejects values the transport must never serialize. */

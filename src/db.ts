@@ -1,4 +1,3 @@
-import { initializeUserStateCurrent, initializeUserStateDeltaBridge } from './user-state-current-store.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -66,7 +65,8 @@ const workMigrationSchema = `
     CREATE TABLE IF NOT EXISTS work_migration_events (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
       operation_id TEXT NOT NULL REFERENCES work_migration_lineage(operation_id),
-      active INTEGER NOT NULL CHECK(active IN (0,1))
+      active INTEGER NOT NULL CHECK(active IN (0,1)),
+      retired_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS work_migration_events_operation ON work_migration_events(operation_id,sequence);
 `;
@@ -103,21 +103,29 @@ const workOverrideSchema = `
 
 const userStateSchema = `
     CREATE TABLE IF NOT EXISTS user_state_meta (
-      singleton INTEGER PRIMARY KEY CHECK(singleton=1), workspace_id TEXT NOT NULL, epoch TEXT NOT NULL
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1), workspace_id TEXT NOT NULL, epoch TEXT NOT NULL,
+      head_revision INTEGER NOT NULL DEFAULT 0,
+      compacted_through INTEGER NOT NULL DEFAULT 0,
+      seed_blocked INTEGER NOT NULL DEFAULT 0,
+      seed_cutoff_at INTEGER,
+      last_gc_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS user_state_records (
       entity_key TEXT PRIMARY KEY, kind TEXT NOT NULL, category_name TEXT, category_deleted INTEGER,
       membership_category_id TEXT, membership_included INTEGER,
-      revision INTEGER NOT NULL, record TEXT NOT NULL
+      revision INTEGER NOT NULL, record TEXT NOT NULL,
+      updated_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS user_state_record_kinds ON user_state_records(kind);
     CREATE UNIQUE INDEX IF NOT EXISTS user_state_active_category_names
       ON user_state_records(category_name) WHERE kind='category' AND category_deleted=0;
     CREATE TABLE IF NOT EXISTS user_state_changes (
-      revision INTEGER PRIMARY KEY AUTOINCREMENT, entity_key TEXT NOT NULL, record TEXT NOT NULL
+      revision INTEGER PRIMARY KEY AUTOINCREMENT, entity_key TEXT NOT NULL, record TEXT NOT NULL,
+      superseded_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS user_state_operations (
-      device_id TEXT NOT NULL, operation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, result TEXT NOT NULL,
+      device_id TEXT NOT NULL, operation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, result TEXT,
+      created_at INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY(operation_id)
     );
     CREATE TABLE IF NOT EXISTS user_state_category_aliases (
@@ -125,17 +133,133 @@ const userStateSchema = `
     );
 `;
 
-function ensureUserStateRecordIndexes(db: DatabaseSync): void {
-  const columns = new Set((db.prepare('PRAGMA table_info(user_state_records)').all() as { name: string }[]).map(column => column.name));
-  const needsBackfill = !columns.has('membership_category_id') || !columns.has('membership_included');
-  if (!columns.has('membership_category_id')) db.exec('ALTER TABLE user_state_records ADD COLUMN membership_category_id TEXT');
-  if (!columns.has('membership_included')) db.exec('ALTER TABLE user_state_records ADD COLUMN membership_included INTEGER');
+const retiredUserStateTables = [
+  'user_state_delta_current_category_aliases',
+  'user_state_delta_current_categories',
+  'user_state_delta_bridge_meta',
+  'user_state_current_records',
+  'user_state_current_meta',
+] as const;
+
+function ensureUserStateSchema(db: DatabaseSync, now = Date.now()): void {
+  for (const table of retiredUserStateTables) db.exec(`DROP TABLE IF EXISTS ${table}`);
+
+  const recordColumns = new Set((db.prepare('PRAGMA table_info(user_state_records)').all() as { name: string }[]).map(column => column.name));
+  const needsMembershipBackfill = !recordColumns.has('membership_category_id') || !recordColumns.has('membership_included');
+  if (!recordColumns.has('membership_category_id')) db.exec('ALTER TABLE user_state_records ADD COLUMN membership_category_id TEXT');
+  if (!recordColumns.has('membership_included')) db.exec('ALTER TABLE user_state_records ADD COLUMN membership_included INTEGER');
+  const needsUpdatedAtBackfill = !recordColumns.has('updated_at');
+  if (!recordColumns.has('updated_at')) db.exec('ALTER TABLE user_state_records ADD COLUMN updated_at INTEGER');
   db.exec(`CREATE INDEX IF NOT EXISTS user_state_membership_categories
     ON user_state_records(membership_category_id,membership_included) WHERE kind='membership'`);
-  if (needsBackfill) db.exec(`UPDATE user_state_records SET
+  db.exec('CREATE INDEX IF NOT EXISTS user_state_records_updated_at ON user_state_records(kind,updated_at)');
+  if (needsMembershipBackfill) db.exec(`UPDATE user_state_records SET
     membership_category_id=json_extract(record,'$.entity.categoryId'),
     membership_included=CAST(json_extract(record,'$.value.included') AS INTEGER)
     WHERE kind='membership'`);
+  if (needsUpdatedAtBackfill) db.exec(`UPDATE user_state_records SET
+    updated_at=COALESCE(CAST(json_extract(record,'$.updatedAt') AS INTEGER), 0)
+    WHERE updated_at IS NULL`);
+
+  const metaColumns = new Set((db.prepare('PRAGMA table_info(user_state_meta)').all() as { name: string }[]).map(column => column.name));
+  if (!metaColumns.has('head_revision')) db.exec('ALTER TABLE user_state_meta ADD COLUMN head_revision INTEGER NOT NULL DEFAULT 0');
+  if (!metaColumns.has('compacted_through')) db.exec('ALTER TABLE user_state_meta ADD COLUMN compacted_through INTEGER NOT NULL DEFAULT 0');
+  if (!metaColumns.has('seed_blocked')) db.exec('ALTER TABLE user_state_meta ADD COLUMN seed_blocked INTEGER NOT NULL DEFAULT 0');
+  if (!metaColumns.has('seed_cutoff_at')) db.exec('ALTER TABLE user_state_meta ADD COLUMN seed_cutoff_at INTEGER');
+  if (!metaColumns.has('last_gc_at')) db.exec('ALTER TABLE user_state_meta ADD COLUMN last_gc_at INTEGER');
+  const hasSequenceTable = Boolean(
+    db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sqlite_sequence'").get(),
+  );
+  const sequenceSubquery = hasSequenceTable
+    ? "COALESCE((SELECT seq FROM sqlite_sequence WHERE name='user_state_changes'), 0)"
+    : '0';
+  db.exec(`UPDATE user_state_meta SET head_revision = MAX(
+    head_revision,
+    COALESCE((SELECT MAX(revision) FROM user_state_changes), 0),
+    COALESCE((SELECT MAX(revision) FROM user_state_records), 0),
+    ${sequenceSubquery}
+  ) WHERE singleton = 1`);
+  db.exec(`UPDATE user_state_meta SET
+    compacted_through = MIN(MAX(0, compacted_through), head_revision),
+    seed_blocked = CASE WHEN seed_blocked <> 0 THEN 1 ELSE 0 END
+    WHERE singleton = 1`);
+
+  const migrationEventColumns = new Set((db.prepare('PRAGMA table_info(work_migration_events)').all() as { name: string }[]).map(column => column.name));
+  if (!migrationEventColumns.has('retired_at')) db.exec('ALTER TABLE work_migration_events ADD COLUMN retired_at INTEGER');
+  db.prepare('UPDATE work_migration_events SET retired_at = ? WHERE active = 1 AND retired_at IS NULL').run(now);
+
+  const changeColumns = new Set((db.prepare('PRAGMA table_info(user_state_changes)').all() as { name: string }[]).map(column => column.name));
+  if (!changeColumns.has('superseded_at')) {
+    db.exec('ALTER TABLE user_state_changes ADD COLUMN superseded_at INTEGER');
+    db.prepare(`UPDATE user_state_changes SET superseded_at = ?
+      WHERE superseded_at IS NULL AND EXISTS (
+        SELECT 1 FROM user_state_records r
+        WHERE r.entity_key = user_state_changes.entity_key AND r.revision > user_state_changes.revision
+      )`).run(now);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS user_state_changes_superseded ON user_state_changes(superseded_at) WHERE superseded_at IS NOT NULL');
+
+  const operationColumns = db.prepare('PRAGMA table_info(user_state_operations)').all() as { name: string; notnull: number }[];
+  const resultColumn = operationColumns.find(column => column.name === 'result');
+  const hasCreatedAt = operationColumns.some(column => column.name === 'created_at');
+  if (resultColumn?.notnull === 1) {
+    db.exec(`CREATE TABLE user_state_operations_v2 (
+      device_id TEXT NOT NULL, operation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, result TEXT,
+      created_at INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(operation_id)
+    )`);
+    if (hasCreatedAt) {
+      db.prepare(`INSERT INTO user_state_operations_v2(device_id,operation_id,payload_hash,result,created_at)
+        SELECT device_id,operation_id,payload_hash,result,CASE WHEN created_at>0 THEN created_at ELSE ? END FROM user_state_operations`).run(now);
+    } else {
+      db.prepare(`INSERT INTO user_state_operations_v2(device_id,operation_id,payload_hash,result,created_at)
+        SELECT device_id,operation_id,payload_hash,result,? FROM user_state_operations`).run(now);
+    }
+    db.exec('DROP TABLE user_state_operations; ALTER TABLE user_state_operations_v2 RENAME TO user_state_operations;');
+  } else if (!hasCreatedAt) {
+    db.exec('ALTER TABLE user_state_operations ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0');
+    db.prepare('UPDATE user_state_operations SET created_at = ? WHERE created_at = 0').run(now);
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS user_state_operations_created_at ON user_state_operations(created_at);
+    CREATE INDEX IF NOT EXISTS user_state_operations_prunable_body ON user_state_operations(created_at) WHERE result IS NOT NULL;`);
+}
+
+export interface DatabaseReclaimResult {
+  autoVacuum: number;
+  freelistBefore: number;
+  freelistAfter: number;
+  reclaimedPages: number;
+  checkpoint: { busy: number; log: number; checkpointed: number };
+}
+
+export function reclaimDatabaseSpace(db: DatabaseSync, pages?: number): DatabaseReclaimResult {
+  if (pages !== undefined && (!Number.isSafeInteger(pages) || pages < 1)) {
+    throw new RangeError('incremental_vacuum page count must be a positive safe integer');
+  }
+  const autoVacuum = Number((db.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum?: number } | undefined)?.auto_vacuum ?? 0);
+  const freelistBefore = Number((db.prepare('PRAGMA freelist_count').get() as { freelist_count?: number } | undefined)?.freelist_count ?? 0);
+  if (autoVacuum === 2 && freelistBefore > 0) {
+    if (pages !== undefined) {
+      db.exec(`PRAGMA incremental_vacuum(${pages})`);
+    } else {
+      db.exec('PRAGMA incremental_vacuum');
+    }
+  }
+  const freelistAfter = Number((db.prepare('PRAGMA freelist_count').get() as { freelist_count?: number } | undefined)?.freelist_count ?? 0);
+  const checkpointRow = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
+    | { busy?: number; log?: number; checkpointed?: number }
+    | undefined;
+  return {
+    autoVacuum,
+    freelistBefore,
+    freelistAfter,
+    reclaimedPages: Math.max(0, freelistBefore - freelistAfter),
+    checkpoint: {
+      busy: Number(checkpointRow?.busy ?? 0),
+      log: Number(checkpointRow?.log ?? 0),
+      checkpointed: Number(checkpointRow?.checkpointed ?? 0),
+    },
+  };
 }
 
 export function openDatabase(dataDir: string): DatabaseSync {
@@ -149,15 +273,14 @@ export function openDatabase(dataDir: string): DatabaseSync {
         throw new Error('Database does not use the current schema. Stop the server, remove metadata.sqlite and its sidecar files, then create a fresh database and scan current chapter folders.');
       }
     } else {
+      db.exec('PRAGMA auto_vacuum = INCREMENTAL');
       transaction(db, () => { db.exec(schema); db.prepare('INSERT INTO schema_state VALUES(?)').run(checksum); });
     }
     db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
     transaction(db, () => {
       db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(workOverrideSchema); db.exec(userStateSchema);
-      ensureUserStateRecordIndexes(db);
       db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
-      initializeUserStateCurrent(db);
-      initializeUserStateDeltaBridge(db);
+      ensureUserStateSchema(db);
     });
     return db;
   } catch (error) { db.close(); throw error; }

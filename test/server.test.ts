@@ -323,25 +323,6 @@ test('rejects local work, chapter, reading-state, and user-state uploads', async
     });
     assert.equal(mergeRes.statusCode, 400, mergeRes.body);
 
-    const currentRes = await s.app.inject({
-      method: 'POST',
-      url: '/api/v1/user-state/current',
-      headers,
-      payload: {
-        version: 2,
-        workspaceId: ws.workspaceId,
-        epoch: ws.epoch,
-        items: [{
-          entity: {
-            kind: 'library',
-            work: { pluginId: 'local', sourceNovelId: 'qa-01', novelPath: 'local:qa-01', name: 'Local QA' },
-          },
-          value: { inLibrary: true, addedAt: 1700000000 },
-        }],
-      },
-    });
-    assert.equal(currentRes.statusCode, 400, currentRes.body);
-
     const readingRes = await s.app.inject({
       method: 'POST',
       url: '/api/v1/reading-state/merge',

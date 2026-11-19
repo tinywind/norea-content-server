@@ -15,9 +15,14 @@ import { registerCatalog } from './catalog.ts';
 import { chapterFileStream, publishChapterFiles } from './chapter-files.ts';
 import { readChapterMediaAsset } from './chapter-media.ts';
 import { registerReadingState } from './reading-state.ts';
-import { registerUserState } from './user-state.ts';
-import { registerUserStateCurrent } from './user-state-current.ts';
-import { registerDeviceBackups } from './device-backups.ts';
+import {
+  DEFAULT_USER_STATE_COMPACTION_INTERVAL_MS,
+  MAX_TIMER_DELAY_MS,
+  maintainUserState,
+  registerUserState,
+  type UserStateMaintenanceOptions,
+} from './user-state.ts';
+import { DeviceBackupStore, registerDeviceBackups } from './device-backups.ts';
 import { registerWorkMigrations } from './work-migrations.ts';
 import { registerWorkMigrationCopy } from './work-migration-copy.ts';
 import { recoverChapterNumberReconciliations, registerChapterNumberReconciliation } from './chapter-number-reconciliation.ts';
@@ -39,21 +44,70 @@ import { inspectChapterInventory } from './chapter-inventory.ts';
 /** A request may take as long as it needs while bytes keep arriving; a socket idle this long is closed. */
 const SOCKET_IDLE_TIMEOUT_MS = 120000;
 
-export async function buildApp(options: { dataDir: string; anonymousRead?: boolean; limits?: Partial<Limits>; trashDays?: number; socketIdleTimeoutMs?: number }) {
+export interface UserStateMaintenanceScheduleOptions extends UserStateMaintenanceOptions {
+  compactionIntervalMs?: number;
+}
+
+export async function buildApp(options: {
+  dataDir: string;
+  anonymousRead?: boolean;
+  limits?: Partial<Limits>;
+  trashDays?: number;
+  socketIdleTimeoutMs?: number;
+  userStateMaintenance?: UserStateMaintenanceScheduleOptions;
+}) {
   const dataDir = resolve(options.dataDir);
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
-  try { recoverChapterNumberReconciliations(db, dataDir); rebuildWorkIndex(db, dataDir); upgradeWorkOverrides(db, dataDir); } catch (error) { db.close(); throw error; }
+  try {
+    recoverChapterNumberReconciliations(db, dataDir);
+    rebuildWorkIndex(db, dataDir);
+    upgradeWorkOverrides(db, dataDir);
+    maintainUserState(db, options.userStateMaintenance);
+  } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
-  const app = Fastify({ bodyLimit: 1024 * 1024, connectionTimeout: options.socketIdleTimeoutMs ?? SOCKET_IDLE_TIMEOUT_MS, requestTimeout: 0, logger: false, trustProxy: false });
+  const app = Fastify({
+    bodyLimit: 1024 * 1024,
+    connectionTimeout: options.socketIdleTimeoutMs ?? SOCKET_IDLE_TIMEOUT_MS,
+    requestTimeout: 0,
+    logger: false,
+    trustProxy: false,
+    routerOptions: { maxParamLength: 4096 },
+  });
   await app.register(rateLimit, { global: true, max: 6000, timeWindow: '1 minute' });
   let anonymousRead = savedAnonymousRead(db, options.anonymousRead ?? true);
   const changes = createChangeNotifications(db);
   await app.register(swagger, { openapi: { info: { title: 'Norea Content Server', version: '1.0.0' }, components: { securitySchemes: { bearerAuth: { type: 'http', scheme: 'bearer' } } } } });
   await app.register(multipart, { limits: { fields: 1, fieldSize: 64 * 1024, files: 3, parts: 4, fileSize: limits.expandedBytes } });
-  app.addHook('preClose', async () => { changes.close(); });
+  let closing = false;
+  let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
+  app.addHook('preClose', async () => {
+    closing = true;
+    if (maintenanceTimer) {
+      clearInterval(maintenanceTimer);
+      maintenanceTimer = undefined;
+    }
+    changes.close();
+  });
   app.addHook('onClose', async () => { db.close(); });
+  const maintenanceIntervalMs = Math.min(
+    options.userStateMaintenance?.compactionIntervalMs ?? DEFAULT_USER_STATE_COMPACTION_INTERVAL_MS,
+    MAX_TIMER_DELAY_MS,
+  );
+  app.addHook('onReady', async () => {
+    if (closing || maintenanceTimer || !Number.isFinite(maintenanceIntervalMs) || maintenanceIntervalMs <= 0) return;
+    maintenanceTimer = setInterval(() => {
+      if (closing) return;
+      try {
+        maintainUserState(db, options.userStateMaintenance);
+      } catch (error) {
+        console.error('User-state maintenance pass failed:', error);
+      }
+    }, maintenanceIntervalMs);
+    maintenanceTimer.unref();
+  });
   const requireRead = (request: Parameters<typeof authenticate>[1]) => { if (!anonymousRead || request.headers.authorization !== undefined) authenticate(db, request); };
+  const deviceBackups = new DeviceBackupStore(dataDir);
   registerWorks(app, { db, dataDir, requireRead, notify: () => changes.notify() });
   registerWorkOverrides(app, { db, dataDir, requireRead, notify: () => changes.notify() });
   registerWorkMigrations(app, { db, dataDir, limits, requireRead, notify: () => changes.notify() });
@@ -61,10 +115,9 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   registerChapterNumberReconciliation(app, { db, dataDir, requireRead, notify: () => changes.notify() });
   registerCatalog(app, { db, dataDir, requireRead, catalogSchema });
   registerReadingState(app, db);
-  registerUserState(app, db);
-  registerUserStateCurrent(app, db);
-  await registerDeviceBackups(app, db, dataDir);
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateCurrentVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, changeOverrideCursorVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateCurrentVersion: 2, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, changeOverrideCursorVersion: 1, anonymousRead }));
+  registerUserState(app, db, options.userStateMaintenance?.now ? { now: options.userStateMaintenance.now } : undefined);
+  await registerDeviceBackups(app, db, deviceBackups);
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateRetentionVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, changeOverrideCursorVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateRetentionVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, changeOverrideCursorVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
@@ -133,6 +186,15 @@ export async function buildApp(options: { dataDir: string; anonymousRead?: boole
   });
   const cutoff = Date.now() - (options.trashDays ?? 30) * 86400000;
   for (const row of db.prepare('SELECT id FROM chapters WHERE deleted_at<?').all(cutoff) as { id: string }[]) purgeChapter(db, dataDir, row.id);
-  await registerAdministration(app, { db, dataDir, limits, notify: () => changes.notify(), getAnonymousRead: () => anonymousRead, setAnonymousRead: value => { anonymousRead = value; } });
+  await registerAdministration(app, {
+    db,
+    dataDir,
+    limits,
+    deviceBackups,
+    userStateMaintenance: options.userStateMaintenance,
+    notify: () => changes.notify(),
+    getAnonymousRead: () => anonymousRead,
+    setAnonymousRead: value => { anonymousRead = value; },
+  });
   return app;
 }

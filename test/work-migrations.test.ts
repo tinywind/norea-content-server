@@ -941,42 +941,6 @@ test('legacy receipt-only retirement blocks automatic restore and remembers deli
   } finally { await f.close(); }
 });
 
-test('active lineage projects old positive work and exact chapter state into its target without transplanting A composition', async () => {
-  const f = await fixture();
-  try {
-    saveWork(f.db, f.dataDir, { ...metadata('source'), chapters: { '1': 'Source', '2': 'Excluded metadata-only chapter' } });
-    saveWork(f.db, f.dataDir, { ...metadata('target'), chapters: { '1001': 'Target' } });
-    await f.upload('source'); await f.upload('target');
-    const scope = (await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers })).json();
-    const work = (side: string) => ({ pluginId: side, sourceNovelId: 'book', novelPath: '/book', name: 'Shared fixture' });
-    const sourceWork = work('source'), targetWork = work('target');
-    const oldComposition = { version: 1, updatedAt: 100, entries: [{ id: 'old-source-entry', path: '/source/1', storageChapterNumber: '1', primarySource: 0,
-      sources: [{ ...metadata('source').identity, chapterPath: '/source/1', sourceChapterId: 'source-stable', chapterNumber: '1', name: 'A title', position: 1, page: '1', contentType: 'text', releaseTime: null }],
-      user: { included: true, order: 1, name: 'Old A user title', chapterNumber: '1' } }] };
-    const oldItems = [
-      { entity: { kind: 'library', work: sourceWork }, value: { inLibrary: true, addedAt: 1 } },
-      { entity: { kind: 'reading', work: sourceWork, chapter: { chapterPath: '/source/1' } }, value: { progress: 90, unread: false, readAt: 10 } },
-      { entity: { kind: 'bookmark', work: sourceWork, chapter: { chapterPath: '/source/1' } }, value: { bookmarked: true } },
-      { entity: { kind: 'reading', work: sourceWork, chapter: { chapterPath: '/source/2' } }, value: { progress: 20, unread: false, readAt: 2 } },
-      { entity: { kind: 'resume', work: sourceWork }, value: { chapter: { chapterPath: '/source/1' }, anchor: null, openedAt: 10 } },
-      { entity: { kind: 'composition', work: sourceWork }, value: { composition: oldComposition } },
-    ];
-    const publish = (items: unknown[]) => f.app.inject({ method: 'POST', url: '/api/v1/user-state/current', headers: f.headers, payload: { ...scope, items } });
-    assert.equal((await publish([...oldItems, { entity: { kind: 'reading', work: targetWork, chapter: { chapterPath: '/target/1' } }, value: { progress: 60, unread: false, readAt: 20 } }])).statusCode, 200);
-    const migration = f.request(); migration.chapterDecisions = [...allDecisions(f, migration), { sourceChapterPath: '/source/2', sourceChapterNumber: '2', targetChapterPath: null, targetChapterNumber: null }];
-    assert.equal((await f.submit(migration)).statusCode, 200);
-    const view = (await f.app.inject({ url: '/api/v1/user-state/current', headers: f.headers })).json();
-    assert.equal(view.items.length, 4); assert(view.items.every((row: any) => row.entity.work.pluginId === 'target'));
-    assert.deepEqual(view.items.find((row: any) => row.entity.kind === 'reading').value, { progress: 60, unread: false, readAt: 20 });
-    assert.equal(view.items.find((row: any) => row.entity.kind === 'resume').value.chapter.chapterPath, '/target/1');
-    const replay = await publish(oldItems); assert.equal(replay.statusCode, 200, replay.body);
-    assert(replay.json().items.every((row: any) => row.entity.work.pluginId === 'target')); assert.equal(replay.json().items.some((row: any) => row.entity.kind === 'composition'), false);
-    assert.equal(f.db.prepare("SELECT count(*) AS n FROM user_state_current_records WHERE kind='library' AND json_extract(item,'$.entity.work.pluginId')='source'").get()?.n, 0);
-    // Omitted old composition and unresolvable/excluded values are retained privately, never deleted or assigned to B.
-    assert.equal(f.db.prepare("SELECT count(*) AS n FROM user_state_current_records WHERE kind='composition' AND json_extract(item,'$.entity.work.pluginId')='source'").get()?.n, 1);
-  } finally { await f.close(); }
-});
-
 test('an explicit newly reviewed decision can consolidate reindexed source IDs while automatic repair stays blocked', async () => {
   const f = await legacyCompletedFixture();
   try {

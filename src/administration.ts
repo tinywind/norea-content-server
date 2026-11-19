@@ -5,10 +5,23 @@ import { join, relative, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance } from 'fastify';
 import { authenticate } from './auth.ts';
-import { problem, transaction } from './db.ts';
+import { problem, reclaimDatabaseSpace, transaction } from './db.ts';
+import {
+  deviceBackupDeleteResponseSchema,
+  deviceBackupParamsSchema,
+  type DeviceBackupStore,
+} from './device-backups.ts';
 import { chapterRow, type CatalogEntry, type Limits } from './packages.ts';
 import { listPlugins, registerPlugin, removePlugin, setPluginEnabled } from './plugin-registry.ts';
 import { scanFolder, type FolderIndexItem, type FolderIndexOptions, type FolderIndexSummary } from './folder-indexer.ts';
+import {
+  getUserStateAdminStats,
+  maintainUserState,
+  resetUserStateWorkspace,
+  updateUserStateRetentionConfig,
+  type UserStateMaintenanceOptions,
+  type UserStateRetentionPatch,
+} from './user-state.ts';
 
 interface ScanSettings {
   path: string;
@@ -27,6 +40,48 @@ const scanProperties = {
   mode: { type: 'string', enum: ['manual', 'periodic', 'changes'] },
   intervalMinutes: { type: 'integer', minimum: 1, maximum: 1440 }, enabled: { type: 'boolean' },
 };
+const retentionPatchSchema = {
+  type: 'object',
+  additionalProperties: false,
+  minProperties: 1,
+  properties: {
+    pruneNonLibraryReading: {
+      type: 'object',
+      additionalProperties: false,
+      minProperties: 1,
+      properties: {
+        enabled: { type: 'boolean' },
+        days: { type: 'integer', minimum: 1, maximum: 36500 },
+      },
+    },
+    stripReadingTimestamps: {
+      type: 'object',
+      additionalProperties: false,
+      minProperties: 1,
+      properties: {
+        enabled: { type: 'boolean' },
+        days: { type: 'integer', minimum: 1, maximum: 36500 },
+      },
+    },
+    slidingWindow: {
+      type: 'object',
+      additionalProperties: false,
+      minProperties: 1,
+      properties: {
+        enabled: { type: 'boolean' },
+        months: { type: 'integer', minimum: 1, maximum: 1200 },
+      },
+    },
+    tombstoneGc: {
+      type: 'object',
+      additionalProperties: false,
+      minProperties: 1,
+      properties: {
+        graceDays: { type: 'integer', minimum: 0, maximum: 3650 },
+      },
+    },
+  },
+};
 
 export function savedAnonymousRead(db: DatabaseSync, fallback: boolean): boolean {
   const row = db.prepare("SELECT value FROM admin_settings WHERE key='anonymousRead'").get() as { value: string } | undefined;
@@ -34,7 +89,8 @@ export function savedAnonymousRead(db: DatabaseSync, fallback: boolean): boolean
 }
 
 export async function registerAdministration(app: FastifyInstance, context: {
-  db: DatabaseSync; dataDir: string; limits: Limits; notify: () => void;
+  db: DatabaseSync; dataDir: string; limits: Limits; deviceBackups: DeviceBackupStore;
+  userStateMaintenance?: UserStateMaintenanceOptions; notify: () => void;
   getAnonymousRead: () => boolean; setAnonymousRead: (enabled: boolean) => void;
 }): Promise<void> {
   const { db, dataDir, limits } = context;
@@ -176,7 +232,7 @@ export async function registerAdministration(app: FastifyInstance, context: {
     '/admin/admin.css': { path: new URL('../web/admin.css', import.meta.url), type: 'text/css; charset=utf-8' },
     '/admin/admin.js': { path: new URL('../webdist/admin.js', import.meta.url), type: 'text/javascript; charset=utf-8' },
   };
-  for (const page of ['overview', 'plugins', 'storage', 'content', 'jobs', 'devices', 'settings']) {
+  for (const page of ['overview', 'plugins', 'storage', 'content', 'jobs', 'devices', 'user-state', 'settings']) {
     assets[`/admin/${page}`] = assets['/admin/'];
     assets[`/admin/${page}/`] = assets['/admin/'];
   }
@@ -233,6 +289,74 @@ export async function registerAdministration(app: FastifyInstance, context: {
       const result = db.prepare('UPDATE devices SET blocked=? WHERE id=?').run(request.body.blocked ? 1 : 0, request.params.id);
       if (!result.changes) throw problem(404, 'Device not found');
       return devices().find(device => device.id === request.params.id)!;
+    });
+    api.get('/device-backups', async () => ({ items: await context.deviceBackups.list() }));
+    api.delete<{ Params: { name: string } }>('/device-backups/:name', {
+      schema: {
+        params: deviceBackupParamsSchema,
+        response: { 200: deviceBackupDeleteResponseSchema },
+      },
+    }, async request => context.deviceBackups.delete(request.params.name));
+    api.get('/user-state', async () => getUserStateAdminStats(db, dataDir, context.userStateMaintenance));
+    api.post('/user-state/compact', {
+      preValidation: async request => { request.body ??= {}; },
+      schema: { body: { type: 'object', additionalProperties: false } },
+    }, async () => {
+      const maintenance = maintainUserState(db, { ...context.userStateMaintenance, vacuumPagesPerPass: undefined });
+      const reclaimed = maintenance.reclaimed ?? reclaimDatabaseSpace(db);
+      return {
+        maintenance: { ...maintenance, reclaimed },
+        state: getUserStateAdminStats(db, dataDir, context.userStateMaintenance),
+      };
+    });
+    api.post('/user-state/reset', {
+      preValidation: async request => { request.body ??= {}; },
+      schema: { body: { type: 'object', additionalProperties: false } },
+    }, async () => {
+      const { previousEpoch } = resetUserStateWorkspace(db);
+      return {
+        reset: true,
+        previousEpoch,
+        state: getUserStateAdminStats(db, dataDir, context.userStateMaintenance),
+      };
+    });
+    api.patch<{ Body: UserStateRetentionPatch }>('/user-state/retention', {
+      preValidation: async request => {
+        const body = request.body;
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          throw problem(400, 'Retention settings must be an object');
+        }
+        const record = body as Record<string, unknown>;
+        const keys = Object.keys(record);
+        const allowedSections: Record<string, readonly string[]> = {
+          pruneNonLibraryReading: ['enabled', 'days'],
+          stripReadingTimestamps: ['enabled', 'days'],
+          slidingWindow: ['enabled', 'months'],
+          tombstoneGc: ['graceDays'],
+        };
+        if (!keys.length || keys.some(key => !Object.hasOwn(allowedSections, key))) {
+          throw problem(400, 'Invalid retention policy fields');
+        }
+        for (const key of keys) {
+          const section = record[key];
+          if (!section || typeof section !== 'object' || Array.isArray(section)) {
+            throw problem(400, `Invalid ${key} retention section`);
+          }
+          const sectionRecord = section as Record<string, unknown>;
+          const sectionKeys = Object.keys(sectionRecord);
+          if (!sectionKeys.length || sectionKeys.some(field => !allowedSections[key].includes(field))) {
+            throw problem(400, `Invalid fields in ${key}`);
+          }
+        }
+      },
+      schema: { body: retentionPatchSchema },
+    }, async request => {
+      const now = context.userStateMaintenance?.now?.() ?? Date.now();
+      const retention = updateUserStateRetentionConfig(db, request.body, now);
+      return {
+        retention,
+        state: getUserStateAdminStats(db, dataDir, context.userStateMaintenance),
+      };
     });
     const settings = () => ({ anonymousRead: context.getAnonymousRead(), limits, dataDir });
     api.get('/settings', async () => settings());

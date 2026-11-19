@@ -239,3 +239,143 @@ test('a backup upload that keeps sending is not cut off by the idle timeout', as
     assert.equal(saved.size, Buffer.concat(parts).length);
   } finally { await rm(dataDir, { recursive: true, force: true }); }
 });
+
+test('device and admin backup deletion remove slots and blobs safely while letting opened downloads finish', async () => {
+  const f = await fixture();
+  try {
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: route('missing') })).statusCode, 401);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: route('missing'), headers: admin })).statusCode, 403);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: route('missing'), headers: f.headers })).statusCode, 404);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: '/api/v1/device-backups/%20%20%20', headers: f.headers })).statusCode, 400);
+
+    assert.equal((await f.app.inject({ url: '/api/v1/admin/device-backups' })).statusCode, 401);
+    assert.equal((await f.app.inject({ url: '/api/v1/admin/device-backups', headers: f.headers })).statusCode, 403);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: '/api/v1/admin/device-backups/missing', headers: f.headers })).statusCode, 403);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: '/api/v1/admin/device-backups/missing', headers: admin })).statusCode, 404);
+
+    const first = (await f.upload(body, '내 기기 / S25')).json();
+    const second = (await f.upload(Buffer.from('PK tablet archive'), 'Tablet')).json();
+
+    assert.deepEqual((await f.app.inject({ url: '/api/v1/admin/device-backups', headers: admin })).json(), {
+      items: [second, first],
+    });
+
+    // Open a stream before deleting via admin endpoint; opened descriptor finishes cleanly.
+    const store = new DeviceBackupStore(f.dataDir);
+    const opened = await store.get('내 기기 / S25');
+    const adminDelete = await f.app.inject({
+      method: 'DELETE',
+      url: `/api/v1/admin/device-backups/${encodeURIComponent('내 기기 / S25')}`,
+      headers: admin,
+    });
+    assert.equal(adminDelete.statusCode, 200, adminDelete.body);
+    assert.equal(adminDelete.headers['cache-control'], 'no-store');
+    assert.deepEqual(adminDelete.json(), { deleted: true, deviceName: '내 기기 / S25' });
+    assert.deepEqual(await contents(opened.body), body);
+
+    assert.equal((await f.app.inject({ url: route('내 기기 / S25'), headers: f.headers })).statusCode, 404);
+    assert.deepEqual((await f.app.inject({ url: '/api/v1/device-backups', headers: f.headers })).json(), { items: [second] });
+
+    // Device can delete its backup via device endpoint.
+    const deviceDelete = await f.app.inject({
+      method: 'DELETE',
+      url: `/api/v1/device-backups/${encodeURIComponent('Tablet')}`,
+      headers: f.headers,
+    });
+    assert.equal(deviceDelete.statusCode, 200, deviceDelete.body);
+    assert.equal(deviceDelete.headers['cache-control'], 'no-store');
+    assert.deepEqual(deviceDelete.json(), { deleted: true, deviceName: 'Tablet' });
+    assert.deepEqual((await f.app.inject({ url: '/api/v1/admin/device-backups', headers: admin })).json(), { items: [] });
+    assert.deepEqual(await readdir(join(f.dataDir, 'device-backups', 'blobs')), []);
+    assert.deepEqual(await readdir(join(f.dataDir, 'device-backups', 'slots')), []);
+  } finally { await f.close(); }
+});
+
+test('long 101-200 char ASCII and multi-byte Korean device names work across backup routes while 201-char names return 400', async () => {
+  const f = await fixture();
+  try {
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    const ascii150 = 'd'.repeat(150);
+    const korean25 = '가나다라마바사아자차카타파하거너더러머버서어저처커';
+    assert.equal(korean25.length, 25);
+    assert.ok(encodeURIComponent(korean25).length > 100);
+
+    for (const [index, name] of [ascii150, korean25].entries()) {
+      const payload = Buffer.from(`PK long device payload ${index}`);
+      const putRes = await f.upload(payload, name);
+      assert.equal(putRes.statusCode, 200, putRes.body);
+      assert.equal(putRes.json().deviceName, name);
+
+      const getRes = await f.app.inject({ url: route(name), headers: f.headers });
+      assert.equal(getRes.statusCode, 200, getRes.body);
+      assert.deepEqual(getRes.rawPayload, payload);
+
+      const deleteUrl = index === 0 ? route(name) : `/api/v1/admin/device-backups/${encodeURIComponent(name)}`;
+      const deleteHeaders = index === 0 ? f.headers : admin;
+      const deleteRes = await f.app.inject({ method: 'DELETE', url: deleteUrl, headers: deleteHeaders });
+      assert.equal(deleteRes.statusCode, 200, deleteRes.body);
+      assert.deepEqual(deleteRes.json(), { deleted: true, deviceName: name });
+    }
+
+    // Also test device DELETE on Korean name and admin DELETE on 150-char ASCII name.
+    assert.equal((await f.upload(body, korean25)).statusCode, 200);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: route(korean25), headers: f.headers })).statusCode, 200);
+    assert.equal((await f.upload(body, ascii150)).statusCode, 200);
+    assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/device-backups/${encodeURIComponent(ascii150)}`, headers: admin })).statusCode, 200);
+
+    const tooLong201 = 'a'.repeat(201);
+    const put201 = await f.upload(body, tooLong201);
+    assert.equal(put201.statusCode, 400, put201.body);
+    const get201 = await f.app.inject({ url: route(tooLong201), headers: f.headers });
+    assert.equal(get201.statusCode, 400, get201.body);
+    const delDevice201 = await f.app.inject({ method: 'DELETE', url: route(tooLong201), headers: f.headers });
+    assert.equal(delDevice201.statusCode, 400, delDevice201.body);
+    const delAdmin201 = await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/device-backups/${encodeURIComponent(tooLong201)}`, headers: admin });
+    assert.equal(delAdmin201.statusCode, 400, delAdmin201.body);
+  } finally { await f.close(); }
+});
+
+test('dot-segment device backup names (., .., %2e, %2e%2e) are rejected without storing backups', async () => {
+  const f = await fixture();
+  try {
+    const admin = await consoleHeaders(f.app, f.dataDir);
+    const store = new DeviceBackupStore(f.dataDir);
+    for (const bad of ['.', '..']) {
+      await assert.rejects(store.put(bad, Readable.from([body]), hash(body)), { statusCode: 400 });
+      await assert.rejects(store.get(bad), { statusCode: 400 });
+      await assert.rejects(store.delete(bad), { statusCode: 400 });
+    }
+
+    const address = new URL(await f.app.listen({ host: '127.0.0.1', port: 0 }));
+    const rawHttp = (method: string, path: string, headers: Record<string, string>, payload?: Buffer) =>
+      new Promise<number>((resolve, reject) => {
+        const req = httpRequest({ hostname: address.hostname, port: Number(address.port), path, method, headers }, res => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode!));
+        });
+        req.on('error', reject);
+        if (payload) req.end(payload);
+        else req.end();
+      });
+
+    for (const seg of ['.', '..', '%2e', '%2e%2e']) {
+      const putHeaders = { ...f.headers, 'content-type': 'application/octet-stream', 'content-length': String(body.length), 'x-backup-sha256': hash(body) };
+      const expectedInjectStatus = seg === '.' || seg === '%2e' ? 400 : 404;
+      assert.equal((await f.app.inject({ method: 'PUT', url: `/api/v1/device-backups/${seg}`, payload: body, headers: putHeaders })).statusCode, expectedInjectStatus, `inject PUT ${seg}`);
+      assert.equal((await f.app.inject({ method: 'GET', url: `/api/v1/device-backups/${seg}`, headers: f.headers })).statusCode, expectedInjectStatus, `inject GET ${seg}`);
+      assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/device-backups/${seg}`, headers: f.headers })).statusCode, expectedInjectStatus, `inject DELETE ${seg}`);
+      assert.equal((await f.app.inject({ method: 'DELETE', url: `/api/v1/admin/device-backups/${seg}`, headers: admin })).statusCode, expectedInjectStatus, `inject admin DELETE ${seg}`);
+
+      assert.equal(await rawHttp('PUT', `/api/v1/device-backups/${seg}`, putHeaders, body), 400, `raw PUT ${seg}`);
+      assert.equal(await rawHttp('GET', `/api/v1/device-backups/${seg}`, f.headers), 400, `raw GET ${seg}`);
+      assert.equal(await rawHttp('DELETE', `/api/v1/device-backups/${seg}`, f.headers), 400, `raw DELETE ${seg}`);
+      assert.equal(await rawHttp('DELETE', `/api/v1/admin/device-backups/${seg}`, admin), 400, `raw admin DELETE ${seg}`);
+    }
+
+    assert.deepEqual(await store.list(), []);
+    assert.deepEqual(await readdir(join(f.dataDir, 'device-backups', 'slots')), []);
+    assert.deepEqual(await readdir(join(f.dataDir, 'device-backups', 'blobs')), []);
+    assert.deepEqual(await readdir(join(f.dataDir, 'device-backups', 'staging')), []);
+  } finally { await f.close(); }
+});
