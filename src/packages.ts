@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { cp, rm } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
+import { safeArchivePath } from './archive-path.ts';
+import { workChangeCursor } from './changes.ts';
 import { problem, transaction } from './db.ts';
+export { safeArchivePath } from './archive-path.ts';
 import { assertChapterNumberReconciliationReady, canonicalChapterManifest, canonicalChapterNumber, chapterIdentityId } from './chapter-number-mappings.ts';
 
 export interface PackageManifest {
@@ -43,10 +47,6 @@ function chapterDirectory(manifest: PackageManifest): string {
   return join('contents', manifest.identity.pluginId, manifest.identity.novelId, chapter);
 }
 
-export function safeArchivePath(path: string): boolean {
-  return !!path && path.length <= 1024 && !path.includes('\\') && !path.includes(':') && !/[\x00-\x1f]/.test(path) && path.split('/').every(part => !!part && part !== '.' && part !== '..' && !/[. ]$/.test(part) && !/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(part));
-}
-
 export function validateManifest(value: unknown): asserts value is PackageManifest {
   const m = value as PackageManifest;
   if (!m || typeof m !== 'object' || m.packageVersion !== 1 || !m.identity || !m.novel || !m.chapter || !Array.isArray(m.files)) throw problem(400, 'Unsupported or incomplete package manifest');
@@ -84,26 +84,57 @@ export function recordEntry(db: DatabaseSync, entry: CatalogEntry): CatalogEntry
   const result = db.prepare('INSERT INTO catalog_changes(chapter_id,entry) VALUES(?,?)').run(entry.id, '{}');
   next.sequence = Number(result.lastInsertRowid);
   const json = JSON.stringify(next);
-  db.prepare('UPDATE catalog_changes SET entry=? WHERE sequence=?').run(json, next.sequence);
+  const { id, sequence, manifest: { identity }, complete, deleted } = next;
+  db.prepare('UPDATE catalog_changes SET entry=? WHERE sequence=?').run(JSON.stringify({ id, sequence, manifest: { identity }, complete, deleted }), sequence);
   db.prepare('UPDATE chapters SET entry=? WHERE id=?').run(json, next.id);
   return next;
 }
 
-function moveChapterFiles(source: string, destination: string): void {
-  try { renameSync(source, destination); return; }
+function removeRetired(path: string): Promise<void> {
+  return rm(path, { recursive: true, force: true }).catch(error => console.warn('Failed to remove retired chapter storage:', path, error));
+}
+
+function storageSignature(directory: string): string {
+  return [directory, ...readdirSync(directory).sort().map(name => join(directory, name))].map(path => {
+    const info = lstatSync(path, { bigint: true });
+    return [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':');
+  }).join('|');
+}
+
+async function moveChapterStorage<T>(db: DatabaseSync, source: string, destination: string, verify: () => void, save: () => T): Promise<T> {
+  const commit = (staged?: string, retired?: string, signature?: string) => {
+    let sourceRenamed = false;
+    let published = false;
+    try {
+      return transaction(db, () => {
+        verify();
+        if (existsSync(destination)) throw problem(409, 'Chapter destination already exists');
+        if (staged && retired) {
+          if (storageSignature(source) !== signature) throw problem(409, 'Chapter files changed during the storage move; retry');
+          renameSync(source, retired);
+          sourceRenamed = true;
+        }
+        renameSync(staged ?? source, destination);
+        published = true;
+        return save();
+      });
+    } catch (error) {
+      if (published) renameSync(destination, staged ?? source);
+      if (sourceRenamed) renameSync(retired!, source);
+      throw error;
+    }
+  };
+  try { return commit(); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error; }
-  // Content bind mounts can be on a different filesystem from server state.
-  const temporary = join(dirname(destination), `.norea-move-${randomUUID()}`);
+  const staged = join(dirname(destination), '.norea-move-' + randomUUID());
+  const retired = join(dirname(source), '.norea-move-' + randomUUID());
+  const signature = storageSignature(source);
   try {
-    cpSync(source, temporary, { recursive: true, force: false, errorOnExist: true, preserveTimestamps: true });
-    renameSync(temporary, destination);
-  } finally { rmSync(temporary, { recursive: true, force: true }); }
-  const retired = join(dirname(source), `.norea-move-${randomUUID()}`);
-  try { renameSync(source, retired); }
-  catch (error) { rmSync(destination, { recursive: true, force: true }); throw error; }
-  // A locked cleanup file must not invalidate the completed copy or its DB path.
-  try { rmSync(retired, { recursive: true }); }
-  catch { console.warn('Deferred removal of a retired chapter storage copy'); }
+    await cp(source, staged, { recursive: true, force: false, errorOnExist: true, preserveTimestamps: true });
+    const result = commit(staged, retired, signature);
+    await removeRetired(retired);
+    return result;
+  } finally { await removeRetired(staged); }
 }
 
 function storedFilesExist(dataDir: string, path: string, entry: CatalogEntry): boolean {
@@ -131,6 +162,10 @@ export function chapterStoragePath(dataDir: string, path: string): string {
   return target;
 }
 
+export function chapterStagePath(dataDir: string, name: string): string {
+  return chapterStoragePath(dataDir, join('contents', '.norea-staging', name));
+}
+
 export function availableChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry | undefined {
   const row = db.prepare('SELECT entry,path FROM chapters WHERE id=? AND deleted_at IS NULL').get(id) as { entry: string; path: string | null } | undefined;
   if (!row?.path) return;
@@ -153,8 +188,8 @@ function folderChapterNumber(path: string): string | undefined {
 
 export function findChapterUploadIdentity(db: DatabaseSync, manifest: PackageManifest): CatalogEntry | undefined {
   manifest = canonicalChapterManifest(db, manifest);
-  const storedWork = db.prepare('SELECT entry FROM works WHERE id=?').get(workId(manifest.identity)) as { entry: string } | undefined;
-  if (storedWork && JSON.parse(storedWork.entry).metadata.identity.novelId !== manifest.identity.novelId) throw problem(409, 'Chapter source novel ID does not match its registered work');
+  const storedWork = db.prepare('SELECT novel_id FROM work_summaries WHERE id=?').get(workId(manifest.identity)) as { novel_id: string } | undefined;
+  if (storedWork && storedWork.novel_id !== manifest.identity.novelId) throw problem(409, 'Chapter source novel ID does not match its registered work');
   const recovered = folderChapterNumber(manifest.identity.chapterPath);
   const declared = normalizedChapterNumber(manifest.chapter.chapterNumber);
   if (recovered !== undefined && manifest.chapter.chapterNumber != null && recovered !== declared) throw problem(400, 'Folder chapter identity does not match its chapter number');
@@ -178,7 +213,8 @@ export function findChapterUploadIdentity(db: DatabaseSync, manifest: PackageMan
 }
 
 export function uploadCursor(db: DatabaseSync): { catalog: number; works: number } {
-  return db.prepare('SELECT (SELECT coalesce(max(sequence),0) FROM catalog_changes) AS catalog,(SELECT coalesce(max(sequence),0) FROM work_changes) AS works').get() as { catalog: number; works: number };
+  const catalog = Number(db.prepare('SELECT coalesce(max(sequence),0) AS cursor FROM catalog_changes').get()!.cursor);
+  return { catalog, works: workChangeCursor(db) };
 }
 
 export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete', verifyCommit?: () => void): CatalogEntry {
@@ -237,17 +273,19 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
           // Preserve unrelated files without interpreting or serving them.
           for (const file of manifest.files) {
             const path = join(destination, file.path);
-            copyFileSync(join(source, file.path), path, constants.COPYFILE_EXCL);
+            if (existsSync(path)) throw problem(409, 'Unindexed chapter files already occupy the directory');
+            renameSync(join(source, file.path), path);
             addedFiles.push(path);
           }
         } else {
           mkdirSync(dirname(destination), { recursive: true });
-          moveChapterFiles(source, destination); publishedPath = destination;
+          renameSync(source, destination); publishedPath = destination;
         }
         if (backup) {
           for (const file of readdirSync(backup.to, { withFileTypes: true })) {
             if (!file.isFile() || chapterFileNames.includes(file.name.toLowerCase()) || isUnfinishedContentName(file.name)) continue;
             const retained = { from: join(backup.to, file.name), to: join(destination, file.name) };
+            if (existsSync(retained.to)) throw problem(409, 'Unindexed chapter files conflict with a previous copy');
             renameSync(retained.from, retained.to); retainedFiles.push(retained);
           }
         }
@@ -258,11 +296,11 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
     committed = true;
     return result;
   } finally {
-    if (committed) { if (backup) rmSync(backup.to, { recursive: true, force: true }); }
+    if (committed) { if (backup) void removeRetired(backup.to); }
     else {
       for (const file of retainedFiles) renameSync(file.to, file.from);
-      for (const path of addedFiles) rmSync(path, { force: true });
-      if (publishedPath) rmSync(publishedPath, { recursive: true, force: true });
+      for (const path of addedFiles) renameSync(path, join(source, basename(path)));
+      if (publishedPath) renameSync(publishedPath, source);
       if (backup) renameSync(backup.to, backup.from);
     }
   }
@@ -276,22 +314,29 @@ export function chapterRow(db: DatabaseSync, id: string) {
   return { ...row, catalog };
 }
 
-export function deleteChapter(db: DatabaseSync, dataDir: string, id: string): CatalogEntry {
+export async function deleteChapter(db: DatabaseSync, dataDir: string, id: string): Promise<CatalogEntry> {
   const row = chapterRow(db, id);
   if (row.deleted_at !== null) return row.catalog;
   const trash = join('trash', id + '-' + randomUUID());
   const from = chapterStoragePath(dataDir, row.path ?? row.directory);
   const moved = existsSync(from);
+  const verify = () => {
+    const current = chapterRow(db, id);
+    if (current.entry !== row.entry || current.path !== row.path || current.deleted_at !== null ||
+        chapterStoragePath(dataDir, row.path ?? row.directory) !== from || existsSync(from) !== moved) {
+      throw problem(409, 'Chapter changed during deletion; retry');
+    }
+  };
+  const save = () => {
+    db.prepare('UPDATE chapters SET path=?,deleted_at=? WHERE id=?').run(moved ? trash : null, Date.now(), id);
+    const entry = recordEntry(db, { ...row.catalog, deleted: true });
+    db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(id, entry.sequence);
+    return entry;
+  };
+  if (!moved) return transaction(db, () => { verify(); return save(); });
   const trashPath = chapterStoragePath(dataDir, trash);
-  if (moved) { mkdirSync(join(dataDir, 'trash'), { recursive: true }); moveChapterFiles(from, trashPath); }
-  try {
-    return transaction(db, () => {
-      db.prepare('UPDATE chapters SET path=?,deleted_at=? WHERE id=?').run(moved ? trash : null, Date.now(), id);
-      const entry = recordEntry(db, { ...row.catalog, deleted: true });
-      db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(id, entry.sequence);
-      return entry;
-    });
-  } catch (error) { if (moved) moveChapterFiles(trashPath, from); throw error; }
+  mkdirSync(dirname(trashPath), { recursive: true });
+  return moveChapterStorage(db, from, trashPath, verify, save);
 }
 
 export async function restoreChapter(db: DatabaseSync, dataDir: string, id: string, limits: Limits): Promise<CatalogEntry> {
@@ -301,19 +346,20 @@ export async function restoreChapter(db: DatabaseSync, dataDir: string, id: stri
   if (!row.path || !storedFilesExist(dataDir, row.path, row.catalog)) throw problem(410, 'Chapter files are unavailable');
   const { validateMedia } = await import('./chapter-files.ts');
   const source = chapterStoragePath(dataDir, row.path);
-  const complete = await validateMedia(source, row.catalog.manifest, limits);
-  const current = chapterRow(db, id);
-  if (!current.catalog.deleted || current.path !== row.path || current.catalog.revision !== row.catalog.revision || !storedFilesExist(dataDir, row.path, row.catalog)) throw problem(409, 'Chapter changed during restoration; retry');
   const destination = chapterStoragePath(dataDir, row.directory);
-  if (existsSync(destination)) throw problem(409, 'Chapter directory already exists');
+  const signature = storageSignature(source);
+  const complete = await validateMedia(source, row.catalog.manifest, limits);
   mkdirSync(dirname(destination), { recursive: true });
-  moveChapterFiles(source, destination);
-  try {
-    return transaction(db, () => {
-      db.prepare('UPDATE chapters SET path=directory,deleted_at=NULL WHERE id=?').run(id);
-      return recordEntry(db, { ...row.catalog, complete, deleted: false });
-    });
-  } catch (error) { moveChapterFiles(destination, source); throw error; }
+  return moveChapterStorage(db, source, destination, () => {
+    const current = chapterRow(db, id);
+    if (current.entry !== row.entry || current.path !== row.path || !storedFilesExist(dataDir, row.path!, row.catalog) ||
+        chapterStoragePath(dataDir, row.directory) !== destination || storageSignature(source) !== signature) {
+      throw problem(409, 'Chapter changed during restoration; retry');
+    }
+  }, () => {
+    db.prepare('UPDATE chapters SET path=directory,deleted_at=NULL WHERE id=?').run(id);
+    return recordEntry(db, { ...row.catalog, complete, deleted: false });
+  });
 }
 
 export function purgeChapter(db: DatabaseSync, dataDir: string, id: string): void {

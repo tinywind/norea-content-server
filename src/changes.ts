@@ -5,14 +5,18 @@ import { problem } from './db.ts';
 export interface ChangeCursors { catalogCursor: number; workCursor: number; overrideCursor: number }
 export interface ChangeWaitCursors { catalogCursor: number; workCursor: number; overrideCursor?: number }
 
+export function workChangeCursor(db: DatabaseSync): number {
+  return Number(db.prepare("SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='work_changes'),0) AS cursor").get()!.cursor);
+}
+
 export function readChangeCursors(db: DatabaseSync): ChangeCursors {
   const catalog = db.prepare('SELECT coalesce(max(sequence),0) AS cursor FROM catalog_changes').get() as { cursor: number };
-  const work = db.prepare('SELECT coalesce(max(sequence),0) AS cursor FROM work_changes').get() as { cursor: number };
+  const work = workChangeCursor(db);
   const override = db.prepare(`SELECT max(
     coalesce((SELECT revision FROM work_override_revision WHERE singleton=1), 0),
     coalesce((SELECT max(revision) FROM work_overrides), 0)
   ) AS cursor`).get() as { cursor: number };
-  return { catalogCursor: catalog.cursor, workCursor: work.cursor, overrideCursor: override.cursor };
+  return { catalogCursor: catalog.cursor, workCursor: work, overrideCursor: override.cursor };
 }
 
 export function createChangeNotifications(db: DatabaseSync) {

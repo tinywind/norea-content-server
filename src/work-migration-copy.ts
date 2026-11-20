@@ -9,7 +9,7 @@ import { chapterIdentityId, canonicalChapterManifest } from './chapter-number-ma
 import { inspectChapterInventory } from './chapter-inventory.ts';
 import { validateFiles, validateMedia } from './chapter-files.ts';
 import { problem } from './db.ts';
-import { availableChapter, chapterRow, chapterStoragePath, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { availableChapter, chapterRow, chapterStagePath, chapterStoragePath, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 import { readVerifiedRegularFile } from './secure-files.ts';
 import { migrationCopyFence, type MigrationInventory } from './work-migrations.ts';
 
@@ -91,7 +91,7 @@ async function performMigrationCopy(db: DatabaseSync, dataDir: string, sourceId:
   }
   if (expected ? !current || current.id !== expected.id || current.revision !== expected.revision : !!current) conflict('target changed; an exact existing-copy revision is required before replacement');
   verify();
-  const stage = join(dataDir, 'staging', 'migration-copy-' + randomUUID());
+  const stage = chapterStagePath(dataDir, 'migration-copy-' + randomUUID());
   try {
     await mkdir(stage, { recursive: true });
     for (const file of manifest.files) await copyFile(chapterStoragePath(dataDir, join(sourceRow.path!, file.path)), join(stage, file.path));

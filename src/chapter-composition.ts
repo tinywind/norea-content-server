@@ -6,10 +6,7 @@ function isStorageId(value: unknown): value is string {
     !/^[. ]|[. ]$|[\u0000-\u001f<>:"/\\|?*]/.test(value) &&
     !/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(value) &&
     !/(?:\.tmp|\.bak|\.part|\.partial|\.norea-sync-backup)$/i.test(value) &&
-    !Array.from(value).some(character => {
-      const code = character.codePointAt(0)!;
-      return code >= 0xd800 && code <= 0xdfff;
-    });
+    value.isWellFormed();
 }
 
 /** The upstream values are retained independently of the user's final chapter list. */
@@ -61,10 +58,7 @@ function object(value: unknown): Record<string, unknown> {
 function text(value: unknown, nullable = false): string | null {
   if (nullable && value === null) return null;
   if (typeof value !== "string" || !value.trim() || value.length > 4096 ||
-      Array.from(value).some(character => {
-        const code = character.codePointAt(0)!;
-        return code >= 0xd800 && code <= 0xdfff;
-      })) throw problem(400, "Chapter composition: invalid text");
+      !value.isWellFormed()) throw problem(400, "Chapter composition: invalid text");
   return value;
 }
 

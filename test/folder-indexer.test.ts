@@ -251,7 +251,7 @@ test('deleted chapters cannot be reimported by putting their directory back', as
   try {
     await f.run();
     const original = await readFile(join(f.directory, 'content.html'));
-    const entry = stored(f); deleteChapter(f.db, f.dataDir, entry.id);
+    const entry = stored(f); await deleteChapter(f.db, f.dataDir, entry.id);
     await mkdir(f.directory); await writeFile(join(f.directory, 'content.html'), original);
     assert.equal((await f.run()).registered, 0);
     assert.match(f.items.at(-1)!.reason!, /deleted/i);

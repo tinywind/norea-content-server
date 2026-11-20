@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.web.json"
   },
   "dependencies": {
+    "@fastify/compress": "^9.3.0",
     "@fastify/multipart": "^10.1.8",
     "@fastify/rate-limit": "^11.2.2",
     "@fastify/swagger": "^9.9.3",

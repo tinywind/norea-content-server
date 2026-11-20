@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { copyFile, mkdir, rm, writeFile } from 'node:fs/promises';
-import { basename, join, resolve } from 'node:path';
+import { copyFile, mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { canonicalChapterManifest, chapterIdentityId } from './chapter-number-mappings.ts';
 import { inspectChapterInventory } from './chapter-inventory.ts';
 import { chapterFileStream, validateFiles, validateMedia } from './chapter-files.ts';
 import { openDatabase, problem } from './db.ts';
-import { availableChapter, defaultLimits, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
+import { availableChapter, chapterStagePath, defaultLimits, digest, publishChapter, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 import { readVerifiedRegularFile } from './secure-files.ts';
 import { readWorkMigration, type MigrationLineageChapterDecision } from './work-migration-lineage.ts';
 import type { MigrationInventory } from './work-migrations.ts';
@@ -337,7 +337,17 @@ export async function recoverDiscardedMigrationChapters(
           fileBytes: item.targetManifest.files.reduce((sum, file) => sum + file.size, 0),
           sequence: 0,
         };
-        resultEntry = publishChapter(db, dataDir, item.stageDir, entry, uploadCursor(db), false, 'prefer-complete');
+        const stage = chapterStagePath(dataDir, 'recovery-' + randomUUID());
+        await mkdir(dirname(stage), { recursive: true });
+        try {
+          try { await rename(item.stageDir, stage); }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
+            await mkdir(stage);
+            for (const file of item.targetManifest.files) await copyFile(join(item.stageDir, file.path), join(stage, file.path));
+          }
+          resultEntry = publishChapter(db, dataDir, stage, entry, uploadCursor(db), false, 'prefer-complete');
+        } finally { await rm(stage, { recursive: true, force: true }); }
         status = 'published';
         publishedCount += 1;
       }

@@ -192,16 +192,16 @@ test('a disconnected streaming upload stays unpublished and its staging file is 
     request.on('error', () => {});
     request.write((await chapterFiles()).subarray(0, 100));
     for (let attempt = 0; attempt < 100; attempt++) {
-      if ((await readdir(join(s.dataDir, 'staging')).catch(() => [])).length) break;
+      if ((await readdir(join(s.dataDir, 'contents', '.norea-staging')).catch(() => [])).length) break;
       await delay(10);
     }
-    assert.equal((await readdir(join(s.dataDir, 'staging'))).length, 1);
+    assert.equal((await readdir(join(s.dataDir, 'contents', '.norea-staging'))).length, 1);
     request.destroy();
     for (let attempt = 0; attempt < 100; attempt++) {
-      if (!(await readdir(join(s.dataDir, 'staging'))).length) break;
+      if (!(await readdir(join(s.dataDir, 'contents', '.norea-staging'))).length) break;
       await delay(10);
     }
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     assert.deepEqual((await s.app.inject('/api/v1/catalog/changes')).json().items, []);
   } finally { await s.close(); }
 });

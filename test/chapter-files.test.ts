@@ -130,7 +130,7 @@ for (const [policy, storedComplete, incomingComplete, replaces] of [
     assert.equal(current.sequence > first.sequence, replaces);
     const downloaded = await s.app.inject(`/api/v1/chapters/${current.id}/files?revision=${current.revision}&path=content.html`);
     assert.equal(downloaded.body, replaces ? 'replacement body' : 'original body');
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -165,7 +165,7 @@ test('replace-server rejects an upload overtaken by a newer replacement', { time
     });
     const split = Math.floor(body.payload.length / 2);
     request.write(body.payload.subarray(0, split));
-    await waitFor(async () => (await readdir(join(s.dataDir, 'staging'))).length === 1);
+    await waitFor(async () => (await readdir(join(s.dataDir, 'contents', '.norea-staging'))).length === 1);
     const newer = { 'content.html': Buffer.from('newer copy') };
     const winner = await upload(s, newer, description(newer), 'replace-server');
     assert.equal(winner.statusCode, 200, winner.body);
@@ -173,7 +173,7 @@ test('replace-server rejects an upload overtaken by a newer replacement', { time
     const result = await response;
     assert.equal(result.status, 409, result.body);
     assert.equal((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${winner.json().revision}&path=content.html`)).body, 'newer copy');
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -269,7 +269,7 @@ test('a complete canonical chapter ignores changed uploads under its folder alia
     assert.deepEqual(ignored.json(), first);
     for (const [path, bytes] of Object.entries(files)) assert.deepEqual((await s.app.inject(`/api/v1/chapters/${first.id}/files?revision=${first.revision}&path=${path}`)).rawPayload, bytes);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -533,7 +533,7 @@ test('concurrent and changed uploads retain the complete stored copy', async () 
     }
     const selected = await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/revision`, headers: await consoleHeaders(s.app, s.dataDir), payload: { revision: second.revision } });
     assert.equal(selected.statusCode, 404);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -706,7 +706,7 @@ test('missing, wrong-sized and interrupted files never enter the catalog', { tim
       const response = await s.app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...s.headers, 'content-type': upload.type }, payload: upload.payload });
       assert.ok(response.statusCode >= 400 && response.statusCode < 500, response.body);
       assert.equal((s.db.prepare('SELECT count(*) AS count FROM chapters').get() as { count: number }).count, 0);
-      assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+      assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     }
   } finally { await s.close(); }
 });
@@ -719,9 +719,9 @@ test('a disconnected multipart upload is unpublished and removes staged files', 
     const request = httpRequest(`${address}/api/v1/chapter-files`, { method: 'POST', headers: { ...s.headers, 'content-type': body.type } });
     request.on('error', () => {});
     request.write(body.payload.subarray(0, body.payload.length / 2));
-    await waitFor(async () => (await readdir(join(s.dataDir, 'staging')).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return []; throw error; })).length === 1);
+    await waitFor(async () => (await readdir(join(s.dataDir, 'contents', '.norea-staging')).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return []; throw error; })).length === 1);
     request.destroy();
-    await waitFor(async () => (await readdir(join(s.dataDir, 'staging'))).length === 0);
+    await waitFor(async () => (await readdir(join(s.dataDir, 'contents', '.norea-staging'))).length === 0);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
   } finally { await s.close(); }
 });
@@ -742,12 +742,12 @@ test('a streaming multipart body that ends inside a file returns a client error'
     });
     request.on('error', fail);
     request.write(body.payload.subarray(0, body.payload.length / 2));
-    await waitFor(async () => (await readdir(join(s.dataDir, 'staging')).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return []; throw error; })).length === 1);
+    await waitFor(async () => (await readdir(join(s.dataDir, 'contents', '.norea-staging')).catch((error: NodeJS.ErrnoException) => { if (error.code === 'ENOENT') return []; throw error; })).length === 1);
     request.end();
     const result = await response;
     assert.equal(result.status, 400, result.body);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -772,14 +772,14 @@ for (const alias of [false, true]) test(`deletion and restoration during a strea
     request.on('error', fail);
     const split = Math.floor(body.payload.length / 2);
     request.write(body.payload.subarray(0, split));
-    await waitFor(async () => (await readdir(join(s.dataDir, 'staging'))).length === 1);
+    await waitFor(async () => (await readdir(join(s.dataDir, 'contents', '.norea-staging'))).length === 1);
     assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${first.id}`, headers: s.headers })).statusCode, 200);
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${first.id}/restore`, headers: s.headers })).statusCode, 200);
     request.end(body.payload.subarray(split));
     const result = await response;
     assert.equal(result.status, 409, result.body);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -821,8 +821,8 @@ for (const alias of [false, true]) for (const removal of ['filesystem', 'api-aft
     const split = Math.floor(body.payload.length / 2);
     request.write(body.payload.subarray(0, split));
     await waitFor(async () => {
-      const stages = await readdir(join(s.dataDir, 'staging'));
-      return stages.length === 1 && (await readdir(join(s.dataDir, 'staging', stages[0]))).includes('content.html');
+      const stages = await readdir(join(s.dataDir, 'contents', '.norea-staging'));
+      return stages.length === 1 && (await readdir(join(s.dataDir, 'contents', '.norea-staging', stages[0]))).includes('content.html');
     });
     if (removal === 'filesystem') await removeAndScan();
     else {
@@ -835,7 +835,7 @@ for (const alias of [false, true]) for (const removal of ['filesystem', 'api-aft
     const result = await response;
     assert.equal(result.status, 409, result.body);
     await assert.rejects(readdir(directory), { code: 'ENOENT' });
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     const retry = await upload(s, files, metadata);
     assert.equal(retry.statusCode, 200, retry.body);
     assert.equal(retry.json().id, first.id);
@@ -863,7 +863,7 @@ test('unsafe paths, incorrect body types, malformed media and undeclared parts a
       const response = await upload(s, item.files, item.metadata);
       assert.equal(response.statusCode, 400, response.body);
       assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-      assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+      assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     }
     for (const order of ['file-first', 'duplicate-file', 'duplicate-metadata', 'wrong-filename']) {
       const form = new FormData();
@@ -874,7 +874,7 @@ test('unsafe paths, incorrect body types, malformed media and undeclared parts a
       const request = new Request('http://localhost', { method: 'POST', body: form });
       const response = await s.app.inject({ method: 'POST', url: '/api/v1/chapter-files', headers: { ...s.headers, 'content-type': request.headers.get('content-type')! }, payload: Buffer.from(await request.arrayBuffer()) });
       assert.ok(response.statusCode >= 400 && response.statusCode < 500, response.body);
-      assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+      assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     }
   } finally { await s.close(); }
 });
@@ -891,7 +891,7 @@ test('raw artifact byte, metadata and file limits fail before publication', { ti
       const response = await upload(s, files);
       assert.equal(response.statusCode, 413, response.body);
       assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-      assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+      assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     } finally { await s.close(); }
   }
   const s = await setup();
@@ -902,7 +902,7 @@ test('raw artifact byte, metadata and file limits fail before publication', { ti
     const understated = description(files); understated.files[0].size = 1;
     assert.equal((await upload(s, files, understated)).statusCode, 400);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -928,7 +928,7 @@ test('unsafe ZIP entries and malformed media inventories are rejected', async ()
     const duplicates = { ...media, media: { files: [media.media.files[0], media.media.files[0]] } };
     assert.equal((await upload(s, { 'content.html': Buffer.from('body'), 'manifest.json': Buffer.from(JSON.stringify(duplicates)), 'media.zip': zip })).statusCode, 400);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 
@@ -941,7 +941,7 @@ test('media uncompressed byte limits are checked without extracting the archive'
     const response = await upload(s, files);
     assert.equal(response.statusCode, 413, response.body);
     assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
   } finally { await s.close(); }
 });
 

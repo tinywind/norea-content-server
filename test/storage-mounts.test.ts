@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { test } from 'node:test';
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import promises, { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { buildApp } from '../src/app.ts';
 import { openDatabase } from '../src/db.ts';
@@ -51,6 +51,7 @@ test('separate content and state mounts support upload, download, trash, restore
     {
       const response = await upload(s);
       assert.equal(response.statusCode, 200, response.body);
+      assert.equal(mount.crossings(), 0);
       const entry = response.json();
       const url = `/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`;
       const original = (await s.app.inject(url)).rawPayload;
@@ -67,38 +68,39 @@ test('separate content and state mounts support upload, download, trash, restore
       await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
       assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/purge`, headers: admin })).statusCode, 200);
     }
-    assert.equal(mount.crossings(), 4);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
+    assert.equal(mount.crossings(), 3);
+    assert.deepEqual(await readdir(join(s.dataDir, 'contents', '.norea-staging')), []);
     assert.equal((await readdir(s.dataDir, { recursive: true })).some(name => name.includes('.norea-move-')), false);
   } finally { mount.restore(); await s.close(); }
 });
 
-test('failed cross-device copies leave no published chapter or partial content', async () => {
+test('failed cross-device trash copies retain the published chapter and remove the partial copy', async () => {
   const s = await setup(); const mount = separateContentsMount(s.dataDir);
-  const copy = fs.cpSync;
+  const copy = promises.cp;
   let copies = 0;
-  fs.cpSync = (from, to, options) => { copy(from, to, options); copies++; throw Object.assign(new Error('No space left on device'), { code: 'ENOSPC' }); };
+  promises.cp = async (from, to, options) => { await copy(from, to, options); copies++; throw Object.assign(new Error('No space left on device'), { code: 'ENOSPC' }); };
   syncBuiltinESMExports();
   try {
-    assert.equal((await upload(s)).statusCode, 500);
+    const uploaded = await upload(s);
+    assert.equal(uploaded.statusCode, 200, uploaded.body);
+    const entry = uploaded.json();
+    assert.equal((await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers })).statusCode, 500);
     assert.equal(copies, 1);
-    assert.equal((s.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 0);
-    assert.deepEqual(await readdir(join(s.dataDir, 'staging')), []);
-    const names = await readdir(join(s.dataDir, 'contents'), { recursive: true });
-    assert.equal(names.some(name => name.includes('.norea-move-') || /\.(files|zip)$/.test(name)), false);
-  } finally { fs.cpSync = copy; mount.restore(); await s.close(); }
+    assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).body, 'Original chapter bytes');
+    assert.deepEqual(await readdir(join(s.dataDir, 'trash')), []);
+  } finally { promises.cp = copy; mount.restore(); await s.close(); }
 });
 
 test('a locked retired source does not lose the complete copy or its catalog path', async () => {
   const s = await setup(); const mount = separateContentsMount(s.dataDir);
-  const remove = fs.rmSync;
+  const remove = promises.rm;
   try {
     const entry = (await upload(s)).json();
-    fs.rmSync = (path, options) => {
+    promises.rm = async (path, options) => {
       if (String(path).includes(`${sep}contents${sep}`) && String(path).includes('.norea-move-') && fs.existsSync(path)) {
         throw Object.assign(new Error('Retired source is locked'), { code: 'EBUSY' });
       }
-      remove(path, options);
+      await remove(path, options);
     };
     syncBuiltinESMExports();
     const deletion = await s.app.inject({ method: 'DELETE', url: `/api/v1/chapters/${entry.id}`, headers: s.headers });
@@ -108,5 +110,5 @@ test('a locked retired source does not lose the complete copy or its catalog pat
     assert.equal(await readFile(join(s.dataDir, stored, 'content.html'), 'utf8'), 'Original chapter bytes');
     assert.equal((await s.app.inject({ method: 'POST', url: `/api/v1/chapters/${entry.id}/restore`, headers: s.headers })).statusCode, 200);
     assert.equal((await s.app.inject(`/api/v1/chapters/${entry.id}/files?revision=${entry.revision}&path=content.html`)).body, 'Original chapter bytes');
-  } finally { fs.rmSync = remove; mount.restore(); await s.close(); }
+  } finally { promises.rm = remove; mount.restore(); await s.close(); }
 });

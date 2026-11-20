@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { authenticateDevice } from './auth.ts';
 import { problem, transaction } from './db.ts';
 import { digest, validateStorageIdentity } from './packages.ts';
-import { atomicWrite, coverByteLimit, coverContentType, isNovelStatus, isOverrideCoverFile, readBytes, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { atomicWrite, coverByteLimit, coverContentType, isNovelStatus, isOverrideCoverFile, readBytes, type NovelMetadataV1 } from './works.ts';
 
 type WorkIdentity = NovelMetadataV1['identity'];
 export interface WorkOverrideField { value: string | number | boolean | null; updatedAt: number }
@@ -161,10 +161,11 @@ export function mergeWorkOverride(base: WorkOverrideV1, incoming: WorkOverrideV1
 }
 
 function overrideWork(db: DatabaseSync, id: string): OverrideWork | undefined {
-  const row = db.prepare('SELECT directory,entry FROM works WHERE id=?').get(id) as { directory: string; entry: string } | undefined;
+  const row = db.prepare('SELECT directory,plugin_id,novel_id,novel_path,is_local FROM work_summaries WHERE id=?').get(id) as
+    { directory: string; plugin_id: string; novel_id: string; novel_path: string; is_local: number } | undefined;
   if (!row) return undefined;
-  const { metadata } = JSON.parse(row.entry) as WorkEntry;
-  return { id, directory: row.directory, identity: workIdentity(metadata.identity), isLocal: metadata.identity.pluginId === 'local' || metadata.novel.isLocal };
+  const identity = workIdentity({ pluginId: row.plugin_id, novelId: row.novel_id, novelPath: row.novel_path });
+  return { id, directory: row.directory, identity, isLocal: identity.pluginId === 'local' || Boolean(row.is_local) };
 }
 function requireOverrideWork(db: DatabaseSync, id: string): OverrideWork {
   if (db.prepare('SELECT 1 FROM work_tombstones WHERE work_id=? AND deleted=1').get(id)) throw problem(410, 'Work was deleted from the server');

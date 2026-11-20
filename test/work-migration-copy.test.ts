@@ -145,7 +145,7 @@ test('copy failures after staging leave source and the previous target intact', 
     assert.equal(guards, 2);
     assert.equal(await f.body('source'), 'original source'); assert.equal(await f.body('target'), 'original target');
     assert.deepEqual(JSON.parse((f.db.prepare('SELECT entry FROM chapters WHERE id=?').get(target.id) as { entry: string }).entry), target);
-    assert.deepEqual(await readdir(join(f.dataDir, 'staging')), []);
+    assert.deepEqual(await readdir(join(f.dataDir, 'contents', '.norea-staging')), []);
   } finally { await f.close(); }
 });
 

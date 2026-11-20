@@ -15,7 +15,6 @@ import {
   type UserStateRetentionState, type UserStateSnapshotResponse,
 } from './user-state-protocol.ts';
 import type { StoredWorkMigrationLineage } from './work-migration-lineage.ts';
-import type { WorkEntry } from './works.ts';
 export { USER_STATE_MAX_BYTES, userStateEntityKey, parseUserStateEntity, parseUserStateValue } from './user-state-protocol.ts';
 export type {
   UserStateEntity, UserStateKind, UserStateValue, UserStateOperation,
@@ -431,6 +430,7 @@ export interface UserStateMaintenanceOptions {
   operationFingerprintRetentionMs?: number;
   tombstoneGraceMs?: number;
   vacuumPagesPerPass?: number;
+  checkpointMode?: 'PASSIVE' | 'TRUNCATE';
   now?: () => number;
 }
 
@@ -712,13 +712,12 @@ export function gcPhysicalUserStateRecords(
     const liveWorkIds = new Set<string>();
     const liveWorkKeys = new Set<string>();
     const liveWorkRows = db.prepare(`
-      SELECT id, entry FROM works
-      WHERE NOT EXISTS (SELECT 1 FROM work_tombstones t WHERE t.work_id = works.id AND t.deleted = 1)
-    `).all() as { id: string; entry: string }[];
+      SELECT id, plugin_id AS pluginId, novel_id AS novelId, novel_path AS novelPath FROM work_summaries
+      WHERE NOT EXISTS (SELECT 1 FROM work_tombstones t WHERE t.work_id = work_summaries.id AND t.deleted = 1)
+    `).all() as { id: string; pluginId: string; novelId: string; novelPath: string }[];
     for (const row of liveWorkRows) {
       liveWorkIds.add(row.id);
-      const parsed = JSON.parse(row.entry) as WorkEntry;
-      for (const workKey of workKeysForIdentity(parsed.metadata.identity)) {
+      for (const workKey of workKeysForIdentity(row)) {
         liveWorkKeys.add(workKey);
       }
     }
@@ -848,7 +847,7 @@ export function maintainUserState(db: DatabaseSync, options?: UserStateMaintenan
     counts.nulledOperationBodies > 0 ||
     counts.deletedOperations > 0;
   const reclaimed = mutated || freelistCount > 0
-    ? reclaimDatabaseSpace(db, options?.vacuumPagesPerPass)
+    ? reclaimDatabaseSpace(db, options?.vacuumPagesPerPass, options?.checkpointMode)
     : null;
   return { ...counts, reclaimed };
 }

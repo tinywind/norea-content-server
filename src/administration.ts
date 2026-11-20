@@ -94,16 +94,18 @@ export async function registerAdministration(app: FastifyInstance, context: {
   getAnonymousRead: () => boolean; setAnonymousRead: (enabled: boolean) => void;
 }): Promise<void> {
   const { db, dataDir, limits } = context;
-  const staging = resolve(dataDir, 'staging');
-  try {
-    if ((await lstat(staging)).isSymbolicLink()) throw problem(400, 'Server staging must not be a symbolic link');
-    if (relative(await realpath(dataDir), await realpath(staging)) !== 'staging') throw problem(400, 'Server staging must remain inside server storage');
-    for (const entry of await readdir(staging, { withFileTypes: true })) {
-      if (entry.isDirectory() && !entry.isSymbolicLink() && /^files-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(entry.name)) {
-        await rm(join(staging, entry.name), { recursive: true, force: true });
+  for (const path of ['staging', join('contents', '.norea-staging')]) {
+    const staging = resolve(dataDir, path);
+    try {
+      if ((await lstat(staging)).isSymbolicLink()) throw problem(400, 'Server staging must not be a symbolic link');
+      if (relative(await realpath(dataDir), await realpath(staging)) !== path) throw problem(400, 'Server staging must remain inside server storage');
+      for (const entry of await readdir(staging, { withFileTypes: true })) {
+        if (entry.isDirectory() && !entry.isSymbolicLink() && /^(?:files|migration-copy|recovery)-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(entry.name)) {
+          await rm(join(staging, entry.name), { recursive: true, force: true });
+        }
       }
-    }
-  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
   let closing = false;
   const active = new Map<string, { rootId: string; controller: AbortController; promise: Promise<void> }>();
   let pendingScan = false;
@@ -130,7 +132,13 @@ export async function registerAdministration(app: FastifyInstance, context: {
     if (active.size) throw problem(409, 'A folder scan is already running');
     const job: ScanJob = { id: randomUUID(), rootId: 'contents', rootName: 'Contents', status: 'running', startedAt: Date.now(),
       summary: { registered: 0, unchanged: 0, skipped: 0, failed: 0, removed: 0, scanned: 0, cancelled: false } };
-    saveJob(job);
+    transaction(db, () => {
+      const expired = db.prepare("SELECT id FROM admin_jobs WHERE json_extract(entry,'$.status')<>'running' ORDER BY json_extract(entry,'$.startedAt') DESC,id LIMIT -1 OFFSET 100").all() as { id: string }[];
+      const deleteItems = db.prepare('DELETE FROM admin_job_items WHERE job_id=?');
+      const deleteJob = db.prepare('DELETE FROM admin_jobs WHERE id=?');
+      for (const { id } of expired) { deleteItems.run(id); deleteJob.run(id); }
+      saveJob(job);
+    });
     const controller = new AbortController();
     const pendingItems: FolderIndexItem[] = [];
     let lastFlushAt = Date.now();

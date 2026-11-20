@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { request as httpRequest } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
+import { gunzipSync } from 'node:zlib';
+import Fastify from 'fastify';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -24,6 +26,109 @@ async function fixture() {
   const headers = await deviceHeaders(app);
   return { app, dataDir, headers, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
+
+test('identity-checked deletion rejects mismatches and returns a compact tombstone', async () => {
+  const f = await fixture();
+  try {
+    const url = `/api/v1/works/${id}`;
+    const original = metadata();
+    original.novel.summary = 'metadata '.repeat(2000);
+    const uploaded = await f.app.inject({ method: 'PUT', url, headers: f.headers, payload: original });
+    assert.equal(uploaded.statusCode, 200);
+    const capabilities = (await f.app.inject('/api/v1/capabilities')).json();
+    assert.equal(capabilities.workDeleteIdentityCheckVersion, 1);
+    const query = new URLSearchParams({ ...original.identity, novelId: 'different' });
+    const conflict = await f.app.inject({ method: 'DELETE', url: `${url}?${query}`, headers: f.headers });
+    assert.equal(conflict.statusCode, 409);
+    assert.equal(conflict.json().code, 'work-identity-mismatch');
+    assert.equal((await f.app.inject({ url, headers: f.headers })).statusCode, 200);
+    await readFile(join(f.dataDir, 'contents/example/Book/novel.json'));
+    query.set('novelId', original.identity.novelId);
+    const deletion = { method: 'DELETE' as const, url: `${url}?${query}`,
+      headers: { ...f.headers, 'content-type': 'application/vnd.norea.work-identity-delete+json' }, payload: '{}' };
+    const removed = await f.app.inject(deletion);
+    assert.equal(removed.statusCode, 200);
+    assert.ok(removed.rawPayload.length < 600);
+    assert.deepEqual(removed.json().metadata.identity, original.identity);
+    assert.deepEqual(removed.json().metadata.chapters, {});
+    assert.equal(removed.json().metadata.cover, null);
+    assert.equal(removed.json().deleted, true);
+    assert.equal((await f.app.inject(deletion)).statusCode, 404);
+  } finally { await f.close(); }
+});
+
+test('the conditional request media type prevents an older server from running an unguarded deletion', async () => {
+  const legacy = Fastify();
+  let invoked = false;
+  legacy.delete('/api/v1/works/:id', async () => { invoked = true; return {}; });
+  try {
+    const response = await legacy.inject({
+      method: 'DELETE', url: `/api/v1/works/${id}?pluginId=example&novelPath=%2Fother`,
+      headers: { 'content-type': 'application/vnd.norea.work-identity-delete+json' }, payload: '{}',
+    });
+    assert.equal(response.statusCode, 415);
+    assert.equal(invoked, false);
+  } finally { await legacy.close(); }
+});
+
+test('work history keeps the current revision, pages by uncompressed bytes and negotiates gzip', async () => {
+  const f = await fixture();
+  try {
+    const original = { ...metadata(), cover: { fileName: 'cover.svg', contentType: 'image/svg+xml' } };
+    await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}`, headers: f.headers, payload: original });
+    const summary = 'a'.repeat(4_500_000);
+    for (const [novelId, novelPath] of [['Book', original.identity.novelPath], ['Other', '/other']]) {
+      const workId = digest(JSON.stringify([original.identity.pluginId, novelPath]));
+      const response = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${workId}`, headers: f.headers, payload: {
+        ...original, identity: { ...original.identity, novelId, novelPath }, novel: { ...original.novel, summary },
+      } });
+      assert.equal(response.statusCode, 200);
+    }
+    const compressed = await f.app.inject({ url: '/api/v1/works?after=0', headers: { ...f.headers, 'accept-encoding': 'gzip' } });
+    assert.equal(compressed.headers['content-encoding'], 'gzip');
+    const first = JSON.parse(gunzipSync(compressed.rawPayload).toString());
+    assert.equal(first.items.length, 1);
+    assert.equal(first.items[0].metadata.novel.summary.length, summary.length);
+    assert.equal(first.hasMore, true);
+    const second = (await f.app.inject({ url: `/api/v1/works?after=${first.cursor}`, headers: f.headers })).json();
+    assert.equal(second.items.length, 1);
+    assert.equal(second.hasMore, false);
+    assert.ok(second.cursor > first.cursor);
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><desc>' + 'c'.repeat(4096) + '</desc></svg>');
+    const upload = await f.app.inject({ method: 'PUT', url: `/api/v1/works/${id}/cover`, headers: { ...f.headers, 'content-type': 'image/svg+xml' }, payload: svg });
+    assert.equal(upload.statusCode, 200);
+    const cover = await f.app.inject({ url: `/api/v1/works/${id}/cover`, headers: { ...f.headers, 'accept-encoding': 'gzip' } });
+    assert.equal(cover.headers['content-type'], 'image/svg+xml');
+    assert.equal(cover.headers['content-encoding'], undefined);
+    assert.deepEqual(cover.rawPayload, svg);
+  } finally { await f.close(); }
+});
+
+test('catalog detail stays compact and work validators follow metadata changes', async () => {
+  const f = await fixture();
+  try {
+    const url = `/api/v1/works/${id}`;
+    const summaryUrl = `/api/v1/catalog/works/${id}`;
+    assert.equal((await f.app.inject({ url: summaryUrl, headers: f.headers })).statusCode, 404);
+    const original = { ...metadata(), chapters: { '1': 'First' } };
+    await f.app.inject({ method: 'PUT', url, headers: f.headers, payload: original });
+    const detail = await f.app.inject({ url: summaryUrl, headers: f.headers });
+    assert.equal(detail.statusCode, 200);
+    assert.deepEqual(detail.json().identity, original.identity);
+    assert.equal(detail.json().chapters, undefined);
+    const response = await f.app.inject({ url, headers: f.headers });
+    assert.match(String(response.headers.etag), /^"[a-f0-9]{64}"$/);
+    const conditional = { url, headers: { ...f.headers, 'if-none-match': String(response.headers.etag) } };
+    const unchanged = await f.app.inject(conditional);
+    assert.equal(unchanged.statusCode, 304);
+    assert.equal(unchanged.body, '');
+    await f.app.inject({ method: 'PUT', url, headers: f.headers, payload: { ...original, novel: { ...original.novel, name: 'Updated' } } });
+    const updated = await f.app.inject(conditional);
+    assert.equal(updated.statusCode, 200);
+    assert.notEqual(updated.headers.etag, response.headers.etag);
+    assert.equal(updated.json().metadata.novel.name, 'Updated');
+  } finally { await f.close(); }
+});
 
 test('restores minimal work files and local covers without source URLs or exact optional fields', async () => {
   await mkdir('.tmp', { recursive: true });

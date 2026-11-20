@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import compress from '@fastify/compress';
 import swagger from '@fastify/swagger';
 import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
@@ -59,11 +60,15 @@ export async function buildApp(options: {
   const dataDir = resolve(options.dataDir);
   const secret = installationSecret(dataDir);
   const db = openDatabase(dataDir);
+  const backgroundMaintenance = { ...options.userStateMaintenance,
+    vacuumPagesPerPass: options.userStateMaintenance?.vacuumPagesPerPass ?? 2048,
+    checkpointMode: 'PASSIVE' as const,
+  };
   try {
     recoverChapterNumberReconciliations(db, dataDir);
     rebuildWorkIndex(db, dataDir);
     upgradeWorkOverrides(db, dataDir);
-    maintainUserState(db, options.userStateMaintenance);
+    maintainUserState(db, backgroundMaintenance);
   } catch (error) { db.close(); throw error; }
   const limits = { ...defaultLimits, ...options.limits };
   const app = Fastify({
@@ -74,6 +79,10 @@ export async function buildApp(options: {
     trustProxy: false,
     routerOptions: { maxParamLength: 4096 },
   });
+  app.addHook('onRoute', route => {
+    if (!route.url.startsWith('/api/v1/') || /\/(?:cover|files|media)(?:\/|$)/.test(route.url)) route.compress = false;
+  });
+  await app.register(compress, { globalDecompression: false, encodings: ['gzip'], syncThreshold: 0 });
   await app.register(rateLimit, { global: true, max: 6000, timeWindow: '1 minute' });
   let anonymousRead = savedAnonymousRead(db, options.anonymousRead ?? true);
   const changes = createChangeNotifications(db);
@@ -99,7 +108,7 @@ export async function buildApp(options: {
     maintenanceTimer = setInterval(() => {
       if (closing) return;
       try {
-        maintainUserState(db, options.userStateMaintenance);
+        maintainUserState(db, backgroundMaintenance);
       } catch (error) {
         console.error('User-state maintenance pass failed:', error);
       }
@@ -117,7 +126,7 @@ export async function buildApp(options: {
   registerReadingState(app, db);
   registerUserState(app, db, options.userStateMaintenance?.now ? { now: options.userStateMaintenance.now } : undefined);
   await registerDeviceBackups(app, db, deviceBackups);
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateRetentionVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, changeOverrideCursorVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateRetentionVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, changeOverrideCursorVersion: 1, anonymousRead }));
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateRetentionVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, changeOverrideCursorVersion: { type: 'integer' }, workDeleteIdentityCheckVersion: { type: 'integer' }, workCatalogSummaryVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateRetentionVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, changeOverrideCursorVersion: 1, workDeleteIdentityCheckVersion: 1, workCatalogSummaryVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');
@@ -151,7 +160,7 @@ export async function buildApp(options: {
     if (authenticated || !anonymousRead) authenticate(db, request);
     return readChangeCursors(db);
   });
-  app.delete<{ Params: { id: string } }>('/api/v1/chapters/:id', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = deleteChapter(db, dataDir, request.params.id); changes.notify(); return entry; });
+  app.delete<{ Params: { id: string } }>('/api/v1/chapters/:id', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = await deleteChapter(db, dataDir, request.params.id); changes.notify(); return entry; });
   app.post<{ Params: { id: string } }>('/api/v1/chapters/:id/restore', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: catalogSchema } } }, async request => { authenticate(db, request); const entry = await restoreChapter(db, dataDir, request.params.id, limits); changes.notify(); return entry; });
   app.post<{ Params: { id: string } }>('/api/v1/chapters/:id/purge', { schema: { params: idParams, security: [{ bearerAuth: [] }], response: { 200: { type: 'object', properties: { purged: { type: 'boolean' } } } } } }, async request => { authenticate(db, request, true); purgeChapter(db, dataDir, request.params.id); return { purged: true }; });
   app.post<{ Querystring: { conflictPolicy: ChapterConflictPolicy } }>('/api/v1/chapter-files', { onRequest: async request => { authenticateDevice(db, request); }, schema: { security: [{ bearerAuth: [] }], consumes: ['multipart/form-data'], querystring: { type: 'object', additionalProperties: false, properties: { conflictPolicy: { type: 'string', enum: ['prefer-complete', 'keep-server', 'replace-server'], default: 'prefer-complete' } } }, response: { 200: catalogSchema }, description: 'Upload original chapter files and record their inspected media completeness. Send metadata JSON first, then files named by their original paths. No compression or body rewriting.' } }, async request => {

@@ -32,6 +32,52 @@ const schema = `
 
 // Additive extensions stay outside the original schema checksum so existing
 // installations retain their catalog, credentials, settings and chapter files.
+const workSummaryFields = `
+  json_extract(entry,'$.sequence'), directory,
+  json_extract(entry,'$.metadata.identity.pluginId'),
+  json_extract(entry,'$.metadata.identity.novelId'),
+  json_extract(entry,'$.metadata.identity.novelPath'),
+  coalesce(json_extract(entry,'$.metadata.novel.isLocal'),0),
+  coalesce(json_extract(entry,'$.hasCover'),0),
+  json_extract(entry,'$.metadata.novel'),
+  json_extract(entry,'$.metadata.cover'),
+  (SELECT count(*) FROM json_each(entry,'$.metadata.chapters'))
+`;
+const indexedWorkEntry = `json_type(entry,'$.metadata.novel')='object' AND json_type(entry,'$.sequence')='integer'`;
+const workSummarySchema = `
+  CREATE TABLE IF NOT EXISTS work_summaries (
+    id TEXT PRIMARY KEY,
+    sequence INTEGER NOT NULL,
+    directory TEXT NOT NULL,
+    plugin_id TEXT NOT NULL,
+    novel_id TEXT NOT NULL,
+    novel_path TEXT NOT NULL,
+    is_local INTEGER NOT NULL,
+    has_cover INTEGER NOT NULL,
+    novel_json TEXT NOT NULL,
+    cover_json TEXT,
+    chapter_count INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS work_summaries_plugin ON work_summaries(plugin_id);
+  CREATE TRIGGER IF NOT EXISTS works_summary_insert AFTER INSERT ON works BEGIN
+    INSERT INTO work_summaries SELECT id,${workSummaryFields} FROM works WHERE id=NEW.id AND ${indexedWorkEntry};
+  END;
+  CREATE TRIGGER IF NOT EXISTS works_summary_update AFTER UPDATE ON works BEGIN
+    DELETE FROM work_summaries WHERE id=OLD.id;
+    INSERT INTO work_summaries SELECT id,${workSummaryFields} FROM works WHERE id=NEW.id AND ${indexedWorkEntry};
+  END;
+  CREATE TRIGGER IF NOT EXISTS works_summary_delete AFTER DELETE ON works BEGIN
+    DELETE FROM work_summaries WHERE id=OLD.id;
+  END;
+  INSERT INTO work_summaries SELECT id,${workSummaryFields} FROM works
+    WHERE NOT EXISTS (SELECT 1 FROM work_summaries WHERE work_summaries.id=works.id) AND ${indexedWorkEntry};
+`;
+const changeIndexSchema = `
+  CREATE INDEX IF NOT EXISTS work_changes_work_id ON work_changes(work_id);
+  CREATE INDEX IF NOT EXISTS catalog_changes_chapter_id ON catalog_changes(chapter_id);
+  CREATE INDEX IF NOT EXISTS user_state_changes_entity_key ON user_state_changes(entity_key);
+`;
+
 const readingStateSchema = `
     CREATE TABLE IF NOT EXISTS reading_state_entries (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -223,6 +269,8 @@ function ensureUserStateSchema(db: DatabaseSync, now = Date.now()): void {
   db.exec(`CREATE INDEX IF NOT EXISTS user_state_operations_created_at ON user_state_operations(created_at);
     CREATE INDEX IF NOT EXISTS user_state_operations_prunable_body ON user_state_operations(created_at) WHERE result IS NOT NULL;`);
 
+  const normalizedReadingKey = 'migration:normalize-reading-progress-v1';
+  if (db.prepare('SELECT 1 FROM admin_settings WHERE key=?').get(normalizedReadingKey)) return;
   // Normalize legacy reading tuples from { progress, unread, readAt } to { progress, readAt }.
   db.exec(`UPDATE user_state_records
     SET record = json_remove(
@@ -260,6 +308,7 @@ function ensureUserStateSchema(db: DatabaseSync, now = Date.now()): void {
     WHERE result IS NOT NULL
       AND json_extract(result, '$.current.entity.kind') = 'reading'
       AND json_type(result, '$.current.value.unread') IS NOT NULL`);
+  db.prepare('INSERT INTO admin_settings(key,value) VALUES(?,?)').run(normalizedReadingKey, '1');
 }
 
 export interface DatabaseReclaimResult {
@@ -270,7 +319,7 @@ export interface DatabaseReclaimResult {
   checkpoint: { busy: number; log: number; checkpointed: number };
 }
 
-export function reclaimDatabaseSpace(db: DatabaseSync, pages?: number): DatabaseReclaimResult {
+export function reclaimDatabaseSpace(db: DatabaseSync, pages?: number, checkpointMode: 'PASSIVE' | 'TRUNCATE' = 'TRUNCATE'): DatabaseReclaimResult {
   if (pages !== undefined && (!Number.isSafeInteger(pages) || pages < 1)) {
     throw new RangeError('incremental_vacuum page count must be a positive safe integer');
   }
@@ -284,7 +333,7 @@ export function reclaimDatabaseSpace(db: DatabaseSync, pages?: number): Database
     }
   }
   const freelistAfter = Number((db.prepare('PRAGMA freelist_count').get() as { freelist_count?: number } | undefined)?.freelist_count ?? 0);
-  const checkpointRow = db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
+  const checkpointRow = db.prepare(checkpointMode === 'PASSIVE' ? 'PRAGMA wal_checkpoint(PASSIVE)' : 'PRAGMA wal_checkpoint(TRUNCATE)').get() as
     | { busy?: number; log?: number; checkpointed?: number }
     | undefined;
   return {
@@ -298,6 +347,16 @@ export function reclaimDatabaseSpace(db: DatabaseSync, pages?: number): Database
       checkpointed: Number(checkpointRow?.checkpointed ?? 0),
     },
   };
+}
+
+function compactCatalogLog(db: DatabaseSync): void {
+  const key = 'migration:compact-catalog-log-v1';
+  if (db.prepare('SELECT 1 FROM admin_settings WHERE key=?').get(key)) return;
+  db.exec(`UPDATE catalog_changes SET entry=json_object(
+    'id', chapter_id, 'sequence', sequence, 'manifest', json_object('identity', json(entry -> '$.manifest.identity')),
+    'complete', json(entry -> '$.complete'), 'deleted', json(entry -> '$.deleted')
+  ) WHERE CASE WHEN json_valid(entry) THEN json_type(entry,'$.revision') IS NOT NULL END`);
+  db.prepare('INSERT INTO admin_settings(key,value) VALUES(?,?)').run(key, '1');
 }
 
 export function openDatabase(dataDir: string): DatabaseSync {
@@ -314,11 +373,13 @@ export function openDatabase(dataDir: string): DatabaseSync {
       db.exec('PRAGMA auto_vacuum = INCREMENTAL');
       transaction(db, () => { db.exec(schema); db.prepare('INSERT INTO schema_state VALUES(?)').run(checksum); });
     }
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
+    db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
     transaction(db, () => {
       db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(workOverrideSchema); db.exec(userStateSchema);
       db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
       ensureUserStateSchema(db);
+      db.exec(workSummarySchema); db.exec(changeIndexSchema);
+      compactCatalogLog(db);
     });
     return db;
   } catch (error) { db.close(); throw error; }

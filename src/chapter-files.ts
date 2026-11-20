@@ -10,7 +10,7 @@ import type { Multipart } from '@fastify/multipart';
 import { canonicalize } from 'json-canonicalize';
 import yauzl from 'yauzl';
 import { problem } from './db.ts';
-import { chapterRow, chapterStoragePath, digest, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type ChapterConflictPolicy, type Limits, type PackageManifest } from './packages.ts';
+import { chapterRow, chapterStagePath, chapterStoragePath, digest, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type ChapterConflictPolicy, type Limits, type PackageManifest } from './packages.ts';
 import { openVerifiedRegularFile, openVerifiedRegularFileSync, readVerifiedRegularFile } from './secure-files.ts';
 
 export function validateFiles(value: unknown, limits: Limits): asserts value is PackageManifest {
@@ -86,7 +86,7 @@ export async function validateMedia(directory: string, manifest: PackageManifest
 
 export async function publishChapterFiles(db: DatabaseSync, dataDir: string, parts: AsyncIterableIterator<Multipart>, limits: Limits, conflictPolicy: ChapterConflictPolicy = 'prefer-complete'): Promise<CatalogEntry> {
   const startedAt = uploadCursor(db);
-  const stage = join(dataDir, 'staging', `files-${randomUUID()}`);
+  const stage = chapterStagePath(dataDir, `files-${randomUUID()}`);
   await mkdir(stage, { recursive: true });
   let manifest: PackageManifest | undefined;
   const received = new Set<string>();

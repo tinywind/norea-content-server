@@ -52,11 +52,12 @@ export function authenticate(db: DatabaseSync, request: FastifyRequest, admin = 
   const hash = tokenDigest(token);
   const session = db.prepare('SELECT id FROM console_sessions WHERE token_hash=? AND expires_at>?').get(hash, Date.now()) as { id: string } | undefined;
   if (session) return { id: session.id, kind: 'console' };
-  const device = /^[0-9a-f]{64}$/.test(token) ? db.prepare('SELECT id,blocked FROM devices WHERE key_hash=?').get(hash) as { id: string; blocked: number } | undefined : undefined;
+  const device = /^[0-9a-f]{64}$/.test(token) ? db.prepare('SELECT id,blocked,last_seen_at FROM devices WHERE key_hash=?').get(hash) as { id: string; blocked: number; last_seen_at: number } | undefined : undefined;
   if (!device) throw problem(401, 'Authentication required');
   if (device.blocked) throw problem(403, 'Device is blocked');
   if (admin) throw problem(403, 'Console session required');
-  db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(Date.now(), device.id);
+  const now = Date.now();
+  if (now - device.last_seen_at >= 60_000) db.prepare('UPDATE devices SET last_seen_at=? WHERE id=?').run(now, device.id);
   return { id: device.id, kind: 'device' };
 }
 

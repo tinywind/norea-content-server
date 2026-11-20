@@ -112,9 +112,9 @@ export function canonicalReadingIdentity(
   entry: { pluginId: string; sourceNovelId: string | null; novelPath: string; chapterPath: string; chapterNumber: string | null },
 ): { chapterPath: string; chapterNumber: string | null } {
   const identity = { pluginId: entry.pluginId, novelPath: entry.novelPath };
-  const work = db.prepare('SELECT entry FROM works WHERE id=?').get(numberMappingWorkId(identity)) as { entry: string } | undefined;
+  const work = db.prepare('SELECT novel_id FROM work_summaries WHERE id=?').get(numberMappingWorkId(identity)) as { novel_id: string } | undefined;
   if (work && entry.sourceNovelId !== null &&
-    JSON.parse(work.entry).metadata.identity.novelId.toLowerCase() !== entry.sourceNovelId.toLowerCase()) {
+    work.novel_id.toLowerCase() !== entry.sourceNovelId.toLowerCase()) {
     return { chapterPath: entry.chapterPath, chapterNumber: entry.chapterNumber };
   }
   const alias = aliasForPath(db, { ...identity, chapterPath: entry.chapterPath });

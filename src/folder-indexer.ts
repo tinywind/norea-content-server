@@ -5,7 +5,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { validateFiles, validateMedia } from './chapter-files.ts';
 import { chapterFileNames, digest, isUnfinishedContentName as unfinished, publishChapter, recordEntry, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
-import { isCoverFile, isOverrideCoverFile, cacheWork, metadataWorkId, readNovelMetadata, type NovelMetadataV1, type WorkEntry } from './works.ts';
+import { isCoverFile, isOverrideCoverFile, cacheWork, metadataWorkId, readNovelMetadata, slimDeletedWorkEntry, type NovelMetadataV1, type WorkEntry } from './works.ts';
 import { transaction } from './db.ts';
 
 export interface FolderIndexItem {
@@ -92,10 +92,28 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
   await noLinks(dataDir);
   if (!(await lstat(dataDir)).isDirectory()) fail('Server storage must be a directory');
   const report = async (item: FolderIndexItem, reused = false) => { summary.scanned++; summary[item.status]++; await options.onItem?.(item, reused); };
-  const checkpoints = new Map((options.db.prepare('SELECT path,signature,entry FROM scan_checkpoints').all() as { path: string; signature: string; entry: string }[]).map(row => [row.path, row]));
+  const scopedRows = <T>(table: string, columns: string, key: 'directory' | 'path', absolute: boolean): T[] => {
+    if (!changes || changes.includes(contents)) return options.db.prepare(`SELECT ${columns} FROM ${table}`).all() as T[];
+    const all = new Map<string, T>();
+    const rowPath = (path: string) => absolute ? path : relative(dataDir, path);
+    const consume = (rows: unknown[]) => {
+      for (const row of rows as (T & Record<typeof key, string>)[]) all.set(row[key], row);
+    };
+    const exact = options.db.prepare(`SELECT ${columns} FROM ${table} WHERE ${key}=?`);
+    const descendants = options.db.prepare(`SELECT ${columns} FROM ${table} WHERE ${key}>=? AND ${key}<?`);
+    const ancestors = new Set<string>();
+    for (const change of changes) {
+      const path = rowPath(change);
+      consume(descendants.all(path + sep, path + String.fromCharCode(sep.charCodeAt(0) + 1)));
+      for (let current = change; current !== contents; current = dirname(current)) ancestors.add(rowPath(current));
+    }
+    for (const path of ancestors) consume(exact.all(path));
+    return [...all.values()];
+  };
+  const checkpoints = new Map(scopedRows<{ path: string; signature: string; entry: string }>('scan_checkpoints', 'path,signature,entry', 'path', true).map(row => [row.path, row]));
   const checkpoint = (path: string) => checkpoints.get(path);
-  const chapters = new Map((options.db.prepare('SELECT id,work_id,directory,path,deleted_at,entry FROM chapters').all() as unknown as IndexedChapter[]).map(row => [row.directory, row]));
-  const works = options.db.prepare('SELECT id,directory,entry FROM works').all() as unknown as IndexedWork[];
+  const chapters = new Map(scopedRows<IndexedChapter>('chapters', 'id,work_id,directory,path,deleted_at,entry', 'directory', false).map(row => [row.directory, row]));
+  const works = scopedRows<IndexedWork>('works', 'id,directory,entry', 'directory', false);
   const seen = new Set<string>();
   const remember = (path: string, key: string, item: FolderIndexItem) => options.db.prepare('INSERT INTO scan_checkpoints(path,signature,entry) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET signature=excluded.signature,entry=excluded.entry').run(path, key, JSON.stringify(item));
   const unavailable = (row: IndexedChapter, removed = false) => transaction(options.db, () => {
@@ -213,6 +231,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     }
     const folders: typeof entries = [];
     for (const entry of entries) {
+      if (!selected(join(directory, entry.name))) continue;
       if (entry.name === 'novel.json' || entry.name === 'override.json' || isCoverFile(entry.name) || isOverrideCoverFile(entry.name) || entry.name === '.nomedia') continue;
       if (!entry.isDirectory() || entry.isSymbolicLink() || unfinished(entry.name)) {
         await report({ path: join(directory, entry.name), sourceId, status: 'skipped', reason: 'Chapter entry is not a directory, is symbolic, or is unfinished' }); continue;
@@ -259,7 +278,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     for (const source of await readdir(contents, { withFileTypes: true })) {
       aborted(options.signal); const path = join(contents, source.name);
       if (!selected(path)) continue;
-      if (source.isFile() && source.name === '.nomedia') continue;
+      if (source.name === '.norea-staging' || (source.isFile() && source.name === '.nomedia')) continue;
       if (!source.isDirectory() || source.isSymbolicLink() || unfinished(source.name)) { await report({ path, status: 'skipped', reason: 'Source entry is not a directory, is symbolic, or is unfinished' }); continue; }
       for (const work of await readdir(path, { withFileTypes: true })) {
         aborted(options.signal); const directory = join(path, work.name);
@@ -276,7 +295,8 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     };
     for (const row of chapters.values()) {
       aborted(options.signal);
-      if (row.deleted_at !== null || JSON.parse(row.entry).deleted || (row.path !== row.directory && row.path !== null) || !selected(join(dataDir, row.directory)) || !await missing(join(dataDir, row.directory))) continue;
+      const directory = join(dataDir, row.directory);
+      if (!selected(directory) || row.deleted_at !== null || (row.path !== row.directory && row.path !== null) || !await missing(directory) || JSON.parse(row.entry).deleted) continue;
       if (unavailable(row, true)) await report({ path: join(dataDir, row.directory), chapterId: row.id, status: 'removed', reason: 'Chapter folder no longer exists' });
     }
     for (const row of works) {
@@ -287,8 +307,9 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         assertChapterNumberReconciliationReady(options.db, row.id);
         if (!options.db.prepare('DELETE FROM works WHERE id=? AND entry=?').run(row.id, row.entry).changes) return false;
         options.db.prepare('DELETE FROM chapters WHERE work_id=?').run(row.id);
+        options.db.prepare('DELETE FROM work_changes WHERE work_id=?').run(row.id);
         const sequence = Number(options.db.prepare('INSERT INTO work_changes(work_id,entry) VALUES(?,?)').run(row.id, '{}').lastInsertRowid);
-        options.db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(JSON.stringify({ ...JSON.parse(row.entry), deleted: true, hasCover: false, sequence }), sequence);
+        options.db.prepare('UPDATE work_changes SET entry=? WHERE sequence=?').run(JSON.stringify(slimDeletedWorkEntry(JSON.parse(row.entry) as WorkEntry, sequence)), sequence);
         return true;
       });
       if (removed) { options.onWorkChange?.(); await report({ path, workId: row.id, status: 'removed', reason: 'Work folder no longer exists' }); }

@@ -492,6 +492,7 @@ test('in-place migration normalizes legacy reading unread tuples across records,
     // Inject legacy unread fields directly into persisted JSON to simulate a pre-upgrade DB.
     const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
     try {
+      db.prepare("DELETE FROM admin_settings WHERE key='migration:normalize-reading-progress-v1'").run();
       const injectUnread = (entityKey: string, unread: boolean, progress: number) => {
         const row = db.prepare('SELECT revision, record FROM user_state_records WHERE entity_key=?').get(entityKey) as { revision: number; record: string };
         const rec = JSON.parse(row.record);

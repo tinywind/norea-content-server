@@ -4,6 +4,7 @@ import { writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { ZipFile } from 'yazl';
 import { buildApp } from '../src/app.ts';
@@ -205,7 +206,9 @@ test('covers an exact regular safeBackup metadata copy without changing the pers
     assert.equal(response.statusCode, 200, response.body);
     assert.deepEqual(payload, before);
     assert.equal((f.db.prepare('SELECT count(*) AS n FROM work_migrations').get() as { n: number }).n, 1);
-    assert.deepEqual(await readdir(join(f.dataDir, 'contents/source')), []);
+    const source = join(f.dataDir, 'contents/source');
+    for (let attempt = 0; attempt < 100 && (await readdir(source)).length; attempt++) await delay(10);
+    assert.deepEqual(await readdir(source), []);
     assert.equal(await readFile(join(f.dataDir, 'contents/target/book/1001/content.html'), 'utf8'), 'synthetic body');
   } finally { await f.close(); }
 });
