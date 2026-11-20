@@ -39,6 +39,37 @@ async function fixture(anonymousRead = true) {
   return { app, dataDir, headers, putWork, putChapter, close: async () => { await app.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
 
+test('repackages legacy chapter changes into fewer SQLite pages while preserving cursors and availability', async () => {
+  await mkdir('.tmp', { recursive: true });
+  const dataDir = await mkdtemp(resolve('.tmp/catalog-compaction-'));
+  const tableBytes = (db: DatabaseSync) => Number(db.prepare("SELECT sum(pgsize) AS bytes FROM dbstat WHERE name='catalog_changes'").get()?.bytes);
+  try {
+    const original = openDatabase(dataDir);
+    const identity = { pluginId: 'source', novelId: 'book', novelPath: '/book', chapterPath: '/chapter' };
+    let before: number;
+    try {
+      original.exec("DELETE FROM admin_settings WHERE key LIKE 'migration:%catalog-log%'; BEGIN");
+      const insert = original.prepare('INSERT INTO catalog_changes(sequence,chapter_id,entry) VALUES(?,?,?)');
+      for (let sequence = 1; sequence <= 601; sequence++) {
+        const id = 'chapter-' + sequence;
+        insert.run(sequence, id, JSON.stringify({ id, sequence, revision: 'old', complete: sequence % 2 === 0, deleted: sequence % 2 !== 0,
+          manifest: { identity, novel: { summary: 'a'.repeat(800) } } }));
+      }
+      original.exec('DELETE FROM catalog_changes WHERE sequence=601; COMMIT');
+      before = tableBytes(original);
+    } finally { original.close(); }
+    const migrated = openDatabase(dataDir);
+    try {
+      assert.ok(tableBytes(migrated) < before / 2);
+      const last = migrated.prepare('SELECT sequence,entry FROM catalog_changes ORDER BY sequence DESC LIMIT 1').get()!;
+      assert.equal(last.sequence, 600);
+      assert.deepEqual(JSON.parse(last.entry as string), { id: 'chapter-600', sequence: 600, manifest: { identity }, complete: true, deleted: false });
+      assert.equal(migrated.prepare('SELECT count(*) AS n FROM catalog_changes').get()?.n, 600);
+      assert.equal(Number(migrated.prepare('INSERT INTO catalog_changes(chapter_id,entry) VALUES(?,?)').run('next', '{}').lastInsertRowid), 602);
+    } finally { migrated.close(); }
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
 test('backs up the complete chapter catalog and shows missing server files without making them downloadable', async () => {
   const f = await fixture();
   try {

@@ -350,12 +350,23 @@ export function reclaimDatabaseSpace(db: DatabaseSync, pages?: number, checkpoin
 }
 
 function compactCatalogLog(db: DatabaseSync): void {
-  const key = 'migration:compact-catalog-log-v1';
+  const key = 'migration:repack-catalog-log-v2';
   if (db.prepare('SELECT 1 FROM admin_settings WHERE key=?').get(key)) return;
-  db.exec(`UPDATE catalog_changes SET entry=json_object(
-    'id', chapter_id, 'sequence', sequence, 'manifest', json_object('identity', json(entry -> '$.manifest.identity')),
-    'complete', json(entry -> '$.complete'), 'deleted', json(entry -> '$.deleted')
-  ) WHERE CASE WHEN json_valid(entry) THEN json_type(entry,'$.revision') IS NOT NULL END`);
+  if (db.prepare('SELECT 1 FROM catalog_changes LIMIT 1').get()) {
+    // Reinsert the compact rows so free space inside the old leaf pages can be reclaimed.
+    db.exec(`CREATE TEMP TABLE catalog_log_compaction AS
+      SELECT sequence, chapter_id,
+        CASE WHEN CASE WHEN json_valid(entry) THEN json_type(entry,'$.revision') IS NOT NULL END
+        THEN json_object(
+          'id', chapter_id, 'sequence', sequence, 'manifest', json_object('identity', json(entry -> '$.manifest.identity')),
+          'complete', json(entry -> '$.complete'), 'deleted', json(entry -> '$.deleted')
+        ) ELSE entry END AS entry
+      FROM catalog_changes;
+      DELETE FROM catalog_changes;
+      INSERT INTO catalog_changes(sequence,chapter_id,entry)
+        SELECT sequence,chapter_id,entry FROM catalog_log_compaction ORDER BY sequence;
+      DROP TABLE temp.catalog_log_compaction;`);
+  }
   db.prepare('INSERT INTO admin_settings(key,value) VALUES(?,?)').run(key, '1');
 }
 
