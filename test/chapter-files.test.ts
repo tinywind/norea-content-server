@@ -1031,3 +1031,36 @@ test('accepts and serves chapter-files packages with epub contentType', async ()
     assert.equal(catalog.json().items[0].contentType, 'epub');
   } finally { await s.close(); }
 });
+
+test('rejects 0-byte chapter body uploads and hides legacy 0-byte catalog entries', async () => {
+  const s = await setup();
+  try {
+    const emptyHtml = { 'content.html': Buffer.alloc(0) };
+    const htmlRes = await upload(s, emptyHtml);
+    assert.equal(htmlRes.statusCode, 400, htmlRes.body);
+    assert.match(htmlRes.body, /Chapter body must not be empty/);
+
+    const emptyPdf = { 'content.pdf': Buffer.alloc(0) };
+    const pdfManifest: PackageManifest = {
+      ...description(emptyPdf),
+      bodyPath: 'content.pdf',
+      chapter: { name: 'Empty PDF', position: 2, chapterNumber: '2', contentType: 'pdf', page: '1' },
+    };
+    const pdfRes = await upload(s, emptyPdf, pdfManifest);
+    assert.equal(pdfRes.statusCode, 400, pdfRes.body);
+
+    // Seed a valid chapter then simulate a legacy 0-byte row in DB + disk.
+    const valid = (await upload(s, { 'content.html': Buffer.from('<p>ok</p>') })).json();
+    const row = s.db.prepare('SELECT path, entry FROM chapters WHERE id=?').get(valid.id) as { path: string; entry: string };
+    const entry = JSON.parse(row.entry);
+    entry.manifest.files = entry.manifest.files.map((f: { path: string; size: number; modifiedAt: number }) => f.path === entry.manifest.bodyPath ? { ...f, size: 0 } : f);
+    s.db.prepare('UPDATE chapters SET entry=? WHERE id=?').run(JSON.stringify(entry), valid.id);
+    await writeFile(join(s.dataDir, row.path, 'content.html'), Buffer.alloc(0));
+
+    const lookup = await s.app.inject({
+      url: `/api/v1/catalog/chapter?${new URLSearchParams({ pluginId: 'source', novelPath: '/work', chapterPath: '/chapter/1' })}`,
+      headers: s.headers,
+    });
+    assert.equal(lookup.statusCode, 404, lookup.body);
+  } finally { await s.close(); }
+});

@@ -34,7 +34,7 @@ export interface UserStateValueMap {
   library: { inLibrary: boolean; addedAt: number | null };
   category: { name: string; sort: number; deleted: boolean };
   membership: { included: boolean };
-  reading: { progress: number; unread: boolean; readAt: number | null };
+  reading: { progress: number; readAt: number | null };
   bookmark: { bookmarked: boolean };
   resume: { chapter: UserStateChapterReference | null; anchor: PortableReaderAnchor | null; openedAt: number | null };
   composition: { composition: ChapterCompositionV1 };
@@ -245,8 +245,8 @@ export function parseUserStateValue(kind: UserStateKind, value: unknown): UserSt
       return { included: bool(row.included, "category membership") };
     }
     case "reading": {
-      const row = object(value, ["progress", "unread", "readAt"], "reading value");
-      return { progress: numberRange(row.progress, "reading progress", 0, 100), unread: bool(row.unread, "unread flag"), readAt: nullableTime(row.readAt, "read time") };
+      const row = object(value, ["progress", "readAt"], "reading value");
+      return { progress: numberRange(row.progress, "reading progress", 0, 100), readAt: nullableTime(row.readAt, "read time") };
     }
     case "bookmark": {
       const row = object(value, ["bookmarked"], "bookmark value");

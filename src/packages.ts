@@ -74,7 +74,9 @@ export function validateManifest(value: unknown): asserts value is PackageManife
     allowed(file, ['path','size','modifiedAt']);
     if (index && m.files[index - 1].path >= file.path) throw problem(400, 'Manifest files must be sorted and unique');
   }
-  if (!m.files.some(file => file.path === m.bodyPath)) throw problem(400, 'Body is absent from file manifest');
+  const bodyFile = m.files.find(file => file.path === m.bodyPath);
+  if (!bodyFile) throw problem(400, 'Body is absent from file manifest');
+  if (bodyFile.size <= 0) throw problem(400, 'Chapter body must not be empty');
 }
 
 export function recordEntry(db: DatabaseSync, entry: CatalogEntry): CatalogEntry {
@@ -105,6 +107,8 @@ function moveChapterFiles(source: string, destination: string): void {
 }
 
 function storedFilesExist(dataDir: string, path: string, entry: CatalogEntry): boolean {
+  const bodyFile = entry.manifest.files.find(file => file.path === entry.manifest.bodyPath);
+  if (!bodyFile || bodyFile.size <= 0) return false;
   try {
     const target = chapterStoragePath(dataDir, path);
     const directory = lstatSync(target);

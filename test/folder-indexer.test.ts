@@ -614,3 +614,29 @@ test('incremental scans discover an added cover without a metadata descriptor an
     assert.equal((await readdir(directory)).includes('cover.json'), false);
   } finally { await f.close(); }
 });
+
+test('folder indexer skips 0-byte body files and marks previously indexed 0-byte chapters unavailable', async () => {
+  const f = await fixture();
+  try {
+    // 0-byte new chapter is skipped and not registered.
+    const emptyDir = join(f.directory, '..', '2');
+    await mkdir(emptyDir, { recursive: true });
+    await writeFile(join(emptyDir, 'content.html'), '');
+    const first = await f.run();
+    assert.equal(first.registered, 2); // work + chapter 1
+    assert.equal(first.skipped, 1); // chapter 2
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM chapters').get() as { n: number }).n, 1);
+
+    // Simulate a legacy pre-existing 0-byte indexed chapter with a cached checkpoint.
+    const row = f.db.prepare('SELECT id, path, entry FROM chapters').get() as { id: string; path: string; entry: string };
+    const entry = JSON.parse(row.entry);
+    entry.manifest.files = entry.manifest.files.map((file: { path: string; size: number; modifiedAt: number }) => file.path === entry.manifest.bodyPath ? { ...file, size: 0 } : file);
+    f.db.prepare('UPDATE chapters SET entry=? WHERE id=?').run(JSON.stringify(entry), row.id);
+    await writeFile(join(f.dataDir, row.path, 'content.html'), '');
+
+    const second = await f.run();
+    assert.equal(second.skipped, 2); // chapter 1 (now 0-byte) + chapter 2
+    const after = f.db.prepare('SELECT path FROM chapters WHERE id=?').get(row.id) as { path: string | null };
+    assert.equal(after.path, null);
+  } finally { await f.close(); }
+});

@@ -222,6 +222,44 @@ function ensureUserStateSchema(db: DatabaseSync, now = Date.now()): void {
   }
   db.exec(`CREATE INDEX IF NOT EXISTS user_state_operations_created_at ON user_state_operations(created_at);
     CREATE INDEX IF NOT EXISTS user_state_operations_prunable_body ON user_state_operations(created_at) WHERE result IS NOT NULL;`);
+
+  // Normalize legacy reading tuples from { progress, unread, readAt } to { progress, readAt }.
+  db.exec(`UPDATE user_state_records
+    SET record = json_remove(
+      CASE
+        WHEN json_type(record, '$.value.unread') = 'false'
+          AND COALESCE(CAST(json_extract(record, '$.value.progress') AS REAL), 0) < 100
+          THEN json_set(record, '$.value.progress', 100)
+        ELSE record
+      END,
+      '$.value.unread'
+    )
+    WHERE kind = 'reading' AND json_type(record, '$.value.unread') IS NOT NULL`);
+  db.exec(`UPDATE user_state_changes
+    SET record = json_remove(
+      CASE
+        WHEN json_type(record, '$.value.unread') = 'false'
+          AND COALESCE(CAST(json_extract(record, '$.value.progress') AS REAL), 0) < 100
+          THEN json_set(record, '$.value.progress', 100)
+        ELSE record
+      END,
+      '$.value.unread'
+    )
+    WHERE json_extract(record, '$.entity.kind') = 'reading'
+      AND json_type(record, '$.value.unread') IS NOT NULL`);
+  db.exec(`UPDATE user_state_operations
+    SET result = json_remove(
+      CASE
+        WHEN json_type(result, '$.current.value.unread') = 'false'
+          AND COALESCE(CAST(json_extract(result, '$.current.value.progress') AS REAL), 0) < 100
+          THEN json_set(result, '$.current.value.progress', 100)
+        ELSE result
+      END,
+      '$.current.value.unread'
+    )
+    WHERE result IS NOT NULL
+      AND json_extract(result, '$.current.entity.kind') = 'reading'
+      AND json_type(result, '$.current.value.unread') IS NOT NULL`);
 }
 
 export interface DatabaseReclaimResult {

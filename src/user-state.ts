@@ -551,7 +551,7 @@ function isTombstoneValue(kind: UserStateKind, value: UserStateValue): boolean {
   switch (kind) {
     case 'reading': {
       const v = value as UserStateValueMap['reading'];
-      return v.progress === 0 && v.unread === true && v.readAt === null;
+      return v.progress === 0 && v.readAt === null;
     }
     case 'bookmark':
       return (value as UserStateValueMap['bookmark']).bookmarked === false;
@@ -676,7 +676,7 @@ function applyStripReadingTimestamps(
       const operationId = 'retention-strip:' + createHash('sha256').update(JSON.stringify([row.entity_key, record.revision])).digest('hex');
       publish(
         db,
-        { operationId, entity: record.entity, baseRevision: record.revision, value: { progress: value.progress, unread: value.unread, readAt: null } },
+        { operationId, entity: record.entity, baseRevision: record.revision, value: { progress: value.progress, readAt: null } },
         record.entity,
         RETENTION_WRITER,
         now,
@@ -979,7 +979,7 @@ export function getUserStateAdminStats(
       SELECT kind,
         COUNT(*) AS total,
         SUM(CASE WHEN
-          (kind='reading' AND json_extract(record,'$.value.unread')=1 AND json_extract(record,'$.value.progress')=0 AND json_extract(record,'$.value.readAt') IS NULL) OR
+          (kind='reading' AND json_extract(record,'$.value.progress')=0 AND json_extract(record,'$.value.readAt') IS NULL) OR
           (kind='bookmark' AND json_extract(record,'$.value.bookmarked')=0) OR
           (kind='library' AND json_extract(record,'$.value.inLibrary')=0) OR
           (kind='membership' AND COALESCE(membership_included, CAST(json_extract(record,'$.value.included') AS INTEGER))=0) OR
@@ -987,7 +987,7 @@ export function getUserStateAdminStats(
           (kind='resume' AND json_extract(record,'$.value.chapter') IS NULL AND json_extract(record,'$.value.anchor') IS NULL AND json_extract(record,'$.value.openedAt') IS NULL)
         THEN 1 ELSE 0 END) AS tombstones,
         SUM(CASE WHEN (
-          (kind='reading' AND json_extract(record,'$.value.unread')=1 AND json_extract(record,'$.value.progress')=0 AND json_extract(record,'$.value.readAt') IS NULL) OR
+          (kind='reading' AND json_extract(record,'$.value.progress')=0 AND json_extract(record,'$.value.readAt') IS NULL) OR
           (kind='bookmark' AND json_extract(record,'$.value.bookmarked')=0) OR
           (kind='library' AND json_extract(record,'$.value.inLibrary')=0) OR
           (kind='membership' AND COALESCE(membership_included, CAST(json_extract(record,'$.value.included') AS INTEGER))=0) OR

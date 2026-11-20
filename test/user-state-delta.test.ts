@@ -115,12 +115,12 @@ test('portable identity ignores names/local row IDs, folds only ASCII source IDs
   try {
     const first = result(await f.merge([operation({ kind: 'library', work: known }, { inLibrary: true, addedAt: null })]));
     assert.equal(result(await f.merge([operation({ kind: 'library', work: renamed }, { inLibrary: true, addedAt: null })])).status, 'unchanged');
-    assert.equal(result(await f.merge([operation(reading('other-work'), { progress: 70, unread: false, readAt: 50 })])).status, 'applied');
+    assert.equal(result(await f.merge([operation(reading('other-work'), { progress: 70, readAt: 50 })])).status, 'applied');
     assert.equal(first.current!.revision, 1);
     const opaqueWork: UserStateEntity = { kind: 'library', work: { ...work(), sourceNovelId: null } };
     const opaqueChapter: UserStateEntity = { kind: 'reading', work: work(), chapter: { chapterPath: 'norea-folder:1' } };
     assert.equal(result(await f.merge([operation(opaqueWork, { inLibrary: true, addedAt: 9 })])).status, 'applied');
-    assert.equal(result(await f.merge([operation(opaqueChapter, { progress: 33, unread: false, readAt: 9 })])).status, 'applied');
+    assert.equal(result(await f.merge([operation(opaqueChapter, { progress: 33, readAt: 9 })])).status, 'applied');
     const opaqueRecords = page(await f.read()).records;
     assert(opaqueRecords.some(record => record.entity.kind === 'library' && record.entity.work.sourceNovelId === null));
     assert(opaqueRecords.some(record => record.entity.kind === 'reading' && record.entity.chapter.chapterPath === 'norea-folder:1'));
@@ -159,26 +159,26 @@ test('blocking a device while a user-state request body arrives prevents both re
   }
 });
 
-test('independent state groups merge while explicit removal, unread, rewind and unbookmark replace prior values', async () => {
+test('independent state groups merge while explicit removal, rewind and unbookmark replace prior values and legacy unread is rejected', async () => {
   const f = await fixture();
   try {
     const a = parseUserStateMergeResponse((await f.merge([
       operation(library(), { inLibrary: true, addedAt: 1 }),
-      operation(reading(), { progress: 100, unread: false, readAt: 100 }),
+      operation(reading(), { progress: 100, readAt: 100 }),
       operation(bookmark(), { bookmarked: true }),
     ])).json()).results;
     const b = parseUserStateMergeResponse((await f.merge([
       operation(bookmark(), { bookmarked: false }, a[2].current!.revision),
-      operation(reading(), { progress: 5, unread: true, readAt: null }, a[1].current!.revision),
+      operation(reading(), { progress: 5, readAt: null }, a[1].current!.revision),
       operation(library(), { inLibrary: false, addedAt: null }, a[0].current!.revision),
     ], f.second)).json()).results;
     assert(b.every(item => item.status === 'applied'));
     assert.deepEqual(b[0].current!.value, { bookmarked: false });
-    assert.deepEqual(b[1].current!.value, { progress: 5, unread: true, readAt: null });
+    assert.deepEqual(b[1].current!.value, { progress: 5, readAt: null });
     assert.deepEqual(b[2].current!.value, { inLibrary: false, addedAt: null });
-    // Existing SQLite permits this atomic legacy tuple; never manufacture or normalize another tuple.
-    const legacy = result(await f.merge([operation(reading(), { progress: 100, unread: true, readAt: 200 }, b[1].current!.revision)]));
-    assert.deepEqual(legacy.current!.value, { progress: 100, unread: true, readAt: 200 });
+    // Legacy unread field is rejected on the wire under the single-percentage reading model.
+    const legacy = await f.merge([{ ...operation(reading(), { progress: 100, readAt: 200 }, b[1].current!.revision), value: { progress: 100, unread: true, readAt: 200 } }]);
+    assert.equal(legacy.statusCode, 400);
   } finally { await f.close(); }
 });
 
@@ -203,14 +203,14 @@ test('explicit edits use server-revision last-write-wins while equivalent values
 test('lost-response retries replay the exact durable result and operation-ID reuse is atomic', async () => {
   const f = await fixture();
   try {
-    const original = operation(reading(), { progress: 40, unread: false, readAt: 100 });
+    const original = operation(reading(), { progress: 40, readAt: 100 });
     const accepted = result(await f.merge([original]));
     // Copied immutable outboxes remain idempotent under another device bearer.
     assert.deepEqual(result(await f.merge([original], f.second)), accepted);
-    result(await f.merge([operation(reading(), { progress: 0, unread: true, readAt: null }, accepted.current!.revision)], f.second));
+    result(await f.merge([operation(reading(), { progress: 0, readAt: null }, accepted.current!.revision)], f.second));
     assert.deepEqual(result(await f.merge([original])), accepted);
     const before = page(await f.read()).headRevision;
-    const changed = { ...original, value: { progress: 41, unread: false, readAt: 100 } };
+    const changed = { ...original, value: { progress: 41, readAt: 100 } };
     assert.equal((await f.merge([operation(library('new'), { inLibrary: true, addedAt: 10 }), changed])).statusCode, 409);
     assert.equal((await f.merge([changed], f.second)).statusCode, 409);
     assert.equal(page(await f.read()).headRevision, before);
@@ -323,7 +323,8 @@ test('malformed batches, wrong value groups and arbitrary device state cannot pa
   try {
     const valid = operation(library(), { inLibrary: true, addedAt: null });
     for (const invalid of [
-      { ...operation(reading(), { progress: 0, unread: true, readAt: null }), value: { progress: 101, unread: true, readAt: null } },
+      { ...operation(reading(), { progress: 0, readAt: null }), value: { progress: 101, readAt: null } },
+      { ...operation(reading(), { progress: 0, readAt: null }), value: { progress: 50, unread: false, readAt: null } },
       { ...valid, deviceId: 'claimed-device' },
       { ...valid, value: { inLibrary: true, addedAt: null, credentials: 'not allowed' } },
       { ...valid, value: { bookmarked: true } },
@@ -364,8 +365,8 @@ test('resume accepts portable anchors and rejects pixel/local-ID fields, and cha
     assert.equal(opaqueResume.status, 'applied');
     assert.deepEqual(opaqueResume.current!.value, { chapter: { chapterPath: 'local-folder:12' }, anchor: null, openedAt: 1700000000001 });
     const owned: UserStateEntity = { kind: 'reading', work: work(), chapter: { ...chapter(), compositionEntryId: 'entry-a' } };
-    const first = result(await f.merge([operation(owned, { progress: 10, unread: false, readAt: null })]));
-    const mismatchOp = operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, unread: false, readAt: null }, first.current!.revision);
+    const first = result(await f.merge([operation(owned, { progress: 10, readAt: null })]));
+    const mismatchOp = operation({ ...owned, chapter: { ...chapter(), compositionEntryId: 'entry-b' } }, { progress: 10, readAt: null }, first.current!.revision);
     const mismatch = result(await f.merge([mismatchOp]));
     assert.deepEqual(mismatch, {
       operationId: mismatchOp.operationId,
@@ -474,5 +475,73 @@ test('additive upgrade and restart preserve original schema, credentials, legacy
       assert.equal(check.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE type='index' AND name='user_state_membership_categories'").get()?.count, 1);
       assert.equal(check.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE name IN ('accounts','sessions','state','state_changes','operations')").get()?.count, 0);
     } finally { check.close(); }
+  } finally { await reopened?.close(); await f.close(); }
+});
+
+test('in-place migration normalizes legacy reading unread tuples across records, changes, and cached operation results', async () => {
+  const f = await fixture();
+  let reopened: Awaited<ReturnType<typeof buildApp>> | undefined;
+  try {
+    const opMarkedRead = operation(reading('mig-read'), { progress: 40, readAt: 100 });
+    const opUnread = operation(reading('mig-unread'), { progress: 0, readAt: null });
+    const opInProgress = operation(reading('mig-partial'), { progress: 55, readAt: 200 });
+    const applied = parseUserStateMergeResponse((await f.merge([opMarkedRead, opUnread, opInProgress])).json()).results;
+    assert(applied.every(item => item.status === 'applied'));
+    await f.app.close();
+
+    // Inject legacy unread fields directly into persisted JSON to simulate a pre-upgrade DB.
+    const db = new DatabaseSync(join(f.dataDir, 'metadata.sqlite'));
+    try {
+      const injectUnread = (entityKey: string, unread: boolean, progress: number) => {
+        const row = db.prepare('SELECT revision, record FROM user_state_records WHERE entity_key=?').get(entityKey) as { revision: number; record: string };
+        const rec = JSON.parse(row.record);
+        rec.value = { progress, unread, readAt: rec.value.readAt };
+        const json = JSON.stringify(rec);
+        db.prepare('UPDATE user_state_records SET record=? WHERE entity_key=?').run(json, entityKey);
+        db.prepare('UPDATE user_state_changes SET record=? WHERE revision=?').run(json, row.revision);
+      };
+      const keys = (db.prepare("SELECT entity_key, record FROM user_state_records WHERE kind='reading'").all() as { entity_key: string; record: string }[]);
+      for (const row of keys) {
+        const rec = JSON.parse(row.record);
+        const path = rec.entity.work.novelPath;
+        if (path === '/novel/mig-read') injectUnread(row.entity_key, false, 40);
+        else if (path === '/novel/mig-unread') injectUnread(row.entity_key, true, 0);
+        else if (path === '/novel/mig-partial') injectUnread(row.entity_key, true, 55);
+      }
+      const ops = db.prepare('SELECT operation_id, result FROM user_state_operations WHERE result IS NOT NULL').all() as { operation_id: string; result: string }[];
+      for (const op of ops) {
+        const res = JSON.parse(op.result);
+        const path = res.current?.entity?.work?.novelPath;
+        if (path === '/novel/mig-read') {
+          res.current.value = { progress: 40, unread: false, readAt: 100 };
+          db.prepare('UPDATE user_state_operations SET result=? WHERE operation_id=?').run(JSON.stringify(res), op.operation_id);
+        } else if (path === '/novel/mig-unread') {
+          res.current.value = { progress: 0, unread: true, readAt: null };
+          db.prepare('UPDATE user_state_operations SET result=? WHERE operation_id=?').run(JSON.stringify(res), op.operation_id);
+        }
+      }
+    } finally { db.close(); }
+
+    // First reopen performs the migration; second reopen verifies idempotency.
+    const check1 = openDatabase(f.dataDir);
+    check1.close();
+    reopened = await buildApp({ dataDir: f.dataDir });
+    const records = page(await reopened.inject({ method: 'POST', url: '/api/v1/user-state/read', headers: f.headers, payload: { ...f.scope, after: 0, limit: 50 } })).records;
+    const byWork = new Map(records.flatMap(r => r.entity.kind === 'reading' ? [[r.entity.work.novelPath, r.value] as const] : []));
+    assert.deepEqual(byWork.get('/novel/mig-read'), { progress: 100, readAt: 100 });
+    assert.deepEqual(byWork.get('/novel/mig-unread'), { progress: 0, readAt: null });
+    assert.deepEqual(byWork.get('/novel/mig-partial'), { progress: 55, readAt: 200 });
+
+    const verifyDb = openDatabase(f.dataDir);
+    try {
+      const remaining = verifyDb.prepare(`
+        SELECT (SELECT COUNT(*) FROM user_state_records WHERE json_type(record, '$.value.unread') IS NOT NULL)
+             + (SELECT COUNT(*) FROM user_state_changes WHERE json_type(record, '$.value.unread') IS NOT NULL)
+             + (SELECT COUNT(*) FROM user_state_operations WHERE result IS NOT NULL AND json_type(result, '$.current.value.unread') IS NOT NULL) AS n
+      `).get() as { n: number };
+      assert.equal(remaining.n, 0);
+      const opRes = JSON.parse((verifyDb.prepare('SELECT result FROM user_state_operations WHERE operation_id=?').get(opMarkedRead.operationId) as { result: string }).result);
+      assert.deepEqual(opRes.current.value, { progress: 100, readAt: 100 });
+    } finally { verifyDb.close(); }
   } finally { await reopened?.close(); await f.close(); }
 });

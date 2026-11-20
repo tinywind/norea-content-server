@@ -246,7 +246,7 @@ test('superseded_at tracks latest revisions in O(1) across edits, category casca
 test('2-stage user_state_operations cleanup nulls bodies, rejects stale replays with 409 atomically, and prunes expired fingerprints', async () => {
   const f = await createFixture();
   try {
-    const op1 = operation(reading('w1'), { progress: 45, unread: false, readAt: 1000 });
+    const op1 = operation(reading('w1'), { progress: 45, readAt: 1000 });
     const res1 = parseUserStateMergeResponse((await f.merge([op1])).json());
     assert.equal(res1.results[0].status, 'applied');
 
@@ -283,7 +283,7 @@ test('2-stage user_state_operations cleanup nulls bodies, rejects stale replays 
     assert.equal(staleBatch.statusCode, 409);
 
     // Stale replay with altered payload also returns 409.
-    const alteredReplay = await f.merge([{ ...op1, value: { progress: 99, unread: false, readAt: 2000 } }]);
+    const alteredReplay = await f.merge([{ ...op1, value: { progress: 99, readAt: 2000 } }]);
     assert.equal(alteredReplay.statusCode, 409);
 
     const wsAfter409 = parseUserStateWorkspace((await f.app.inject({ url: '/api/v1/user-state', headers: f.headers })).json());
@@ -292,7 +292,7 @@ test('2-stage user_state_operations cleanup nulls bodies, rejects stale replays 
     assert.equal(readAfter409.records.length, 1);
 
     // Clamping check: fingerprintRetentionMs < bodyRetentionMs must clamp fingerprint retention >= bodyRetentionMs.
-    const op2 = operation(reading('w2'), { progress: 10, unread: false, readAt: 1001 });
+    const op2 = operation(reading('w2'), { progress: 10, readAt: 1001 });
     assert.equal((await f.merge([op2])).statusCode, 200);
     const dbCheck = openDatabase(f.dataDir);
     try {

@@ -90,7 +90,7 @@ test('live TCP HTTP wire protocol exercises capabilities, merge, read, stage-1 4
     assert.equal(retA.compactedThrough, 0);
 
     const scope = { workspaceId: wsA.workspaceId, epoch: wsA.epoch };
-    const opRead = op(reading('w1'), { progress: 65, unread: false, readAt: clock - 1_000 });
+    const opRead = op(reading('w1'), { progress: 65, readAt: clock - 1_000 });
     const opBmTomb = op(bookmark('w1'), { bookmarked: false });
     const opCat = op(category('cat-1'), { name: 'Shelf', sort: 0, deleted: false });
     const opMem = op(membership('cat-1', 'w1'), { included: true });
@@ -159,7 +159,7 @@ test('live TCP HTTP wire protocol exercises capabilities, merge, read, stage-1 4
     assert.equal(page1.snapshotRevision, 4);
 
     // Concurrent merge during pagination advances headRevision to 5
-    const concurrentOp = op(reading('w2'), { progress: 30, unread: false, readAt: clock });
+    const concurrentOp = op(reading('w2'), { progress: 30, readAt: clock });
     const concurrentMerge = parseUserStateMergeResponse(await (await fetch(`${baseUrl}/api/v1/user-state/merge`, {
       method: 'POST',
       headers: { ...devA, 'content-type': 'application/json' },
@@ -195,7 +195,7 @@ test('live TCP HTTP wire protocol exercises capabilities, merge, read, stage-1 4
 
     // 7. seed: true when seedAllowed === false: missing/GC'd -> current: null; existing -> current: <record>
     const seedMissing = op(bookmark('w1'), { bookmarked: true }, 0, true);
-    const seedExisting = op(reading('w1'), { progress: 99, unread: false, readAt: clock }, 0, true);
+    const seedExisting = op(reading('w1'), { progress: 99, readAt: clock }, 0, true);
     const seedRes = parseUserStateMergeResponse(await (await fetch(`${baseUrl}/api/v1/user-state/merge`, {
       method: 'POST',
       headers: { ...devC, 'content-type': 'application/json' },
@@ -259,8 +259,8 @@ test('live TCP HTTP wire protocol exercises capabilities, merge, read, stage-1 4
       body: JSON.stringify({
         ...scope2,
         operations: [
-          op(reading('w-old'), { progress: 100, unread: false, readAt: oldReadAt }),
-          op(reading('w-recent'), { progress: 80, unread: false, readAt: recentReadAt }),
+          op(reading('w-old'), { progress: 100, readAt: oldReadAt }),
+          op(reading('w-recent'), { progress: 80, readAt: recentReadAt }),
         ],
       }),
     });
@@ -290,9 +290,9 @@ test('live TCP HTTP wire protocol exercises capabilities, merge, read, stage-1 4
     assert.equal(cSnap.records.length, 1);
     assert.equal(cSnap.seedAllowed, true);
 
-    const cSeedOld = op(reading('w-c-old'), { progress: 100, unread: false, readAt: ret2c.seedCutoffAt! - 1 }, 0, true);
-    const cSeedNull = op(reading('w-c-null'), { progress: 50, unread: false, readAt: null }, 0, true);
-    const cSeedRecent = op(reading('w-c-recent'), { progress: 90, unread: false, readAt: ret2c.seedCutoffAt! + 1_000 }, 0, true);
+    const cSeedOld = op(reading('w-c-old'), { progress: 100, readAt: ret2c.seedCutoffAt! - 1 }, 0, true);
+    const cSeedNull = op(reading('w-c-null'), { progress: 50, readAt: null }, 0, true);
+    const cSeedRecent = op(reading('w-c-recent'), { progress: 90, readAt: ret2c.seedCutoffAt! + 1_000 }, 0, true);
     const cMerge = parseUserStateMergeResponse(await (await fetch(`${baseUrl}/api/v1/user-state/merge`, {
       method: 'POST',
       headers: { ...devC, 'content-type': 'application/json' },
@@ -311,7 +311,7 @@ test('live TCP HTTP wire protocol exercises capabilities, merge, read, stage-1 4
       const nextRev = cMerge.headRevision + 1;
       const giantRecord = JSON.stringify({
         entity: giantEntity,
-        value: { progress: 10, unread: false, readAt: clock },
+        value: { progress: 10, readAt: clock },
         revision: nextRev,
         operationId: 'op-giant-413',
         updatedAt: clock,

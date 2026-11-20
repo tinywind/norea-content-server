@@ -564,7 +564,7 @@ test('[T1-A2] headRevision stays monotonic after superseded_at compaction delete
   try {
     let baseRev = 0;
     for (let i = 1; i <= 10; i++) {
-      const m = await f.merge([op(reading('n-1'), { progress: i * 10, unread: i < 10, readAt: BASE_NOW + i }, baseRev)]);
+      const m = await f.merge([op(reading('n-1'), { progress: i * 10, readAt: BASE_NOW + i }, baseRev)]);
       baseRev = m.results[0].current!.revision;
       assert.equal(baseRev, i);
     }
@@ -577,7 +577,7 @@ test('[T1-A2] headRevision stays monotonic after superseded_at compaction delete
     assert.equal(compactedChanges, 1);
     assert.equal((await f.workspace()).headRevision, 10);
 
-    const next = await f.merge([op(reading('n-1'), { progress: 50, unread: false, readAt: BASE_NOW + 20 }, baseRev)]);
+    const next = await f.merge([op(reading('n-1'), { progress: 50, readAt: BASE_NOW + 20 }, baseRev)]);
     assert.equal(next.results[0].current!.revision, 11);
     assert.equal(next.headRevision, 11);
     assert.equal((await f.workspace()).headRevision, 11);
@@ -618,11 +618,11 @@ test('[T1-A3] GET /user-state, POST /read, and POST /merge emit strict protocol 
 test('[T1-A4] issued (entity_key, revision) payloads remain byte-identical across subsequent updates', async t => {
   const f = await setup({ t });
   try {
-    const first = await f.merge([op(reading('n-imm'), { progress: 50, unread: false, readAt: 1000 })]);
+    const first = await f.merge([op(reading('n-imm'), { progress: 50, readAt: 1000 })]);
     const rev1 = first.results[0].current!;
     const rawRev1Before = JSON.stringify((await f.read(0)).records[0]);
 
-    await f.merge([op(reading('n-imm'), { progress: 80, unread: false, readAt: 2000 }, rev1.revision)]);
+    await f.merge([op(reading('n-imm'), { progress: 80, readAt: 2000 }, rev1.revision)]);
     const afterRead = await f.read(0);
     assert.equal(afterRead.records.length, 2);
     assert.equal(JSON.stringify(afterRead.records[0]), rawRev1Before);
@@ -638,7 +638,7 @@ test('[T1-A4] issued (entity_key, revision) payloads remain byte-identical acros
 test('[T1-A6] user_state_meta.head_revision stays synchronized across publish(), policy 2-B, and server restarts', async t => {
   const f = await setup({ t });
   try {
-    await f.merge([op(reading('n-meta'), { progress: 70, unread: false, readAt: BASE_NOW - 100 * DAY_MS })]);
+    await f.merge([op(reading('n-meta'), { progress: 70, readAt: BASE_NOW - 100 * DAY_MS })]);
     const metaAfterPublish = f.withDb(db =>
       Number((db.prepare('SELECT head_revision FROM user_state_meta WHERE singleton=1').get() as { head_revision: number }).head_revision),
     );
@@ -667,7 +667,7 @@ test('[T1-B1] superseded_at marks prior revisions non-null in O(1) while latest 
   try {
     let rev = 0;
     for (let i = 1; i <= 4; i++) {
-      const m = await f.merge([op(reading('n-sup'), { progress: i * 25, unread: false, readAt: BASE_NOW + i }, rev)]);
+      const m = await f.merge([op(reading('n-sup'), { progress: i * 25, readAt: BASE_NOW + i }, rev)]);
       rev = m.results[0].current!.revision;
     }
     const rows = f.withDb(db =>
@@ -691,7 +691,7 @@ test('[T1-B2] superseded_at compaction deletes old change rows after grace while
   try {
     let rev = 0;
     for (let i = 1; i <= 4; i++) {
-      const m = await f.merge([op(reading('n-cmp'), { progress: i * 25, unread: false, readAt: BASE_NOW + i }, rev)]);
+      const m = await f.merge([op(reading('n-cmp'), { progress: i * 25, readAt: BASE_NOW + i }, rev)]);
       rev = m.results[0].current!.revision;
     }
     // Before grace period elapses, compaction must keep all 4 rows
@@ -792,11 +792,11 @@ test('[T1-B6] server SQLite uses PRAGMA auto_vacuum = INCREMENTAL and reclaims f
     assert.equal(initialVacuum, 2);
 
     const createOps = Array.from({ length: 200 }, (_, i) =>
-      op(reading(`w-${i}`), { progress: 10, unread: false, readAt: BASE_NOW }),
+      op(reading(`w-${i}`), { progress: 10, readAt: BASE_NOW }),
     );
     const first = await f.merge(createOps);
     const updateOps = first.results.map((r, i) =>
-      op(reading(`w-${i}`), { progress: 100, unread: false, readAt: BASE_NOW + 1000 }, r.current!.revision),
+      op(reading(`w-${i}`), { progress: 100, readAt: BASE_NOW + 1000 }, r.current!.revision),
     );
     await f.merge(updateOps);
 
@@ -883,8 +883,8 @@ test('[T1-C1] GET /api/v1/admin/user-state reports accurate counts, SQLite stats
 test('[T1-C2] POST /api/v1/admin/user-state/compact compacts eligible rows and reclaims freelist/WAL', async t => {
   const f = await setup({ t });
   try {
-    const m1 = await f.merge([op(reading('w-c2'), { progress: 20, unread: false, readAt: BASE_NOW })]);
-    await f.merge([op(reading('w-c2'), { progress: 90, unread: false, readAt: BASE_NOW + 10 }, m1.results[0].current!.revision)]);
+    const m1 = await f.merge([op(reading('w-c2'), { progress: 20, readAt: BASE_NOW })]);
+    await f.merge([op(reading('w-c2'), { progress: 90, readAt: BASE_NOW + 10 }, m1.results[0].current!.revision)]);
 
     const compacted = await f.advanceDaysAndCompact(400);
     assert.equal(compacted.maintenance.deletedChanges, 1);
@@ -1031,7 +1031,7 @@ test('[T1-D1] opt-in policies 2-A, 2-B, and 2-C default to disabled and do not p
     const veryOld = BASE_NOW - 500 * DAY_MS;
     await f.merge([
       op(library('w-nonlib'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib'), { progress: 60, unread: false, readAt: veryOld }),
+      op(reading('w-nonlib'), { progress: 60, readAt: veryOld }),
     ]);
     await f.adminCompact();
     const readRes = await f.read(0);
@@ -1052,14 +1052,14 @@ test('[T1-D2] policy 2-A prunes old non-library reading and resume records while
     const recentSec = Math.floor((BASE_NOW - 5 * DAY_MS) / 1000);
     await f.merge([
       op(library('w-nonlib'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib'), { progress: 50, unread: false, readAt: oldMs }),
+      op(reading('w-nonlib'), { progress: 50, readAt: oldMs }),
       op(resume('w-nonlib'), { chapter: chapter(), anchor: null, openedAt: oldMs }),
       op(library('w-nonlib-sec'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib-sec'), { progress: 60, unread: false, readAt: oldSec }),
+      op(reading('w-nonlib-sec'), { progress: 60, readAt: oldSec }),
       op(library('w-nonlib-sec-recent'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib-sec-recent'), { progress: 70, unread: false, readAt: recentSec }),
+      op(reading('w-nonlib-sec-recent'), { progress: 70, readAt: recentSec }),
       op(library('w-inlib'), { inLibrary: true, addedAt: oldMs }),
-      op(reading('w-inlib'), { progress: 50, unread: false, readAt: oldMs }),
+      op(reading('w-inlib'), { progress: 50, readAt: oldMs }),
       op(resume('w-inlib'), { chapter: chapter(), anchor: null, openedAt: oldMs }),
     ]);
 
@@ -1077,7 +1077,7 @@ test('[T1-D2] policy 2-A prunes old non-library reading and resume records while
   }
 });
 
-test('[T1-D3] policy 2-B clears readAt and resume via new immutable revision while preserving progress and unread', async t => {
+test('[T1-D3] policy 2-B clears readAt and resume via new immutable revision while preserving progress', async t => {
   const f = await setup({ t });
   try {
     const patch = await f.adminPatchRetention({ stripReadingTimestamps: { enabled: true, days: 60 } });
@@ -1087,14 +1087,14 @@ test('[T1-D3] policy 2-B clears readAt and resume via new immutable revision whi
     const oldSec = Math.floor((BASE_NOW - 100 * DAY_MS) / 1000);
     const recentSec = Math.floor((BASE_NOW - 10 * DAY_MS) / 1000);
     await f.merge([
-      op(reading('w-2b'), { progress: 75, unread: false, readAt: oldMs }),
+      op(reading('w-2b'), { progress: 75, readAt: oldMs }),
       op(resume('w-2b'), {
         chapter: chapter('/ch/7'),
         anchor: { segmentIndex: 1, segmentCount: 5, offset: 0.5, progress: 75, savedAt: oldMs },
         openedAt: oldMs,
       }),
-      op(reading('w-2b-sec'), { progress: 65, unread: false, readAt: oldSec }),
-      op(reading('w-2b-sec-recent'), { progress: 40, unread: false, readAt: recentSec }),
+      op(reading('w-2b-sec'), { progress: 65, readAt: oldSec }),
+      op(reading('w-2b-sec-recent'), { progress: 40, readAt: recentSec }),
     ]);
     const initialRecords = (await f.read(0)).records;
     const rev1Json = JSON.stringify(initialRecords[0]);
@@ -1110,7 +1110,7 @@ test('[T1-D3] policy 2-B clears readAt and resume via new immutable revision whi
 
     const latestReading = after.records.filter(r => userStateEntityKey(r.entity) === userStateEntityKey(reading('w-2b'))).at(-1)!;
     assert.ok(latestReading.revision > 4);
-    assert.deepEqual(latestReading.value, { progress: 75, unread: false, readAt: null });
+    assert.deepEqual(latestReading.value, { progress: 75, readAt: null });
 
     const latestResume = after.records.filter(r => userStateEntityKey(r.entity) === userStateEntityKey(resume('w-2b'))).at(-1)!;
     assert.ok(latestResume.revision > 4);
@@ -1118,11 +1118,11 @@ test('[T1-D3] policy 2-B clears readAt and resume via new immutable revision whi
 
     const latestSecOld = after.records.filter(r => userStateEntityKey(r.entity) === userStateEntityKey(reading('w-2b-sec'))).at(-1)!;
     assert.ok(latestSecOld.revision > 4);
-    assert.deepEqual(latestSecOld.value, { progress: 65, unread: false, readAt: null });
+    assert.deepEqual(latestSecOld.value, { progress: 65, readAt: null });
 
     const secRecentRecords = after.records.filter(r => userStateEntityKey(r.entity) === userStateEntityKey(reading('w-2b-sec-recent')));
     assert.equal(secRecentRecords.length, 1);
-    assert.deepEqual(secRecentRecords[0].value, { progress: 40, unread: false, readAt: recentSec });
+    assert.deepEqual(secRecentRecords[0].value, { progress: 40, readAt: recentSec });
   } finally {
     await f.close();
   }
@@ -1137,8 +1137,8 @@ test('[T1-D4] policy 2-C enforces sliding window retention and exposes seedCutof
     const eightMonthsAgo = BASE_NOW - 240 * DAY_MS;
     const oneMonthAgo = BASE_NOW - 30 * DAY_MS;
     await f.merge([
-      op(reading('w-old'), { progress: 100, unread: false, readAt: eightMonthsAgo }),
-      op(reading('w-recent'), { progress: 40, unread: false, readAt: oneMonthAgo }),
+      op(reading('w-old'), { progress: 100, readAt: eightMonthsAgo }),
+      op(reading('w-recent'), { progress: 40, readAt: oneMonthAgo }),
     ]);
 
     await f.adminCompact();
@@ -1177,13 +1177,13 @@ test('[T1-E2] physical GC deletes tombstones from user_state_records and user_st
       op(library('w-keep'), { inLibrary: true, addedAt: BASE_NOW }),
       op(bookmark('w-keep'), { bookmarked: true }),
       op(library('w-del'), { inLibrary: true, addedAt: BASE_NOW }),
-      op(reading('w-del'), { progress: 50, unread: false, readAt: BASE_NOW }),
+      op(reading('w-del'), { progress: 50, readAt: BASE_NOW }),
       op(category('cat-del'), { name: 'Temp', sort: 1, deleted: false }),
     ]);
     await f.merge([
       op(bookmark('w-keep', '/chapter/tomb'), { bookmarked: false }),
       op(library('w-del'), { inLibrary: false, addedAt: null }, active.results[2].current!.revision),
-      op(reading('w-del'), { progress: 0, unread: true, readAt: null }, active.results[3].current!.revision),
+      op(reading('w-del'), { progress: 0, readAt: null }, active.results[3].current!.revision),
       op(category('cat-del'), { name: 'Temp', sort: 1, deleted: true }, active.results[4].current!.revision),
     ]);
 
@@ -1366,8 +1366,8 @@ test('[T2-A6] duplicate operationId, seed with baseRevision > 0, or seed: false 
 test('[T2-B1] superseded_at compaction never deletes latest revision even when years old', async t => {
   const f = await setup({ t });
   try {
-    const r1 = await f.merge([op(reading('w-old-latest'), { progress: 30, unread: false, readAt: BASE_NOW })]);
-    await f.merge([op(reading('w-old-latest'), { progress: 60, unread: false, readAt: BASE_NOW + 10 }, r1.results[0].current!.revision)]);
+    const r1 = await f.merge([op(reading('w-old-latest'), { progress: 30, readAt: BASE_NOW })]);
+    await f.merge([op(reading('w-old-latest'), { progress: 60, readAt: BASE_NOW + 10 }, r1.results[0].current!.revision)]);
 
     // Before grace: rev 1 still present
     t.mock.timers.tick(1000);
@@ -1387,9 +1387,9 @@ test('[T2-B1] superseded_at compaction never deletes latest revision even when y
 test('[T2-B2] stale operation_id replay after stage-1 cleanup returns 409 for both exact and tampered payloads and rolls back batch', async t => {
   const f = await setup({ t });
   try {
-    const op1 = op(reading('w-b2'), { progress: 25, unread: false, readAt: BASE_NOW });
+    const op1 = op(reading('w-b2'), { progress: 25, readAt: BASE_NOW });
     const r1 = await f.merge([op1]);
-    await f.merge([op(reading('w-b2'), { progress: 90, unread: false, readAt: BASE_NOW + 50 }, r1.results[0].current!.revision)]);
+    await f.merge([op(reading('w-b2'), { progress: 90, readAt: BASE_NOW + 50 }, r1.results[0].current!.revision)]);
 
     const stage1 = await f.advanceUntil(() =>
       f.withDb(db => {
@@ -1407,7 +1407,7 @@ test('[T2-B2] stale operation_id replay after stage-1 cleanup returns 409 for bo
     assert.equal(replayExact.statusCode, 409, replayExact.body);
 
     // Tampered payload replay -> 409
-    const tampered = { ...op1, value: { progress: 99, unread: false, readAt: BASE_NOW } };
+    const tampered = { ...op1, value: { progress: 99, readAt: BASE_NOW } };
     const replayTampered = await f.mergeRaw([tampered]);
     assert.equal(replayTampered.statusCode, 409, replayTampered.body);
 
@@ -1852,8 +1852,8 @@ test('[T2-D2] policy 2-A preserves non-library bookmarks and applies exact day c
     await f.merge([
       op(library('w-2a'), { inLibrary: false, addedAt: null }),
       op(bookmark('w-2a'), { bookmarked: true }),
-      op(reading('w-2a', '/ch/older'), { progress: 40, unread: false, readAt: exactCutoff - 1 }),
-      op(reading('w-2a', '/ch/exact'), { progress: 40, unread: false, readAt: exactCutoff }),
+      op(reading('w-2a', '/ch/older'), { progress: 40, readAt: exactCutoff - 1 }),
+      op(reading('w-2a', '/ch/exact'), { progress: 40, readAt: exactCutoff }),
     ]);
     await f.adminCompact();
     const keys = new Set((await f.snapshot()).records.map(r => userStateEntityKey(r.entity)));
@@ -1870,7 +1870,7 @@ test('[T2-D3] policy 2-B is idempotent and does not emit duplicate revisions on 
   try {
     assert.equal((await f.adminPatchRetention({ stripReadingTimestamps: { enabled: true, days: 30 } })).statusCode, 200);
     await f.merge([
-      op(reading('w-idem'), { progress: 80, unread: false, readAt: BASE_NOW - 60 * DAY_MS }),
+      op(reading('w-idem'), { progress: 80, readAt: BASE_NOW - 60 * DAY_MS }),
       op(resume('w-idem'), { chapter: chapter(), anchor: null, openedAt: BASE_NOW - 60 * DAY_MS }),
     ]);
 
@@ -1894,10 +1894,10 @@ test('[T2-D4] policy 2-C blocks seed: true older than seedCutoffAt while applyin
     const beforeCutoff = ret.seedCutoffAt - 1;
     const beforeCutoffSec = Math.floor((ret.seedCutoffAt - 10_000) / 1000);
 
-    const opOld = op(reading('w-seed-old'), { progress: 50, unread: false, readAt: beforeCutoff }, 0, true);
-    const opNull = op(reading('w-seed-null'), { progress: 50, unread: false, readAt: null }, 0, true);
-    const opExplicit = op(reading('w-explicit-old'), { progress: 50, unread: false, readAt: beforeCutoff }, 0, false);
-    const opOldSec = op(reading('w-seed-old-sec'), { progress: 50, unread: false, readAt: beforeCutoffSec }, 0, true);
+    const opOld = op(reading('w-seed-old'), { progress: 50, readAt: beforeCutoff }, 0, true);
+    const opNull = op(reading('w-seed-null'), { progress: 50, readAt: null }, 0, true);
+    const opExplicit = op(reading('w-explicit-old'), { progress: 50, readAt: beforeCutoff }, 0, false);
+    const opOldSec = op(reading('w-seed-old-sec'), { progress: 50, readAt: beforeCutoffSec }, 0, true);
 
     const res = await f.merge([opOld, opNull, opExplicit, opOldSec]);
     assert.equal(res.results[0].operationId, opOld.operationId);
@@ -2059,9 +2059,9 @@ test('[T2-E6] POST /snapshot returns 413 when a single stored record exceeds 32 
 test('[T3-01] compaction + headRevision monotonicity + 409 stale receipt replay', async t => {
   const f = await setup({ t });
   try {
-    const op1 = op(reading('w-301'), { progress: 10, unread: false, readAt: BASE_NOW });
+    const op1 = op(reading('w-301'), { progress: 10, readAt: BASE_NOW });
     const r1 = await f.merge([op1]);
-    const op2 = op(reading('w-301'), { progress: 95, unread: false, readAt: BASE_NOW + 10 }, r1.results[0].current!.revision);
+    const op2 = op(reading('w-301'), { progress: 95, readAt: BASE_NOW + 10 }, r1.results[0].current!.revision);
     await f.merge([op2]);
 
     const ready = await f.advanceUntil(() =>
@@ -2082,7 +2082,7 @@ test('[T3-01] compaction + headRevision monotonicity + 409 stale receipt replay'
 
     const replay = await f.mergeRaw([op1]);
     assert.equal(replay.statusCode, 409);
-    assert.deepEqual((await f.read(0)).records[0].value, { progress: 95, unread: false, readAt: BASE_NOW + 10 });
+    assert.deepEqual((await f.read(0)).records[0].value, { progress: 95, readAt: BASE_NOW + 10 });
   } finally {
     await f.close();
   }
@@ -2223,7 +2223,7 @@ test('[T3-04] physical GC preserves work_migration_lineage and work-migration-re
     const tgtRead: UserStateEntity = { kind: 'reading', work: work('tgt-1', 'tgt-p'), chapter: chapter('/tgt/1/1') };
     const m = await f.merge([
       op(srcLib, { inLibrary: true, addedAt: BASE_NOW }),
-      op(tgtRead, { progress: 100, unread: false, readAt: BASE_NOW }),
+      op(tgtRead, { progress: 100, readAt: BASE_NOW }),
     ]);
     await f.merge([op(srcLib, { inLibrary: false, addedAt: null }, m.results[0].current!.revision)]);
     await f.advanceDaysAndCompact(400);
@@ -2271,9 +2271,9 @@ test('[T3-05] policy 2-A + physical GC advances compactedThrough and returns 410
     const oldMs = BASE_NOW - 60 * DAY_MS;
     await f.merge([
       op(library('w-lib'), { inLibrary: true, addedAt: oldMs }),
-      op(reading('w-lib'), { progress: 100, unread: false, readAt: oldMs }),
+      op(reading('w-lib'), { progress: 100, readAt: oldMs }),
       op(library('w-nonlib'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib'), { progress: 50, unread: false, readAt: oldMs }),
+      op(reading('w-nonlib'), { progress: 50, readAt: oldMs }),
     ]);
 
     await f.advanceDaysAndCompact(400);
@@ -2291,7 +2291,7 @@ test('[T3-06] policy 2-B + payload immutability + superseded_at compaction', asy
   const f = await setup({ t });
   try {
     assert.equal((await f.adminPatchRetention({ stripReadingTimestamps: { enabled: true, days: 30 } })).statusCode, 200);
-    await f.merge([op(reading('w-306'), { progress: 80, unread: false, readAt: BASE_NOW - 60 * DAY_MS })]);
+    await f.merge([op(reading('w-306'), { progress: 80, readAt: BASE_NOW - 60 * DAY_MS })]);
     const rev1Before = JSON.stringify((await f.read(0)).records[0]);
 
     await f.adminCompact();
@@ -2299,7 +2299,7 @@ test('[T3-06] policy 2-B + payload immutability + superseded_at compaction', asy
     assert.equal(beforeCompaction.headRevision, 2);
     assert.equal(beforeCompaction.records.length, 2);
     assert.equal(JSON.stringify(beforeCompaction.records[0]), rev1Before);
-    assert.deepEqual(beforeCompaction.records[1].value, { progress: 80, unread: false, readAt: null });
+    assert.deepEqual(beforeCompaction.records[1].value, { progress: 80, readAt: null });
 
     await f.advanceDaysAndCompact(400);
     const afterCompaction = await f.read(0);
@@ -2317,8 +2317,8 @@ test('[T3-07] policy 2-C + seedCutoffAt blocks old seed while allowing explicit 
     await f.adminCompact();
     const cutoff = (await f.retention()).seedCutoffAt!;
     const m = await f.merge([
-      op(reading('w-307-seed'), { progress: 50, unread: false, readAt: cutoff - 1000 }, 0, true),
-      op(reading('w-307-explicit'), { progress: 50, unread: false, readAt: cutoff - 1000 }, 0, false),
+      op(reading('w-307-seed'), { progress: 50, readAt: cutoff - 1000 }, 0, true),
+      op(reading('w-307-explicit'), { progress: 50, readAt: cutoff - 1000 }, 0, false),
     ]);
     assert.equal(m.results[0].status, 'seed-skipped');
     assert.equal(m.results[0].current, null);
@@ -2383,11 +2383,11 @@ test('[T3-10] GET /api/v1/admin/user-state reflects compactable counts and freel
   const f = await setup({ t });
   try {
     const first = await f.merge(
-      Array.from({ length: 40 }, (_, i) => op(reading(`w-310-${i}`), { progress: 10, unread: false, readAt: BASE_NOW })),
+      Array.from({ length: 40 }, (_, i) => op(reading(`w-310-${i}`), { progress: 10, readAt: BASE_NOW })),
     );
     await f.merge(
       first.results.map((r, i) =>
-        op(reading(`w-310-${i}`), { progress: 80, unread: false, readAt: BASE_NOW + 10 }, r.current!.revision),
+        op(reading(`w-310-${i}`), { progress: 80, readAt: BASE_NOW + 10 }, r.current!.revision),
       ),
     );
     t.mock.timers.tick(400 * DAY_MS);
@@ -2471,7 +2471,7 @@ test('[T4-01] 2-device active reading + compaction + new device join + 409 stale
       const batch = [1, 2, 3, 4, 5].map(ch => {
         const entity = reading('n-401', `/ch/${ch}`);
         const key = userStateEntityKey(entity);
-        const o = op(entity, { progress: round * 25, unread: false, readAt: BASE_NOW + round }, latestRevs.get(key) ?? 0);
+        const o = op(entity, { progress: round * 25, readAt: BASE_NOW + round }, latestRevs.get(key) ?? 0);
         if (round === 1 && ch === 1) staleOps.push(o);
         return o;
       });
@@ -2538,7 +2538,7 @@ test('[T4-02] offline device reconnecting after physical tombstone GC gets 410 -
 
     // Explicit edit on w-4 succeeds
     const w4Rev = [...snap.records, ...snap2.records].find(r => (r.entity as { work: { sourceNovelId: string } }).work.sourceNovelId === 'w-4')!.revision;
-    const edit = await f.merge([op(reading('w-4'), { progress: 100, unread: false, readAt: BASE_NOW + 100 }, 0)], f.deviceB);
+    const edit = await f.merge([op(reading('w-4'), { progress: 100, readAt: BASE_NOW + 100 }, 0)], f.deviceB);
     assert.equal(edit.results[0].status, 'applied');
     assert.ok(w4Rev > 0);
   } finally {
@@ -2550,7 +2550,7 @@ test('[T4-03] workspace epoch reset + dual-device Mode A re-seed vs Mode B start
   const f = await setup({ t });
   try {
     await f.merge(
-      [1, 2, 3].map(i => op(reading(`w-e1-${i}`), { progress: 100, unread: false, readAt: BASE_NOW })),
+      [1, 2, 3].map(i => op(reading(`w-e1-${i}`), { progress: 100, readAt: BASE_NOW })),
       f.deviceA,
     );
     const ws1 = await f.workspace(f.deviceA);
@@ -2570,7 +2570,7 @@ test('[T4-03] workspace epoch reset + dual-device Mode A re-seed vs Mode B start
     const ws2B = await f.workspace(f.deviceB);
     const pulled = await f.read(0, undefined, 200, f.deviceB, ws2B);
     assert.equal(pulled.records.length, 1);
-    const newEdit = await f.merge([op(reading('w-b-new'), { progress: 30, unread: false, readAt: BASE_NOW + 50 })], f.deviceB, ws2B);
+    const newEdit = await f.merge([op(reading('w-b-new'), { progress: 30, readAt: BASE_NOW + 50 })], f.deviceB, ws2B);
     assert.equal(newEdit.headRevision, 2);
   } finally {
     await f.close();
@@ -2584,8 +2584,8 @@ test('[T4-04] policy 2-C sliding window retention + late client seed filtering',
     const oldMs = BASE_NOW - 240 * DAY_MS;
     const recentMs = BASE_NOW - 20 * DAY_MS;
     await f.merge([
-      op(reading('w-old-hist'), { progress: 100, unread: false, readAt: oldMs }),
-      op(reading('w-new-hist'), { progress: 50, unread: false, readAt: recentMs }),
+      op(reading('w-old-hist'), { progress: 100, readAt: oldMs }),
+      op(reading('w-new-hist'), { progress: 50, readAt: recentMs }),
     ]);
     await f.adminCompact();
 
@@ -2595,8 +2595,8 @@ test('[T4-04] policy 2-C sliding window retention + late client seed filtering',
     const deviceC = await deviceHeaders(f.app, 'Device C');
     const batch = await f.merge(
       [
-        op(reading('w-late-old'), { progress: 80, unread: false, readAt: oldMs }, 0, true),
-        op(reading('w-late-new'), { progress: 80, unread: false, readAt: recentMs }, 0, true),
+        op(reading('w-late-old'), { progress: 80, readAt: oldMs }, 0, true),
+        op(reading('w-late-new'), { progress: 80, readAt: recentMs }, 0, true),
       ],
       deviceC,
     );
@@ -2617,13 +2617,13 @@ test('[T4-05] admin lifecycle: backup deletion, retention config, manual compact
     for (let round = 0; round < 5; round++) {
       await f.merge(
         Array.from({ length: 50 }, (_, i) =>
-          op(reading(`w-life-${i}`, '/ch/1'), { progress: (round + 1) * 20, unread: false, readAt: BASE_NOW - 100 * DAY_MS }, round === 0 ? 0 : round * 50 + i + 1 - 50),
+          op(reading(`w-life-${i}`, '/ch/1'), { progress: (round + 1) * 20, readAt: BASE_NOW - 100 * DAY_MS }, round === 0 ? 0 : round * 50 + i + 1 - 50),
         ),
       );
     }
     const nonLib = await f.merge([
       op(library('w-nonlib-405'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib-405'), { progress: 40, unread: false, readAt: BASE_NOW - 100 * DAY_MS }),
+      op(reading('w-nonlib-405'), { progress: 40, readAt: BASE_NOW - 100 * DAY_MS }),
     ]);
     assert.ok(nonLib.headRevision >= 252);
 
@@ -2670,7 +2670,7 @@ test('[T4-06] work migration + source tombstone GC + /snapshot reconnection pres
 
     const w1Lib: UserStateEntity = { kind: 'library', work: work('n-src', 'p-src') };
     const w2Read: UserStateEntity = { kind: 'reading', work: work('n-tgt', 'p-tgt'), chapter: chapter('/tgt/406/1') };
-    const m1 = await f.merge([op(w1Lib, { inLibrary: true, addedAt: BASE_NOW }), op(w2Read, { progress: 100, unread: false, readAt: BASE_NOW })]);
+    const m1 = await f.merge([op(w1Lib, { inLibrary: true, addedAt: BASE_NOW }), op(w2Read, { progress: 100, readAt: BASE_NOW })]);
     await f.merge([op(w1Lib, { inLibrary: false, addedAt: null }, m1.results[0].current!.revision)]);
 
     await f.advanceDaysAndCompact(400);
@@ -2796,17 +2796,17 @@ test('[T4-11] combined 2-A + 2-B long-term hygiene cycle differentiates library 
     const d45 = BASE_NOW - 45 * DAY_MS;
     await f.merge([
       op(library('w-lib-411'), { inLibrary: true, addedAt: d120 }),
-      op(reading('w-lib-411'), { progress: 85, unread: false, readAt: d120 }),
+      op(reading('w-lib-411'), { progress: 85, readAt: d120 }),
       op(resume('w-lib-411'), { chapter: chapter(), anchor: null, openedAt: d120 }),
       op(library('w-nonlib-411'), { inLibrary: false, addedAt: null }),
-      op(reading('w-nonlib-411'), { progress: 40, unread: false, readAt: d45 }),
+      op(reading('w-nonlib-411'), { progress: 40, readAt: d45 }),
     ]);
 
     await f.adminCompact();
     const latest = await f.snapshot();
     const libReading = latest.records.find(r => userStateEntityKey(r.entity) === userStateEntityKey(reading('w-lib-411')));
     assert.ok(libReading);
-    assert.deepEqual(libReading.value, { progress: 85, unread: false, readAt: null });
+    assert.deepEqual(libReading.value, { progress: 85, readAt: null });
 
     const libResume = latest.records.find(r => userStateEntityKey(r.entity) === userStateEntityKey(resume('w-lib-411')));
     assert.ok(libResume);

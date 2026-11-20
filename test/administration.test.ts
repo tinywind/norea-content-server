@@ -354,8 +354,8 @@ test('admin user-state telemetry, manual compact, retention config, and workspac
         ...scope,
         operations: [
           { operationId: 'op-lib-1', entity: { kind: 'library', work }, baseRevision: 0, value: { inLibrary: true, addedAt: 100 } },
-          { operationId: 'op-read-1', entity: { kind: 'reading', work, chapter: { chapterPath: '/c1' } }, baseRevision: 0, value: { progress: 50, unread: false, readAt: 100 } },
-          { operationId: 'op-read-tomb', entity: { kind: 'reading', work, chapter: { chapterPath: '/c2' } }, baseRevision: 0, value: { progress: 0, unread: true, readAt: null } },
+          { operationId: 'op-read-1', entity: { kind: 'reading', work, chapter: { chapterPath: '/c1' } }, baseRevision: 0, value: { progress: 50, readAt: 100 } },
+          { operationId: 'op-read-tomb', entity: { kind: 'reading', work, chapter: { chapterPath: '/c2' } }, baseRevision: 0, value: { progress: 0, readAt: null } },
           { operationId: 'op-bm-tomb', entity: { kind: 'bookmark', work, chapter: { chapterPath: '/c1' } }, baseRevision: 0, value: { bookmarked: false } },
           { operationId: 'op-cat-1', entity: { kind: 'category', categoryId: 'cat-1' }, baseRevision: 0, value: { name: 'Shelf', sort: 1, deleted: false } },
           { operationId: 'op-cat-alias', entity: { kind: 'category', categoryId: 'cat-alias' }, baseRevision: 0, value: { name: 'Shelf', sort: 2, deleted: false } },

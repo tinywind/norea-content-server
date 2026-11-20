@@ -112,7 +112,7 @@ test('recovers discarded server-only chapters from backup without reviving tombs
             operationId: randomUUID(),
             entity: { kind: 'reading', work: { pluginId: 'bookkor-novel', sourceNovelId: '6951', novelPath: '/bookkor/6951', name: 'How an A-Rank Hunter Lives' }, chapter: { chapterPath: '/bookkor/6951-ep-1' } },
             baseRevision: 0,
-            value: { progress: 100, unread: false, readAt: 12345 },
+            value: { progress: 100, readAt: 12345 },
           },
           {
             operationId: randomUUID(),

@@ -120,8 +120,12 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       if (!options.full && saved?.signature === before) {
         const item = JSON.parse(saved.entry) as FolderIndexItem;
         const current = chapters.get(relative(dataDir, path));
-        if (current?.path === current?.directory && current?.deleted_at === null && JSON.parse(current.entry).revision === item.revision) {
-          await report({ ...item, status: 'unchanged' }, true); return;
+        if (current?.path === current?.directory && current?.deleted_at === null) {
+          const parsedCurrent = JSON.parse(current.entry) as CatalogEntry;
+          const currentBody = parsedCurrent.manifest.files.find(file => file.path === parsedCurrent.manifest.bodyPath);
+          if (parsedCurrent.revision === item.revision && currentBody && currentBody.size > 0) {
+            await report({ ...item, status: 'unchanged' }, true); return;
+          }
         }
       }
       let manifest: PackageManifest;
@@ -231,7 +235,8 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         await report({ path, sourceId, status: 'skipped', reason: 'Chapter folder must be a canonical nonnegative number' }); return;
       }
       const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
-      if (entry?.complete && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
+      const bodyFile = entry?.manifest.files.find(file => file.path === entry.manifest.bodyPath);
+      if (entry?.complete && bodyFile && bodyFile.size > 0 && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
         await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); return;
       }
       if (exactIdentity) { await process(path, entry!.manifest, key); return; }

@@ -155,13 +155,13 @@ test('Policy 2-A prunes old non-library reading/resume (including Unix-second ti
 
     const mergeRes = parseUserStateMergeResponse((await f.merge([
       op(library('in-lib'), { inLibrary: true, addedAt: oldSec }),
-      op(reading('in-lib', '/c1'), { progress: 80, unread: false, readAt: oldSec }),
+      op(reading('in-lib', '/c1'), { progress: 80, readAt: oldSec }),
       op(library('not-lib'), { inLibrary: false, addedAt: null }),
-      op(reading('not-lib', '/c1'), { progress: 60, unread: false, readAt: oldSec }),
+      op(reading('not-lib', '/c1'), { progress: 60, readAt: oldSec }),
       op(resume('not-lib'), { chapter: { chapterPath: '/c1' }, anchor: null, openedAt: oldSec }),
       op(bookmark('not-lib', '/c1'), { bookmarked: true }),
-      op(reading('untracked', '/c1'), { progress: 30, unread: false, readAt: oldSec }),
-      op(reading('recent-nonlib', '/c1'), { progress: 40, unread: false, readAt: recentSec }),
+      op(reading('untracked', '/c1'), { progress: 30, readAt: oldSec }),
+      op(reading('recent-nonlib', '/c1'), { progress: 40, readAt: recentSec }),
     ])).json());
     assert.equal(mergeRes.headRevision, 8);
 
@@ -196,14 +196,14 @@ test('Policy 2-A prunes old non-library reading/resume (including Unix-second ti
 
     // seed: true cannot resurrect pruned non-library reading.
     const seedRes = parseUserStateMergeResponse((await f.merge([
-      op(reading('not-lib', '/c1'), { progress: 99, unread: false, readAt: recentSec }, 0, true),
+      op(reading('not-lib', '/c1'), { progress: 99, readAt: recentSec }, 0, true),
     ], f.secondHeaders)).json());
     assert.equal(seedRes.results[0].status, 'seed-skipped');
     assert.equal(seedRes.results[0].current, null);
 
     // Explicit edit still succeeds.
     const explicitRes = parseUserStateMergeResponse((await f.merge([
-      op(reading('not-lib', '/c1'), { progress: 100, unread: false, readAt: recentSec }, 0, false),
+      op(reading('not-lib', '/c1'), { progress: 100, readAt: recentSec }, 0, false),
     ], f.secondHeaders)).json());
     assert.equal(explicitRes.results[0].status, 'applied');
     assert.equal(explicitRes.headRevision, 9);
@@ -219,8 +219,8 @@ test('Policy 2-B strips readAt and resume via immutable new revisions, preserves
     const recentSec = Math.floor((f.now() - 10 * 86_400_000) / 1000);
 
     const mergeRes = parseUserStateMergeResponse((await f.merge([
-      op(reading('w1', '/c1'), { progress: 85, unread: false, readAt: oldSec }),
-      op(reading('w1', '/c2'), { progress: 100, unread: false, readAt: recentSec }),
+      op(reading('w1', '/c1'), { progress: 85, readAt: oldSec }),
+      op(reading('w1', '/c2'), { progress: 100, readAt: recentSec }),
       op(resume('w1'), { chapter: { chapterPath: '/c1' }, anchor: { segmentIndex: 1, segmentCount: 5, offset: 0.4, progress: 85, savedAt: f.now() - 200 * 86_400_000 }, openedAt: oldSec }),
     ])).json());
     assert.equal(mergeRes.headRevision, 3);
@@ -262,7 +262,7 @@ test('Policy 2-B strips readAt and resume via immutable new revisions, preserves
       assert.equal(laterGc.gcDeletedRecords, 1); // Only the empty resume tombstone (chapter/anchor/openedAt all null) is a tombstone!
       const snap = parseUserStateSnapshotResponse((await f.snapshot()).json());
       const strippedReading = snap.records.find(r => r.entity.kind === 'reading' && r.entity.chapter.chapterPath === '/c1');
-      assert.deepEqual(strippedReading?.value, { progress: 85, unread: false, readAt: null });
+      assert.deepEqual(strippedReading?.value, { progress: 85, readAt: null });
     } finally {
       db.close();
     }
@@ -284,9 +284,9 @@ test('Policy 2-C enforces sliding window + seedCutoffAt while preserving non-rea
       op(category('cat-1'), { name: 'Shelf', sort: 0, deleted: false }),
       op(membership('cat-1', 'w1'), { included: true }),
       op(composition('w1'), { composition: { version: 1, updatedAt: 1, entries: [] } }),
-      op(reading('w1', '/old'), { progress: 100, unread: false, readAt: oldSec }),
+      op(reading('w1', '/old'), { progress: 100, readAt: oldSec }),
       op(resume('w1'), { chapter: { chapterPath: '/old' }, anchor: null, openedAt: oldSec }),
-      op(reading('w1', '/recent'), { progress: 50, unread: false, readAt: recentSec }),
+      op(reading('w1', '/recent'), { progress: 50, readAt: recentSec }),
     ]);
 
     const db = openDatabase(f.dataDir);
@@ -307,10 +307,10 @@ test('Policy 2-C enforces sliding window + seedCutoffAt while preserving non-rea
 
     // Batch with old seed (skipped) and recent seed (applied), plus non-seed edit on old chapter (applied).
     const mergeSeedRes = parseUserStateMergeResponse((await f.merge([
-      op(reading('w1', '/old-seed'), { progress: 100, unread: false, readAt: oldSec }, 0, true),
+      op(reading('w1', '/old-seed'), { progress: 100, readAt: oldSec }, 0, true),
       op(resume('w2'), { chapter: { chapterPath: '/c1' }, anchor: null, openedAt: oldSec }, 0, true),
-      op(reading('w1', '/recent-seed'), { progress: 70, unread: false, readAt: recentSec }, 0, true),
-      op(reading('w1', '/old-explicit'), { progress: 100, unread: false, readAt: oldSec }, 0, false),
+      op(reading('w1', '/recent-seed'), { progress: 70, readAt: recentSec }, 0, true),
+      op(reading('w1', '/old-explicit'), { progress: 100, readAt: oldSec }, 0, false),
     ], f.secondHeaders)).json());
     assert.equal(mergeSeedRes.results[0].status, 'seed-skipped');
     assert.equal(mergeSeedRes.results[0].current, null);
@@ -349,9 +349,9 @@ test('Physical GC removes expired tombstones across all 6 kinds, cleans dangling
     const veryOldDomainSec = Math.floor((f.now() - 500 * 86_400_000) / 1000);
     const createRes = parseUserStateMergeResponse((await f.merge([
       op(library('keep'), { inLibrary: true, addedAt: veryOldDomainSec }),
-      op(reading('keep', '/read'), { progress: 0, unread: false, readAt: null }),
+      op(reading('keep', '/read'), { progress: 100, readAt: null }),
       op(library('del-lib'), { inLibrary: false, addedAt: null }),
-      op(reading('del-read', '/c1'), { progress: 0, unread: true, readAt: null }),
+      op(reading('del-read', '/c1'), { progress: 0, readAt: null }),
       op(bookmark('del-bm', '/c1'), { bookmarked: false }),
       op(resume('del-res'), { chapter: null, anchor: null, openedAt: null }),
       op(category('del-cat'), { name: 'TrashCat', sort: 0, deleted: false }),
@@ -441,7 +441,7 @@ test('Physical GC removes retired migration originals after grace while keeping 
       // Write non-tombstone user_state_records for both source-1 and target-1.
       await f.merge([
         op(library('source-1'), { inLibrary: true, addedAt: 100 }),
-        op(reading('source-1', '/c1'), { progress: 50, unread: false, readAt: 100 }),
+        op(reading('source-1', '/c1'), { progress: 50, readAt: 100 }),
         op(library('target-1'), { inLibrary: true, addedAt: 100 }),
       ]);
 
@@ -865,7 +865,7 @@ test('POST /snapshot safely handles MAX_SAFE_INTEGER limit and reserves budget f
       expectedPage1NextKey = comp2.entityKey;
       const bigReadingRecord = JSON.stringify({
         entity: bigReadingEntity,
-        value: { progress: 50, unread: false, readAt: 1 },
+        value: { progress: 50, readAt: 1 },
         revision: 13,
         operationId: 'op-big-reading',
         updatedAt: f.now(),
@@ -938,10 +938,10 @@ test('POST /snapshot paginates across valid multi-byte UTF-8 and escaped-quote e
     assert.ok(Buffer.byteLength(userStateEntityKey(utf8Reading2), 'utf8') > 32_768);
 
     const mergeRes = await f.merge([
-      op(quoteReading1, { progress: 10, unread: false, readAt: 100 }),
-      op(quoteReading2, { progress: 20, unread: false, readAt: 200 }),
-      op(utf8Reading1, { progress: 30, unread: false, readAt: 300 }),
-      op(utf8Reading2, { progress: 40, unread: false, readAt: 400 }),
+      op(quoteReading1, { progress: 10, readAt: 100 }),
+      op(quoteReading2, { progress: 20, readAt: 200 }),
+      op(utf8Reading1, { progress: 30, readAt: 300 }),
+      op(utf8Reading2, { progress: 40, readAt: 400 }),
     ]);
     assert.equal(mergeRes.statusCode, 200, mergeRes.body);
 
@@ -1003,8 +1003,8 @@ test('POST /snapshot paginates across unpaired UTF-16 surrogate entity_keys exce
     }
 
     const mergeRes = await f.merge([
-      op(surrogateReading1, { progress: 15, unread: false, readAt: 100 }),
-      op(surrogateReading2, { progress: 25, unread: false, readAt: 200 }),
+      op(surrogateReading1, { progress: 15, readAt: 100 }),
+      op(surrogateReading2, { progress: 25, readAt: 200 }),
       op(maxSurrogateBookmark, { bookmarked: true }),
     ]);
     assert.equal(mergeRes.statusCode, 200, mergeRes.body);
@@ -1085,9 +1085,9 @@ test('background setInterval runs 2-stage op cleanup, Policy 2-A, tombstone GC, 
     const oldReadSec = Math.floor((clock - 20 * 86_400_000) / 1000);
     const recentReadSec = Math.floor((clock - 86_400_000) / 1000);
 
-    const oldReadingOp = op(reading('nonlib-old', '/ch/1'), { progress: 60, unread: false, readAt: oldReadSec });
+    const oldReadingOp = op(reading('nonlib-old', '/ch/1'), { progress: 60, readAt: oldReadSec });
     const libOp = op(library('lib-kept'), { inLibrary: true, addedAt: oldReadSec });
-    const libReadOp = op(reading('lib-kept', '/ch/1'), { progress: 75, unread: false, readAt: recentReadSec });
+    const libReadOp = op(reading('lib-kept', '/ch/1'), { progress: 75, readAt: recentReadSec });
     const tombOp = op(bookmark('tomb-work', '/ch/1'), { bookmarked: false });
 
     const mergeRes = await fetch(`${baseUrl}/api/v1/user-state/merge`, {
