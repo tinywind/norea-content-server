@@ -14,6 +14,9 @@ env:
   CI: "true"
   IMAGE_NAME: tinywind0/norea-content-server
   LOCAL_IMAGE: norea-content-server-ci:${{ github.sha }}
+  NODE_IMAGE: node:24-bookworm-slim
+  PYTHON_IMAGE: python:3.14-slim
+  PNPM_VERSION: "11.25.0"
 
 jobs:
   validate:
@@ -45,29 +48,40 @@ jobs:
             echo "Validation only: $SOURCE_BRANCH is not a version branch such as 0.2." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - name: Cache pnpm store
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          version: 11.25.0
-          run_install: false
+          path: ${{ runner.temp }}/pnpm-store
+          key: norea-content-server-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            norea-content-server-pnpm-
 
-      - name: Set up Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-
-      - name: Install locked dependencies
+      - name: Install locked dependencies, check types, run tests, and build in Node container
         run: |
-          test "$(pnpm --version)" = '11.25.0'
-          pnpm install --frozen-lockfile
-
-      - name: Check types, run tests, and build the console
-        run: |
-          pnpm typecheck
-          pnpm test
-          pnpm build
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/container-home" "$RUNNER_TEMP/pnpm-store" "$RUNNER_TEMP/pnpm-global"
+          docker run --rm --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$RUNNER_TEMP/container-home:/tmp/home" \
+            -v "$RUNNER_TEMP/pnpm-store:/pnpm-store" \
+            -v "$RUNNER_TEMP/pnpm-global:/pnpm-global" \
+            -w /workspace \
+            -e CI=true \
+            -e HOME=/tmp/home \
+            -e PNPM_STORE_DIR=/pnpm-store \
+            -e NPM_CONFIG_PREFIX=/pnpm-global \
+            -e NPM_CONFIG_CACHE=/tmp/home/.npm \
+            -e PNPM_VERSION="$PNPM_VERSION" \
+            "$NODE_IMAGE" \
+            bash -euo pipefail -c '
+              export PATH="/pnpm-global/bin:$PATH"
+              npm install --global --no-audit --no-fund "pnpm@${PNPM_VERSION}"
+              test "$(pnpm --version)" = "$PNPM_VERSION"
+              pnpm install --frozen-lockfile --store-dir "$PNPM_STORE_DIR"
+              pnpm typecheck
+              pnpm test
+              pnpm build
+            '
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --exit-code
           git diff --cached --exit-code
@@ -103,33 +117,38 @@ jobs:
             --tmpfs /data:rw,uid=1000,gid=1000,mode=0700 \
             --env NOREA_HOST=0.0.0.0 --env NOREA_PORT=8787 --env NOREA_DATA_DIR=/data \
             "$LOCAL_IMAGE"
-          port="$(docker port "$container_name" 8787/tcp | cut -d: -f2)"
-          base_url="http://127.0.0.1:${port}"
-          ready=false
-          for attempt in {1..30}; do
-            if curl --fail --silent --max-time 2 "$base_url/api/v1/capabilities" -o "$RUNNER_TEMP/capabilities.json"; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [[ "$ready" != true ]]; then
-            docker logs "$container_name"
-            exit 1
-          fi
-          curl --fail --silent --show-error --max-time 10 "$base_url/admin/" -o "$RUNNER_TEMP/admin.html"
-          curl --fail --silent --show-error --max-time 10 "$base_url/admin/admin.js" -o "$RUNNER_TEMP/admin.js"
-          node --input-type=module <<'NODE'
+          if ! docker run --rm -i --network "container:$container_name" "$NODE_IMAGE" node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
-          import { readFileSync } from 'node:fs';
-          const read = name => readFileSync(`${process.env.RUNNER_TEMP}/${name}`, 'utf8');
-          const capabilities = JSON.parse(read('capabilities.json'));
+          import { setTimeout as delay } from 'node:timers/promises';
+
+          const baseUrl = 'http://127.0.0.1:8787';
+          let capabilitiesResponse;
+          for (let attempt = 0; attempt < 30; attempt++) {
+            try {
+              const response = await fetch(`${baseUrl}/api/v1/capabilities`, { signal: AbortSignal.timeout(2000) });
+              if (response.ok) {
+                capabilitiesResponse = response;
+                break;
+              }
+            } catch {}
+            await delay(1000);
+          }
+          assert.ok(capabilitiesResponse, 'server did not become ready within 30s');
+          const capabilities = await capabilitiesResponse.json();
           for (const [key, value] of Object.entries({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, deviceBackupVersion: 1 })) {
             assert.equal(capabilities[key], value, key);
           }
-          assert.match(read('admin.html'), /<html[\s>]/i);
-          assert.ok(read('admin.js').trim().length > 0, 'built admin.js must be present');
+          const adminHtmlResponse = await fetch(`${baseUrl}/admin/`, { signal: AbortSignal.timeout(10000) });
+          assert.ok(adminHtmlResponse.ok, `/admin/ returned ${adminHtmlResponse.status}`);
+          assert.match(await adminHtmlResponse.text(), /<html[\s>]/i);
+          const adminJsResponse = await fetch(`${baseUrl}/admin/admin.js`, { signal: AbortSignal.timeout(10000) });
+          assert.ok(adminJsResponse.ok, `/admin/admin.js returned ${adminJsResponse.status}`);
+          assert.ok((await adminJsResponse.text()).trim().length > 0, 'built admin.js must be present');
           NODE
+          then
+            docker logs "$container_name"
+            exit 1
+          fi
 
       - name: Export the exact smoke-tested image
         if: steps.publication.outputs.publish == 'true'
@@ -138,9 +157,14 @@ jobs:
           set -euo pipefail
           test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
           docker save --output "$RUNNER_TEMP/norea-image.tar" "$LOCAL_IMAGE"
-          python3 <<'PY'
+          digest="$(docker run --rm -i --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP:/runner-temp:ro" \
+            -e LOCAL_IMAGE \
+            -e GITHUB_SHA \
+            "$PYTHON_IMAGE" \
+            python3 - <<'PY'
           import hashlib, json, os, tarfile
-          with tarfile.open(os.environ['RUNNER_TEMP'] + '/norea-image.tar') as archive:
+          with tarfile.open('/runner-temp/norea-image.tar') as archive:
               manifest = json.load(archive.extractfile('manifest.json'))
               matches = [item for item in manifest if os.environ['LOCAL_IMAGE'] in (item.get('RepoTags') or [])]
               assert len(matches) == 1, 'Archive must contain the one tested image tag'
@@ -148,10 +172,11 @@ jobs:
               config = json.loads(config_bytes)
               assert config['os'] == 'linux' and config['architecture'] == 'amd64'
               assert config['config']['Labels']['org.opencontainers.image.revision'] == os.environ['GITHUB_SHA']
-              digest = 'sha256:' + hashlib.sha256(config_bytes).hexdigest()
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write('image_config_digest=' + digest + '\n')
+              print('sha256:' + hashlib.sha256(config_bytes).hexdigest())
           PY
+          )"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image_config_digest=$digest" >> "$GITHUB_OUTPUT"
           echo "sha256=$(sha256sum "$RUNNER_TEMP/norea-image.tar" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Transfer the tested image to the publishing job
@@ -186,7 +211,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SOURCE_BRANCH" --jq '.object.sha')"
+          head="$(docker run --rm -i \
+            -e GH_TOKEN \
+            -e GITHUB_REPOSITORY \
+            -e SOURCE_BRANCH \
+            "$NODE_IMAGE" \
+            node --input-type=module <<'NODE'
+          const branchPath = process.env.SOURCE_BRANCH.split('/').map(encodeURIComponent).join('/');
+          const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/git/ref/heads/${branchPath}`, {
+            headers: {
+              Authorization: `Bearer ${process.env.GH_TOKEN}`,
+              Accept: 'application/vnd.github+json',
+              'User-Agent': 'norea-content-server-ci',
+              'X-GitHub-Api-Version': '2022-11-28',
+            },
+          });
+          if (!response.ok) {
+            throw new Error(`GitHub API ${response.status}: ${await response.text()}`);
+          }
+          const data = await response.json();
+          console.log(data.object.sha);
+          NODE
+          )"
           if [[ "$head" == "$GITHUB_SHA" ]]; then
             echo 'publish=true' >> "$GITHUB_OUTPUT"
           else
@@ -229,7 +275,30 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SOURCE_BRANCH" --jq '.object.sha')"
+          fetch_branch_head() {
+            docker run --rm -i \
+              -e GH_TOKEN \
+              -e GITHUB_REPOSITORY \
+              -e SOURCE_BRANCH \
+              "$NODE_IMAGE" \
+              node --input-type=module <<'NODE'
+          const branchPath = process.env.SOURCE_BRANCH.split('/').map(encodeURIComponent).join('/');
+          const response = await fetch(`https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/git/ref/heads/${branchPath}`, {
+            headers: {
+              Authorization: `Bearer ${process.env.GH_TOKEN}`,
+              Accept: 'application/vnd.github+json',
+              'User-Agent': 'norea-content-server-ci',
+              'X-GitHub-Api-Version': '2022-11-28',
+            },
+          });
+          if (!response.ok) {
+            throw new Error(`GitHub API ${response.status}: ${await response.text()}`);
+          }
+          const data = await response.json();
+          console.log(data.object.sha);
+          NODE
+          }
+          head="$(fetch_branch_head)"
           if [[ "$head" != "$GITHUB_SHA" ]]; then
             echo 'Publication skipped: branch advanced while transferring the image.' >> "$GITHUB_STEP_SUMMARY"
             exit 0
@@ -237,24 +306,38 @@ jobs:
           docker tag "$LOCAL_IMAGE" "$IMAGE_NAME:$SOURCE_BRANCH"
           docker push "$IMAGE_NAME:$SOURCE_BRANCH"
           docker buildx imagetools inspect "$IMAGE_NAME:$SOURCE_BRANCH" --raw > "$RUNNER_TEMP/registry-manifest.json"
-          platform_digest="$(python3 <<'PY'
-          import json, os
-          manifest = json.load(open(os.environ['RUNNER_TEMP'] + '/registry-manifest.json'))
-          if 'manifests' in manifest:
-              matches = [item for item in manifest['manifests'] if item.get('platform', {}).get('os') == 'linux' and item.get('platform', {}).get('architecture') == 'amd64']
-              assert len(matches) == 1, 'Registry index must contain one linux/amd64 image'
-              print(matches[0]['digest'])
-          PY
+          platform_digest="$(docker run --rm -i --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP:/runner-temp:ro" \
+            "$NODE_IMAGE" \
+            node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync('/runner-temp/registry-manifest.json', 'utf8'));
+          if (Array.isArray(manifest.manifests)) {
+            const matches = manifest.manifests.filter(item => item?.platform?.os === 'linux' && item?.platform?.architecture === 'amd64');
+            assert.equal(matches.length, 1, 'Registry index must contain one linux/amd64 image');
+            console.log(matches[0].digest);
+          }
+          NODE
           )"
           if [[ -n "$platform_digest" ]]; then
             [[ "$platform_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             docker buildx imagetools inspect "$IMAGE_NAME@$platform_digest" --raw > "$RUNNER_TEMP/registry-manifest.json"
           fi
-          python3 -c 'import json,os; m=json.load(open(os.environ["RUNNER_TEMP"]+"/registry-manifest.json")); assert m["config"]["digest"] == os.environ["EXPECTED_CONFIG_DIGEST"], "Published image differs from tested image"'
+          docker run --rm -i --user "$(id -u):$(id -g)" \
+            -v "$RUNNER_TEMP:/runner-temp:ro" \
+            -e EXPECTED_CONFIG_DIGEST \
+            "$NODE_IMAGE" \
+            node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const manifest = JSON.parse(readFileSync('/runner-temp/registry-manifest.json', 'utf8'));
+          assert.equal(manifest.config.digest, process.env.EXPECTED_CONFIG_DIGEST, 'Published image differs from tested image');
+          NODE
           digest="$(docker buildx imagetools inspect "$IMAGE_NAME:$SOURCE_BRANCH" --format '{{.Manifest.Digest}}')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           latest='skipped because the branch advanced'
-          head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$SOURCE_BRANCH" --jq '.object.sha')"
+          head="$(fetch_branch_head)"
           if [[ "$head" == "$GITHUB_SHA" ]]; then
             docker tag "$LOCAL_IMAGE" "$IMAGE_NAME:latest"
             docker push "$IMAGE_NAME:latest"

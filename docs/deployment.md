@@ -12,8 +12,11 @@ workflow** dispatches. Pull requests and ordinary feature-branch pushes validate
 only. A push or manual run publishes only when the exact branch name is a version
 branch such as `0.2` or `0.3`. Dependabot changes are validated by the pull-request
 event, and manual runs on Dependabot branches also validate only.
-The workflow uses GitHub-hosted Ubuntu runners, Node.js 24, and pnpm 11.25.0 with a
-frozen lockfile.
+The workflow uses GitHub-hosted Ubuntu runners and executes Node.js/pnpm
+validation, smoke tests, and registry verification inside official Docker Hub
+containers (`node:24-bookworm-slim` with `pnpm 11.25.0` and a frozen lockfile,
+plus `python:3.14-slim` for archive verification) rather than host-installed
+runtimes.
 The first job runs type checks, the complete server test suite, and the console
 build. It then builds one `linux/amd64` image from the exact Git commit, loads
 that image, and starts a disposable container with temporary empty storage.
