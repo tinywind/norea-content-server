@@ -6,6 +6,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { canonicalize } from 'json-canonicalize';
 import { authenticateDevice } from './auth.ts';
 import { canonicalWorkChapters, chapterNumberAliases, type ChapterNumberAlias } from './chapter-number-mappings.ts';
+import { chapterStorageSignatureSync, deleteChapterInventoryDigest } from './chapter-inventory.ts';
 import { problem, transaction } from './db.ts';
 import { chapterStoragePath, digest, recordEntry, type CatalogEntry } from './packages.ts';
 import { mergeReadingState, normalizeReadingState, readingStateKey, type ReadingStateEntry } from './reading-state.ts';
@@ -340,7 +341,20 @@ export function reconcileChapterNumbers(db: DatabaseSync, dataDir: string, workI
             chapter: { ...entry.manifest.chapter, chapterNumber: plan.mapping.to, position: Number(plan.mapping.to) } };
           db.prepare('UPDATE chapters SET directory=?,path=? WHERE id=?').run(plan.directory, plan.path, plan.row.id);
           const updated = recordEntry(db, { ...entry, manifest, revision: digest(canonicalize(manifest)) });
-          if (updated.deleted) db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(updated.id, updated.sequence);
+          if (updated.deleted) {
+            db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(updated.id, updated.sequence);
+            deleteChapterInventoryDigest(db, plan.row.id);
+          } else if (plan.path && db.prepare('SELECT 1 FROM chapter_inventory_digests WHERE chapter_id=? AND revision=?').get(plan.row.id, entry.revision)) {
+            try {
+              const storageSignature = chapterStorageSignatureSync(chapterStoragePath(dataDir, plan.path), updated.manifest);
+              db.prepare('UPDATE chapter_inventory_digests SET revision=?, storage_signature=?, updated_at=? WHERE chapter_id=?')
+                .run(updated.revision, storageSignature, Date.now(), plan.row.id);
+            } catch {
+              deleteChapterInventoryDigest(db, plan.row.id);
+            }
+          } else {
+            deleteChapterInventoryDigest(db, plan.row.id);
+          }
         }
         db.prepare('DELETE FROM scan_checkpoints WHERE path IN (?,?)').run(chapterStoragePath(dataDir, join(workRow.directory, plan.mapping.from)), chapterStoragePath(dataDir, plan.directory));
       }

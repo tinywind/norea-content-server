@@ -8,10 +8,26 @@ import { safeArchivePath } from './archive-path.ts';
 import type { Limits } from './packages.ts';
 import { openVerifiedRegularFileSync, readVerifiedRegularFile } from './secure-files.ts';
 
-type Asset = { key: string; sha256: string; bytes: number };
-type Inventory = { body: { sha256: string; bytes: number } | null; expectedAssetKeys: string[] | null; storedAssets: Asset[] };
+export type Asset = { key: string; sha256: string; bytes: number };
+export type Inventory = { body: { sha256: string; bytes: number } | null; expectedAssetKeys: string[] | null; storedAssets: Asset[] };
 export type InventoryInput = { body: string; manifest?: string; archive?: string; limits: Limits };
 export type InventoryResult = { inventory: Inventory; fingerprints: string[] };
+
+export function compareCodepoint(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+export function chapterInventorySignature(inventory: Inventory): string {
+  return JSON.stringify([
+    inventory.body ? [inventory.body.sha256, inventory.body.bytes] : null,
+    inventory.expectedAssetKeys === null ? null : [...inventory.expectedAssetKeys].sort(compareCodepoint),
+    [...inventory.storedAssets].sort((left, right) => compareCodepoint(left.key, right.key)).map(asset => [asset.key, asset.sha256, asset.bytes]),
+  ]);
+}
+
+export function chapterPayloadHash(inventory: Inventory): string {
+  return createHash('sha256').update(chapterInventorySignature(inventory)).digest('hex');
+}
 
 export async function fingerprint(path: string) {
   const stat = await lstat(path);
@@ -88,7 +104,7 @@ async function inspect(input: InventoryInput): Promise<InventoryResult> {
   }
   const after = await Promise.all(paths.map(fingerprint));
   if (before.some((value, index) => value !== after[index])) throw new Error('Files changed during inspection');
-  storedAssets.sort((a, b) => a.key.localeCompare(b.key));
+  storedAssets.sort((a, b) => compareCodepoint(a.key, b.key));
   return { inventory: { body: { sha256: bodyHash.digest('hex'), bytes: bodyBytes }, expectedAssetKeys, storedAssets }, fingerprints: after };
 }
 

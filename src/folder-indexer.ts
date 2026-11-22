@@ -4,6 +4,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import { canonicalize } from 'json-canonicalize';
 import { validateFiles, validateMedia } from './chapter-files.ts';
+import { deleteChapterInventoryDigest, hasChapterInventoryDigest, inspectChapterInventory, inspectStagedChapterInventory } from './chapter-inventory.ts';
 import { chapterFileNames, digest, isUnfinishedContentName as unfinished, publishChapter, recordEntry, uploadCursor, type CatalogEntry, type Limits, type PackageManifest } from './packages.ts';
 import { isCoverFile, isOverrideCoverFile, cacheWork, metadataWorkId, readNovelMetadata, slimDeletedWorkEntry, type NovelMetadataV1, type WorkEntry } from './works.ts';
 import { transaction } from './db.ts';
@@ -121,6 +122,7 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
     const pathCondition = removed ? "(path=directory OR path IS NULL) AND json_extract(entry,'$.deleted')=0" : 'path=directory';
     const result = options.db.prepare(`UPDATE chapters SET path=NULL WHERE id=? AND ${pathCondition} AND deleted_at IS NULL AND entry=?`).run(row.id, row.entry);
     if (!result.changes) return false;
+    deleteChapterInventoryDigest(options.db, row.id);
     if (removed) {
       const entry = recordEntry(options.db, { ...JSON.parse(row.entry) as CatalogEntry, deleted: true });
       options.db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(row.id, entry.sequence);
@@ -142,6 +144,13 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
           const parsedCurrent = JSON.parse(current.entry) as CatalogEntry;
           const currentBody = parsedCurrent.manifest.files.find(file => file.path === parsedCurrent.manifest.bodyPath);
           if (parsedCurrent.revision === item.revision && currentBody && currentBody.size > 0) {
+            if (!hasChapterInventoryDigest(options.db, parsedCurrent.id, parsedCurrent.revision)) {
+              try {
+                await inspectChapterInventory(options.db, dataDir, parsedCurrent.id, parsedCurrent.revision, options.limits, false, { signal: options.signal, queue: true });
+              } catch {
+                aborted(options.signal);
+              }
+            }
             await report({ ...item, status: 'unchanged' }, true); return;
           }
         }
@@ -163,10 +172,12 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
         before = after;
       }
       aborted(options.signal);
+      const precomputed = await inspectStagedChapterInventory(path, manifest, options.limits, options.signal);
+      const stableBeforePublish = before === canonicalize([chapterMetadata, await inventorySignature(path, options.signal)]);
       const id = chapterIdentityId(options.db, manifest.identity);
       const previous = options.db.prepare("SELECT path,json_extract(entry,'$.revision') AS revision FROM chapters WHERE id=?").get(id) as { path: string | null; revision: string } | undefined;
       const entry: CatalogEntry = { id, revision: digest(canonicalize([manifest, before])), manifest, complete, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
-      const current = publishChapter(options.db, dataDir, path, entry, startedAt, true);
+      const current = publishChapter(options.db, dataDir, path, entry, startedAt, true, 'prefer-complete', undefined, stableBeforePublish ? precomputed : undefined);
       const item: FolderIndexItem = { path, sourceId, status: previous?.path && previous.revision === current.revision ? 'unchanged' : 'registered', chapterId: current.id, revision: current.revision };
       if (before === canonicalize([chapterMetadata, await inventorySignature(path, options.signal)])) remember(path, before, item);
       await report(item);
@@ -256,6 +267,13 @@ export async function scanFolder(options: FolderIndexOptions): Promise<FolderInd
       const exactIdentity = entry && (isLocal || !entry.manifest.identity.chapterPath.startsWith('norea-folder:'));
       const bodyFile = entry?.manifest.files.find(file => file.path === entry.manifest.bodyPath);
       if (entry?.complete && bodyFile && bodyFile.size > 0 && published?.path === published?.directory && published?.deleted_at === null && !inspect(path)) {
+        if (!hasChapterInventoryDigest(options.db, entry.id, entry.revision)) {
+          try {
+            await inspectChapterInventory(options.db, dataDir, entry.id, entry.revision, options.limits, false, { signal: options.signal, queue: true });
+          } catch {
+            aborted(options.signal);
+          }
+        }
         await report({ path, sourceId, status: 'unchanged', chapterId: entry.id, revision: entry.revision }, true); return;
       }
       if (exactIdentity) { await process(path, entry!.manifest, key); return; }

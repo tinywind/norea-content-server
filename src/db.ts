@@ -78,6 +78,21 @@ const changeIndexSchema = `
   CREATE INDEX IF NOT EXISTS user_state_changes_entity_key ON user_state_changes(entity_key);
 `;
 
+const chapterInventoryDigestSchema = `
+  CREATE TABLE IF NOT EXISTS chapter_inventory_digests (
+    chapter_id TEXT PRIMARY KEY REFERENCES chapters(id) ON DELETE CASCADE,
+    revision TEXT NOT NULL,
+    storage_signature TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    body_bytes INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL,
+    inventory_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS chapter_inventory_digests_rev
+    ON chapter_inventory_digests(chapter_id, revision);
+`;
+
 const readingStateSchema = `
     CREATE TABLE IF NOT EXISTS reading_state_entries (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -389,7 +404,7 @@ export function openDatabase(dataDir: string): DatabaseSync {
       db.exec(readingStateSchema); db.exec(workMigrationSchema); db.exec(chapterNumberSchema); db.exec(workOverrideSchema); db.exec(userStateSchema);
       db.prepare('INSERT OR IGNORE INTO user_state_meta(singleton,workspace_id,epoch) VALUES(1,?,?)').run(randomUUID(), randomUUID());
       ensureUserStateSchema(db);
-      db.exec(workSummarySchema); db.exec(changeIndexSchema);
+      db.exec(workSummarySchema); db.exec(changeIndexSchema); db.exec(chapterInventoryDigestSchema);
       compactCatalogLog(db);
     });
     return db;

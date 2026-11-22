@@ -10,6 +10,7 @@ import type { Multipart } from '@fastify/multipart';
 import { canonicalize } from 'json-canonicalize';
 import yauzl from 'yauzl';
 import { problem } from './db.ts';
+import { inspectStagedChapterInventory } from './chapter-inventory.ts';
 import { chapterRow, chapterStagePath, chapterStoragePath, digest, publishChapter, safeArchivePath, uploadCursor, validateManifest, type CatalogEntry, type ChapterConflictPolicy, type Limits, type PackageManifest } from './packages.ts';
 import { openVerifiedRegularFile, openVerifiedRegularFileSync, readVerifiedRegularFile } from './secure-files.ts';
 
@@ -121,9 +122,10 @@ export async function publishChapterFiles(db: DatabaseSync, dataDir: string, par
     }
     if (!manifest || received.size !== manifest.files.length) throw problem(400, 'Chapter files are incomplete');
     const complete = await validateMedia(stage, manifest, limits);
+    const precomputedInventory = await inspectStagedChapterInventory(stage, manifest, limits);
     const id = chapterIdentityId(db, manifest.identity);
     const entry: CatalogEntry = { id, revision: digest(canonicalize(manifest)), manifest, complete, fileBytes: manifest.files.reduce((sum, file) => sum + file.size, 0), deleted: false, sequence: 0 };
-    return publishChapter(db, dataDir, stage, entry, startedAt, false, conflictPolicy);
+    return publishChapter(db, dataDir, stage, entry, startedAt, false, conflictPolicy, undefined, precomputedInventory);
   } catch (error) {
     if (error instanceof Error && /unexpected end|premature close/i.test(error.message)) throw problem(400, 'Chapter upload was interrupted');
     throw error;

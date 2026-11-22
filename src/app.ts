@@ -40,7 +40,7 @@ const manifestSchema = { type: 'object', required: ['packageVersion','layout','i
 const catalogSchema = { type: 'object', required: ['id','revision','fileBytes','manifest','complete','deleted','sequence'], properties: { id: string, revision: string, fileBytes: { type: 'integer' }, manifest: manifestSchema, complete: { type: 'boolean' }, deleted: { type: 'boolean' }, sequence: { type: 'integer' } } };
 const cursorSchema = { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER };
 
-import { inspectChapterInventory } from './chapter-inventory.ts';
+import { inspectChapterInventory, startChapterDigestBackfill, type ChapterDigestBackfillHandle } from './chapter-inventory.ts';
 
 /** A request may take as long as it needs while bytes keep arriving; a socket idle this long is closed. */
 const SOCKET_IDLE_TIMEOUT_MS = 120000;
@@ -90,12 +90,16 @@ export async function buildApp(options: {
   await app.register(multipart, { limits: { fields: 1, fieldSize: 64 * 1024, files: 3, parts: 4, fileSize: limits.expandedBytes } });
   let closing = false;
   let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
+  let digestBackfill: ChapterDigestBackfillHandle | undefined;
   app.addHook('preClose', async () => {
     closing = true;
     if (maintenanceTimer) {
       clearInterval(maintenanceTimer);
       maintenanceTimer = undefined;
     }
+    const activeBackfill = digestBackfill;
+    digestBackfill = undefined;
+    if (activeBackfill) await activeBackfill.stop();
     changes.close();
   });
   app.addHook('onClose', async () => { db.close(); });
@@ -104,7 +108,11 @@ export async function buildApp(options: {
     MAX_TIMER_DELAY_MS,
   );
   app.addHook('onReady', async () => {
-    if (closing || maintenanceTimer || !Number.isFinite(maintenanceIntervalMs) || maintenanceIntervalMs <= 0) return;
+    if (closing) return;
+    if (!digestBackfill) {
+      digestBackfill = startChapterDigestBackfill(db, dataDir, limits);
+    }
+    if (maintenanceTimer || !Number.isFinite(maintenanceIntervalMs) || maintenanceIntervalMs <= 0) return;
     maintenanceTimer = setInterval(() => {
       if (closing) return;
       try {
@@ -122,11 +130,11 @@ export async function buildApp(options: {
   registerWorkMigrations(app, { db, dataDir, limits, requireRead, notify: () => changes.notify() });
   registerWorkMigrationCopy(app, { db, dataDir, limits, notify: () => changes.notify() });
   registerChapterNumberReconciliation(app, { db, dataDir, requireRead, notify: () => changes.notify() });
-  registerCatalog(app, { db, dataDir, requireRead, catalogSchema });
+  registerCatalog(app, { db, dataDir, limits, requireRead, catalogSchema });
   registerReadingState(app, db);
   registerUserState(app, db, options.userStateMaintenance?.now ? { now: options.userStateMaintenance.now } : undefined);
   await registerDeviceBackups(app, db, deviceBackups);
-  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateRetentionVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, changeOverrideCursorVersion: { type: 'integer' }, workDeleteIdentityCheckVersion: { type: 'integer' }, workCatalogSummaryVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateRetentionVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, changeOverrideCursorVersion: 1, workDeleteIdentityCheckVersion: 1, workCatalogSummaryVersion: 1, anonymousRead }));
+  app.get('/api/v1/capabilities', { schema: { response: { 200: { type: 'object', properties: { apiVersion: { type: 'integer' }, packageVersion: { type: 'integer' }, authentication: string, personalStateSync: { type: 'boolean' }, readingStateVersion: { type: 'integer' }, userStateVersion: { type: 'integer' }, userStateBulkVersion: { type: 'integer' }, userStateOpaqueIdentityVersion: { type: 'integer' }, userStateRetentionVersion: { type: 'integer' }, deviceBackupVersion: { type: 'integer' }, workMigrationVersion: { type: 'integer' }, workMigrationReconcileVersion: { type: 'integer' }, workCoverDeletionVersion: { type: 'integer' }, workMigrationLineageVersion: { type: 'integer' }, workMigrationCopyVersion: { type: 'integer' }, chapterNumberReconciliationVersion: { type: 'integer' }, chapterNumberMappingsVersion: { type: 'integer' }, workOverrideVersion: { type: 'integer' }, workOverrideCoverVersion: { type: 'integer' }, changeOverrideCursorVersion: { type: 'integer' }, workDeleteIdentityCheckVersion: { type: 'integer' }, workCatalogSummaryVersion: { type: 'integer' }, chapterDigestVersion: { type: 'integer' }, anonymousRead: { type: 'boolean' } } } } } }, async () => ({ apiVersion: 1, packageVersion: 1, authentication: 'device-key', personalStateSync: true, readingStateVersion: 1, userStateVersion: 1, userStateBulkVersion: 1, userStateOpaqueIdentityVersion: 1, userStateRetentionVersion: 1, deviceBackupVersion: 1, workMigrationVersion: 1, workMigrationReconcileVersion: 1, workCoverDeletionVersion: 1, workMigrationLineageVersion: 1, workMigrationCopyVersion: 1, chapterNumberReconciliationVersion: 1, chapterNumberMappingsVersion: 1, workOverrideVersion: 1, workOverrideCoverVersion: 1, changeOverrideCursorVersion: 1, workDeleteIdentityCheckVersion: 1, workCatalogSummaryVersion: 1, chapterDigestVersion: 1, anonymousRead }));
   app.get('/api/v1/openapi.json', { schema: { hide: true } }, async () => app.swagger());
   app.post<{ Body: { password: string } }>('/api/v1/console-sessions', { config: { rateLimit: { max: 10 } }, schema: { body: { type: 'object', additionalProperties: false, required: ['password'], properties: { password: { type: 'string', minLength: 1, maxLength: 1024 } } }, response: { 200: { type: 'object', properties: { token: string } } } } }, async (request, reply) => {
     reply.header('Cache-Control', 'no-store');

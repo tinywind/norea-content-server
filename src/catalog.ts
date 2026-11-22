@@ -4,8 +4,9 @@ import type { DatabaseSync } from 'node:sqlite';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { problem } from './db.ts';
 import { authenticate } from './auth.ts';
+import { chapterPayloadHash, inspectChapterInventory } from './chapter-inventory.ts';
 import { availableChapter, digest } from './packages.ts';
-import type { CatalogEntry } from './packages.ts';
+import type { CatalogEntry, Limits } from './packages.ts';
 import { applyWorkOverrideToNovel, overrideCoverBytes, overrideCoverBytesForWork, parseWorkOverride, type WorkOverrideV1 } from './work-overrides.ts';
 import { readWorkCover, NOVEL_STATUS_VALUES, type NovelMetadataV1, type WorkEntry } from './works.ts';
 
@@ -24,6 +25,10 @@ const identityText = { type: 'string', minLength: 1, maxLength: 4096 };
 const count = { type: 'integer', minimum: 0 };
 const chapterSummarySchema = { type: 'object', required: ['id', 'chapterPath', 'position', 'name', 'chapterNumber', 'page', 'contentType', 'complete'], properties: {
   id: text, chapterPath: text, position: { type: 'number' }, name: text, chapterNumber: nullableText, page: text, contentType: { type: 'string', enum: ['html', 'text', 'markdown', 'pdf', 'epub'] }, complete: { type: 'boolean' },
+} };
+const chapterDigestSchema = { type: 'object', required: ['id', 'revision', 'chapterPath', 'chapterNumber', 'position', 'complete', 'payloadHash', 'bodySha256', 'bodyBytes'], properties: {
+  id: text, revision: text, chapterPath: text, chapterNumber: nullableText, position: { type: 'number' }, complete: { type: 'boolean' },
+  payloadHash: nullableText, bodySha256: nullableText, bodyBytes: { type: ['integer', 'null'], minimum: 0 }, error: text,
 } };
 const chapterChangeSchema = { type: 'object', required: ['identity', 'complete', 'deleted', 'sequence'], properties: {
   identity: { type: 'object', required: ['pluginId', 'novelId', 'novelPath', 'chapterPath'], properties: { pluginId: text, novelId: text, novelPath: text, chapterPath: text } },
@@ -81,8 +86,8 @@ function summarizeWork(dataDir: string, row: SummaryRow): WorkSummary {
   };
 }
 
-export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
-  const { db, dataDir, requireRead, catalogSchema } = context;
+export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSync; dataDir: string; limits: Limits; requireRead: (request: FastifyRequest) => void; catalogSchema: object }): void {
+  const { db, dataDir, limits, requireRead, catalogSchema } = context;
   app.get<{ Params: { id: string }; Querystring: { search: string; offset: number; limit: number } }>('/api/v1/admin/works/:id/chapters', { schema: {
     security: [{ bearerAuth: [] }],
     description: 'List the saved work chapter catalog with an available server copy when present. Missing or deleted bodies retain their catalog titles and have a null entry. Available files absent from the catalog remain visible.',
@@ -201,6 +206,95 @@ export function registerCatalog(app: FastifyInstance, context: { db: DatabaseSyn
       json_extract(entry,'$.manifest.chapter.chapterNumber') AS chapterNumber,json_extract(entry,'$.manifest.chapter.page') AS page,json_extract(entry,'$.manifest.chapter.contentType') AS contentType,json_extract(entry,'$.complete') AS complete
       FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL ORDER BY json_extract(entry,'$.manifest.chapter.position'),id LIMIT ? OFFSET ?`).all(id, limit, offset);
     return { items: items.map(item => ({ ...item, complete: Boolean(item.complete), name: titles[String(Number(item.chapterNumber))] ?? item.name })), total, hasMore: offset + items.length < total };
+  });
+  app.get<{ Params: { id: string }; Querystring: { offset: number; limit: number } }>('/api/v1/catalog/works/:id/chapter-digests', { schema: {
+    security,
+    description: 'Page precomputed chapter payload digests for a work ordered by position, then ID. Missing digests are inspected on demand and persisted.',
+    params: workParams,
+    querystring: { type: 'object', additionalProperties: false, properties: { offset: { ...count, maximum: Number.MAX_SAFE_INTEGER, default: 0 }, limit: { type: 'integer', minimum: 1, maximum: 5000, default: 2000 } } },
+    response: { 200: pageSchema(chapterDigestSchema) },
+  } }, async (request, reply) => {
+    requireRead(request);
+    reply.header('Cache-Control', 'no-store');
+    const { id } = request.params;
+    const { offset, limit } = request.query;
+    const work = db.prepare('SELECT 1 FROM works WHERE id=?').get(id);
+    if (!work && !db.prepare('SELECT 1 FROM chapters WHERE work_id=? LIMIT 1').get(id)) throw problem(404, 'Work not found');
+    const total = (db.prepare('SELECT COUNT(*) AS n FROM chapters WHERE work_id=? AND deleted_at IS NULL AND path IS NOT NULL').get(id) as { n: number }).n;
+    const rows = db.prepare(`SELECT c.id,
+      json_extract(c.entry, '$.revision') AS revision,
+      json_extract(c.entry, '$.manifest.identity.chapterPath') AS chapterPath,
+      json_extract(c.entry, '$.manifest.chapter.chapterNumber') AS chapterNumber,
+      json_extract(c.entry, '$.manifest.chapter.position') AS position,
+      json_extract(c.entry, '$.complete') AS complete,
+      d.payload_hash AS payloadHash,
+      d.body_sha256 AS bodySha256,
+      d.body_bytes AS bodyBytes
+      FROM chapters c
+      LEFT JOIN chapter_inventory_digests d
+        ON d.chapter_id = c.id AND d.revision = json_extract(c.entry, '$.revision')
+      WHERE c.work_id = ? AND c.deleted_at IS NULL AND c.path IS NOT NULL
+      ORDER BY json_extract(c.entry, '$.manifest.chapter.position'), c.id
+      LIMIT ? OFFSET ?`).all(id, limit, offset) as {
+        id: string;
+        revision: string;
+        chapterPath: string;
+        chapterNumber: string | null;
+        position: number;
+        complete: number;
+        payloadHash: string | null;
+        bodySha256: string | null;
+        bodyBytes: number | null;
+      }[];
+    const items = rows.map(row => ({
+      id: row.id,
+      revision: row.revision,
+      chapterPath: row.chapterPath,
+      chapterNumber: row.chapterNumber,
+      position: row.position,
+      complete: Boolean(row.complete),
+      payloadHash: row.payloadHash,
+      bodySha256: row.bodySha256,
+      bodyBytes: row.bodyBytes,
+      error: undefined as string | undefined,
+    }));
+    const missing = items.filter(item => item.payloadHash === null);
+    if (missing.length > 0) {
+      const controller = new AbortController();
+      const onClose = () => { if (!reply.raw.writableEnded) controller.abort(); };
+      reply.raw.once('close', onClose);
+      try {
+        let cursor = 0;
+        const worker = async () => {
+          while (cursor < missing.length && !controller.signal.aborted) {
+            const item = missing[cursor++];
+            try {
+              const inspected = await inspectChapterInventory(db, dataDir, item.id, item.revision, limits, false, {
+                signal: controller.signal,
+                queue: true,
+              });
+              if (inspected.inventory.body) {
+                item.payloadHash = chapterPayloadHash(inspected.inventory);
+                item.bodySha256 = inspected.inventory.body.sha256;
+                item.bodyBytes = inspected.inventory.body.bytes;
+              }
+            } catch (error) {
+              if (controller.signal.aborted) return;
+              item.error = error instanceof Error ? error.message : String(error);
+            }
+          }
+        };
+        const concurrency = Math.min(2, missing.length);
+        await Promise.all(Array.from({ length: concurrency }, worker));
+      } finally {
+        reply.raw.off('close', onClose);
+      }
+    }
+    return {
+      items: items.map(({ error, ...rest }) => error === undefined ? rest : { ...rest, error }),
+      total,
+      hasMore: offset + items.length < total,
+    };
   });
   app.get<{ Querystring: { pluginId: string; novelPath: string; chapterPath: string; chapterNumber?: string; includeUnavailable?: boolean } }>('/api/v1/catalog/chapter', { schema: {
     security,

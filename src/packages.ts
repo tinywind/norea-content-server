@@ -9,6 +9,7 @@ import { workChangeCursor } from './changes.ts';
 import { problem, transaction } from './db.ts';
 export { safeArchivePath } from './archive-path.ts';
 import { assertChapterNumberReconciliationReady, canonicalChapterManifest, canonicalChapterNumber, chapterIdentityId } from './chapter-number-mappings.ts';
+import { chapterStorageSignatureSync, deleteChapterInventoryDigest, saveChapterInventoryDigest, type Inventory } from './chapter-inventory.ts';
 
 export interface PackageManifest {
   packageVersion: 1;
@@ -217,7 +218,7 @@ export function uploadCursor(db: DatabaseSync): { catalog: number; works: number
   return { catalog, works: workChangeCursor(db) };
 }
 
-export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete', verifyCommit?: () => void): CatalogEntry {
+export function publishChapter(db: DatabaseSync, dataDir: string, source: string, entry: CatalogEntry, startedAt: ReturnType<typeof uploadCursor>, imported = false, conflictPolicy: ChapterConflictPolicy = 'prefer-complete', verifyCommit?: () => void, precomputedInventory?: Inventory): CatalogEntry {
   if (!imported && (entry.manifest.identity.pluginId === 'local' || entry.manifest.novel.isLocal)) {
     throw problem(400, 'Local chapters cannot be uploaded to the content server');
   }
@@ -291,13 +292,33 @@ export function publishChapter(db: DatabaseSync, dataDir: string, source: string
         }
       }
       db.prepare('INSERT INTO chapters(id,work_id,entry,directory,path) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET entry=excluded.entry,path=excluded.path,deleted_at=NULL').run(id, work, JSON.stringify(entry), directory, directory);
-      return recordEntry(db, entry);
+      const savedEntry = recordEntry(db, entry);
+      if (precomputedInventory?.body) {
+        try {
+          const storageSignature = chapterStorageSignatureSync(destination, savedEntry.manifest);
+          saveChapterInventoryDigest(db, {
+            chapterId: savedEntry.id,
+            revision: savedEntry.revision,
+            storageSignature,
+            inventory: precomputedInventory,
+          });
+        } catch {
+          deleteChapterInventoryDigest(db, savedEntry.id);
+        }
+      } else {
+        deleteChapterInventoryDigest(db, savedEntry.id);
+      }
+      return savedEntry;
     });
     committed = true;
     return result;
   } finally {
-    if (committed) { if (backup) void removeRetired(backup.to); }
-    else {
+    if (committed) {
+      if (backup) {
+        try { rmSync(backup.to, { recursive: true, force: true }); }
+        catch (error) { console.warn('Failed to remove retired chapter storage:', backup.to, error); }
+      }
+    } else {
       for (const file of retainedFiles) renameSync(file.to, file.from);
       for (const path of addedFiles) renameSync(path, join(source, basename(path)));
       if (publishedPath) renameSync(publishedPath, source);
@@ -329,6 +350,7 @@ export async function deleteChapter(db: DatabaseSync, dataDir: string, id: strin
   };
   const save = () => {
     db.prepare('UPDATE chapters SET path=?,deleted_at=? WHERE id=?').run(moved ? trash : null, Date.now(), id);
+    deleteChapterInventoryDigest(db, id);
     const entry = recordEntry(db, { ...row.catalog, deleted: true });
     db.prepare('INSERT INTO chapter_tombstones VALUES(?,?) ON CONFLICT(chapter_id) DO UPDATE SET sequence=excluded.sequence').run(id, entry.sequence);
     return entry;
@@ -345,10 +367,12 @@ export async function restoreChapter(db: DatabaseSync, dataDir: string, id: stri
   if (!row.catalog.deleted) return row.catalog;
   if (!row.path || !storedFilesExist(dataDir, row.path, row.catalog)) throw problem(410, 'Chapter files are unavailable');
   const { validateMedia } = await import('./chapter-files.ts');
+  const { inspectStagedChapterInventory } = await import('./chapter-inventory.ts');
   const source = chapterStoragePath(dataDir, row.path);
   const destination = chapterStoragePath(dataDir, row.directory);
   const signature = storageSignature(source);
   const complete = await validateMedia(source, row.catalog.manifest, limits);
+  const restoredInventory = await inspectStagedChapterInventory(source, row.catalog.manifest, limits);
   mkdirSync(dirname(destination), { recursive: true });
   return moveChapterStorage(db, source, destination, () => {
     const current = chapterRow(db, id);
@@ -358,7 +382,22 @@ export async function restoreChapter(db: DatabaseSync, dataDir: string, id: stri
     }
   }, () => {
     db.prepare('UPDATE chapters SET path=directory,deleted_at=NULL WHERE id=?').run(id);
-    return recordEntry(db, { ...row.catalog, complete, deleted: false });
+    const restored = recordEntry(db, { ...row.catalog, complete, deleted: false });
+    if (restoredInventory?.body) {
+      try {
+        saveChapterInventoryDigest(db, {
+          chapterId: restored.id,
+          revision: restored.revision,
+          storageSignature: chapterStorageSignatureSync(destination, restored.manifest),
+          inventory: restoredInventory,
+        });
+      } catch {
+        deleteChapterInventoryDigest(db, restored.id);
+      }
+    } else {
+      deleteChapterInventoryDigest(db, restored.id);
+    }
+    return restored;
   });
 }
 
@@ -371,4 +410,5 @@ export function purgeChapter(db: DatabaseSync, dataDir: string, id: string): voi
     rmSync(path, { recursive: true, force: true });
   }
   db.prepare('UPDATE chapters SET path=NULL WHERE id=?').run(id);
+  deleteChapterInventoryDigest(db, id);
 }
