@@ -415,33 +415,43 @@ test('upgrades legacy completed overrides in SQLite and override.json on server 
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
-test('filters browsed works by completion, letting a set override decide over the plugin status', async () => {
+test('filters browsed works by canonical status, letting a set override decide over the plugin status', async () => {
   const f = await fixture(false, ['Ongoing', 'Marked', 'Unmarked', 'Cleared']);
   try {
-    for (const [novelId, status] of [['Plugin', 'Completed'], ['Finished', 'Publishing Finished'],
-      ['Hiatus', 'On Hiatus'], ['Cancelled', 'Cancelled'], ['Licensed', 'Licensed'], ['Unknown', 'Unknown'],
+    for (const [novelId, status] of [['Plugin', 'Completed'],
+      ['Hiatus', 'On Hiatus'], ['Cancelled', 'Cancelled'],
       ['Unmarked', 'Completed'], ['Cleared', 'Completed'], ['Void', null]] as const) {
       const saved = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId(novelId), headers: f.headers, payload: { ...metadata(novelId), novel: { ...metadata(novelId).novel, status } } });
       assert.equal(saved.statusCode, 200, saved.body);
     }
-    for (const invalidStatus of ['완결', 'completed', 'ongoing']) {
+    for (const invalidStatus of ['Unknown', 'Licensed', 'Publishing Finished', '완결', 'completed', 'ongoing']) {
       const rejected = await f.app.inject({ method: 'PUT', url: '/api/v1/works/' + workId('Invalid_' + invalidStatus), headers: f.headers, payload: { ...metadata('Invalid'), novel: { ...metadata('Invalid').novel, status: invalidStatus } } });
       assert.equal(rejected.statusCode, 400, rejected.body);
       assert.match(rejected.body, /invalid novel status/);
+      const rejectedOverride = await f.put(override(statusField(invalidStatus, 5), 'Ongoing'), 'Ongoing');
+      assert.equal(rejectedOverride.statusCode, 400, rejectedOverride.body);
     }
     for (const [novelId, value] of [['Marked', true], ['Unmarked', false], ['Cleared', null]] as const) {
       assert.equal((await f.put(override(completed(value, 5), novelId), novelId)).statusCode, 200);
     }
-    const names = async (completion: string) => {
-      const response = await f.app.inject({ url: '/api/v1/catalog/works?completion=' + completion, headers: f.headers });
+    assert.equal((await f.put(override(statusField('Cancelled', 6), 'Hiatus'), 'Hiatus')).statusCode, 200);
+    const names = async (statuses: string[]) => {
+      const params = new URLSearchParams();
+      for (const status of statuses) params.append('status', status);
+      const response = await f.app.inject({ url: '/api/v1/catalog/works?' + params.toString(), headers: f.headers });
       assert.equal(response.statusCode, 200, response.body);
       const page = response.json();
       assert.equal(page.total, page.items.length);
       return page.items.map((item: { novel: { name: string } }) => item.novel.name);
     };
-    assert.deepEqual(await names('completed'), ['Cleared', 'Marked', 'Plugin']);
-    assert.deepEqual(await names('ongoing'), ['Cancelled', 'Finished', 'Hiatus', 'Licensed', 'Ongoing', 'Unknown', 'Unmarked', 'Void']);
-    assert.equal((await f.app.inject({ url: '/api/v1/catalog/works?completion=done', headers: f.headers })).statusCode, 400);
+    assert.deepEqual(await names(['Completed']), ['Cleared', 'Marked', 'Plugin']);
+    assert.deepEqual(await names(['Ongoing']), ['Ongoing', 'Unmarked', 'Void']);
+    assert.deepEqual(await names(['Cancelled']), ['Cancelled', 'Hiatus']);
+    assert.deepEqual(await names(['On Hiatus']), []);
+    assert.deepEqual(await names(['Completed', 'Cancelled']), ['Cancelled', 'Cleared', 'Hiatus', 'Marked', 'Plugin']);
+    for (const bad of ['status=Unknown', 'status=Licensed', 'status=Publishing+Finished', 'status=done', 'completion=completed']) {
+      assert.equal((await f.app.inject({ url: '/api/v1/catalog/works?' + bad, headers: f.headers })).statusCode, 400, bad);
+    }
   } finally { await f.close(); }
 });
 

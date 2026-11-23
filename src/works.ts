@@ -19,11 +19,8 @@ import { readVerifiedRegularFileSync } from './secure-files.ts';
 import { applyWorkOverrideToNovel, overrideCoverBytes, overrideCoverBytesForWork, parseWorkOverride, type WorkOverrideV1 } from './work-overrides.ts';
 
 export const NOVEL_STATUS_VALUES = [
-  'Unknown',
   'Ongoing',
   'Completed',
-  'Licensed',
-  'Publishing Finished',
   'Cancelled',
   'On Hiatus',
 ] as const;

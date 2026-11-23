@@ -491,7 +491,7 @@ test('accepts canonical NovelStatus values and null while rejecting non-canonica
   const f = await fixture();
   try {
     const base = metadata();
-    for (const status of ['Completed', 'Ongoing', 'On Hiatus', 'Cancelled', 'Publishing Finished', 'Licensed', 'Unknown', null] as const) {
+    for (const status of ['Completed', 'Ongoing', 'On Hiatus', 'Cancelled', null] as const) {
       const novelPath = `/books/status/${status ?? 'null'}`;
       const workId = digest(JSON.stringify(['example', novelPath]));
       const put = await f.app.inject({
@@ -506,7 +506,7 @@ test('accepts canonical NovelStatus values and null while rejecting non-canonica
       assert.equal(get.json().metadata.novel.status, status);
     }
 
-    for (const invalidStatus of ['ongoing', 'completed', '완결', '연재중', '휴재', '', 'Unknown Status']) {
+    for (const invalidStatus of ['Unknown', 'Licensed', 'Publishing Finished', 'ongoing', 'completed', '완결', '연재중', '휴재', '', 'Unknown Status']) {
       const workId = digest(JSON.stringify(['example', `/books/invalid/${invalidStatus}`]));
       const put = await f.app.inject({
         method: 'PUT',

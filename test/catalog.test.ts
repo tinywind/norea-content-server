@@ -251,7 +251,7 @@ test('catalog reads follow anonymous, invalid-key and blocked-device policies an
     const work = metadata('source-a', 'Alpha'); const stored = await f.putWork(work);
     await f.putChapter(work, '/chapter/one', 1);
     const query = new URLSearchParams({ ...work.identity, chapterPath: '/chapter/one' });
-    const routes = ['/api/v1/catalog/changes', '/api/v1/catalog/works', '/api/v1/catalog/sources', `/api/v1/catalog/works/${stored.id}/chapters`, `/api/v1/catalog/chapter?${query}`];
+    const routes = ['/api/v1/catalog/changes', '/api/v1/catalog/works', '/api/v1/catalog/sources', '/api/v1/catalog/filters', `/api/v1/catalog/works/${stored.id}/chapters`, `/api/v1/catalog/chapter?${query}`];
     for (const url of routes) {
       assert.equal((await f.app.inject(url)).statusCode, 401);
       assert.equal((await f.app.inject({ url, headers: f.headers })).statusCode, 200);
@@ -272,7 +272,7 @@ test('catalog reads follow anonymous, invalid-key and blocked-device policies an
     const chapterSummary = schema.paths['/api/v1/catalog/works/{id}/chapters'].get.responses['200'].content['application/json'].schema.properties.items.items;
     assert.equal(chapterSummary.properties.complete.type, 'boolean');
     assert.ok(chapterSummary.required.includes('complete'));
-    for (const path of ['/api/v1/catalog/changes', '/api/v1/catalog/works', '/api/v1/catalog/sources', '/api/v1/catalog/works/{id}/chapters', '/api/v1/catalog/chapter']) assert.ok(schema.paths[path].get.responses['200'].content['application/json'].schema);
+    for (const path of ['/api/v1/catalog/changes', '/api/v1/catalog/works', '/api/v1/catalog/sources', '/api/v1/catalog/filters', '/api/v1/catalog/works/{id}/chapters', '/api/v1/catalog/chapter']) assert.ok(schema.paths[path].get.responses['200'].content['application/json'].schema);
   } finally { await f.close(); }
 });
 
@@ -327,5 +327,140 @@ test('default work pages stay bounded and the current schema provides browsing i
       }
       assert.equal((db.prepare('SELECT COUNT(*) AS n FROM works').get() as { n: number }).n, 42);
     } finally { db.close(); }
+  } finally { await f.close(); }
+});
+
+test('filters catalog works and facets by canonical status, user categories, uncategorized, and tags', async () => {
+  const f = await fixture(true);
+  try {
+    const mk = (pluginId: string, name: string, status: NovelMetadataV1['novel']['status'], genres: string | null): NovelMetadataV1 => ({
+      ...metadata(pluginId, name),
+      novel: { ...metadata(pluginId, name).novel, status, genres },
+    });
+    const alpha = mk('source-a', 'Alpha', 'Ongoing', 'Fantasy, Action, #Magic');
+    const beta = mk('source-a', 'Beta', 'Completed', 'Fantasy | Drama');
+    const gamma = mk('source-b', 'Gamma', 'On Hiatus', 'Drama, Sci-Fi');
+    const delta = mk('source-b', 'Delta', 'Cancelled', null);
+    const epsilon = mk('source-b', 'Epsilon', null, 'Action');
+    for (const work of [alpha, beta, gamma, delta, epsilon]) await f.putWork(work);
+
+    // Override Delta's genres to verify override genres participate in tag filtering and facets.
+    const deltaId = digest(JSON.stringify([delta.identity.pluginId, delta.identity.novelPath]));
+    const overrideRes = await f.app.inject({
+      method: 'PUT',
+      url: `/api/v1/works/${deltaId}/override`,
+      headers: f.headers,
+      payload: { schemaVersion: 1, identity: delta.identity, fields: { genres: { value: 'Fantasy, Mystery', updatedAt: 100 } } },
+    });
+    assert.equal(overrideRes.statusCode, 200, overrideRes.body);
+
+    // Populate shared user-state categories & memberships (including a deleted category and an empty category).
+    const workspace = (await f.app.inject({ url: '/api/v1/user-state', headers: f.headers })).json() as { workspaceId: string; epoch: string };
+    const merge = async (operations: unknown[]) => {
+      const response = await f.app.inject({
+        method: 'POST',
+        url: '/api/v1/user-state/merge',
+        headers: f.headers,
+        payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, operations },
+      });
+      assert.equal(response.statusCode, 200, response.body);
+      return response.json();
+    };
+    await merge([
+      { operationId: 'cat-reading', entity: { kind: 'category', categoryId: 'cat-reading' }, baseRevision: 0, value: { name: 'Reading', sort: 0, deleted: false } },
+      { operationId: 'cat-done', entity: { kind: 'category', categoryId: 'cat-done' }, baseRevision: 0, value: { name: 'Done', sort: 1, deleted: false } },
+      { operationId: 'cat-empty', entity: { kind: 'category', categoryId: 'cat-empty' }, baseRevision: 0, value: { name: 'Empty', sort: 2, deleted: false } },
+      { operationId: 'cat-deleted', entity: { kind: 'category', categoryId: 'cat-deleted' }, baseRevision: 0, value: { name: 'Deleted', sort: 3, deleted: false } },
+    ]);
+    await merge([
+      { operationId: 'cat-alias', entity: { kind: 'category', categoryId: 'cat-reading-alias' }, baseRevision: 0, value: { name: 'Reading', sort: 0, deleted: false } },
+      { operationId: 'm-alpha-id', entity: { kind: 'membership', work: { pluginId: 'source-a', sourceNovelId: 'Alpha', novelPath: '/books/Alpha', name: 'Alpha' }, categoryId: 'cat-reading' }, baseRevision: 0, value: { included: true } },
+      { operationId: 'm-alpha-done', entity: { kind: 'membership', work: { pluginId: 'source-a', sourceNovelId: 'Alpha', novelPath: '/books/Alpha', name: 'Alpha' }, categoryId: 'cat-done' }, baseRevision: 0, value: { included: true } },
+      { operationId: 'm-beta-path', entity: { kind: 'membership', work: { pluginId: 'source-a', sourceNovelId: null, novelPath: '/books/Beta', name: 'Beta' }, categoryId: 'cat-done' }, baseRevision: 0, value: { included: true } },
+      { operationId: 'm-gamma-del', entity: { kind: 'membership', work: { pluginId: 'source-b', sourceNovelId: 'Gamma', novelPath: '/books/Gamma', name: 'Gamma' }, categoryId: 'cat-deleted' }, baseRevision: 0, value: { included: true } },
+    ]);
+    const deletedCategoryRecord = (await f.app.inject({ method: 'POST', url: '/api/v1/user-state/snapshot', headers: f.headers, payload: { workspaceId: workspace.workspaceId, epoch: workspace.epoch, limit: 100 } })).json()
+      .records.find((record: { entity: { kind: string; categoryId?: string } }) => record.entity.kind === 'category' && record.entity.categoryId === 'cat-deleted');
+    await merge([
+      { operationId: 'cat-deleted-rm', entity: { kind: 'category', categoryId: 'cat-deleted' }, baseRevision: deletedCategoryRecord.revision, value: { name: 'Deleted', sort: 3, deleted: true } },
+    ]);
+
+    const workNames = async (query: string, auth = true) => {
+      const response = await f.app.inject({ url: `/api/v1/catalog/works?${query}`, ...(auth ? { headers: f.headers } : {}) });
+      assert.equal(response.statusCode, 200, response.body);
+      const page = response.json();
+      assert.equal(page.total, page.items.length);
+      return page.items.map((item: { novel: { name: string } }) => item.novel.name);
+    };
+
+    // Unfiltered authenticated facets.
+    const allFilters = (await f.app.inject({ url: '/api/v1/catalog/filters', headers: f.headers })).json();
+    assert.deepEqual(allFilters.sources, [{ id: 'source-a', workCount: 2 }, { id: 'source-b', workCount: 3 }]);
+    assert.deepEqual(allFilters.statuses, [
+      { status: 'Ongoing', workCount: 2 },
+      { status: 'Completed', workCount: 1 },
+      { status: 'Cancelled', workCount: 1 },
+      { status: 'On Hiatus', workCount: 1 },
+    ]);
+    assert.deepEqual(allFilters.categories, [
+      { id: 'cat-reading', name: 'Reading', workCount: 1 },
+      { id: 'cat-done', name: 'Done', workCount: 2 },
+      { id: 'cat-empty', name: 'Empty', workCount: 0 },
+    ]);
+    assert.equal(allFilters.uncategorizedCount, 3);
+    assert.deepEqual(allFilters.tags, [
+      { tag: 'Fantasy', workCount: 3 },
+      { tag: 'Action', workCount: 2 },
+      { tag: 'Drama', workCount: 2 },
+      { tag: 'Magic', workCount: 1 },
+      { tag: 'Mystery', workCount: 1 },
+      { tag: 'Sci-Fi', workCount: 1 },
+    ]);
+
+    // Anonymous facet read omits private categories, and anonymous category filter is rejected.
+    const anonFilters = (await f.app.inject('/api/v1/catalog/filters')).json();
+    assert.deepEqual(anonFilters.categories, []);
+    assert.equal(anonFilters.uncategorizedCount, 0);
+    assert.equal(anonFilters.statuses.length, 4);
+    assert.equal((await f.app.inject('/api/v1/catalog/works?category=cat-reading')).statusCode, 401);
+    assert.equal((await f.app.inject('/api/v1/catalog/works?uncategorized=true')).statusCode, 401);
+    assert.equal((await f.app.inject('/api/v1/catalog/filters?category=cat-reading')).statusCode, 401);
+    assert.equal((await f.app.inject('/api/v1/catalog/filters?uncategorized=true')).statusCode, 401);
+
+    // Category filtering (canonical ID, alias ID, multi-select OR, uncategorized, and combination + pagination).
+    assert.deepEqual(await workNames('category=cat-reading'), ['Alpha']);
+    assert.deepEqual(await workNames('category=cat-reading-alias'), ['Alpha']);
+    assert.deepEqual(await workNames('category=cat-done'), ['Alpha', 'Beta']);
+    assert.deepEqual(await workNames('uncategorized=true'), ['Delta', 'Epsilon', 'Gamma']);
+    assert.deepEqual(await workNames('category=cat-reading&uncategorized=true'), ['Alpha', 'Delta', 'Epsilon', 'Gamma']);
+    const pagedUncat = (await f.app.inject({ url: '/api/v1/catalog/works?uncategorized=true&offset=1&limit=1', headers: f.headers })).json();
+    assert.equal(pagedUncat.total, 3);
+    assert.equal(pagedUncat.hasMore, true);
+    assert.deepEqual(pagedUncat.items.map((item: { novel: { name: string } }) => item.novel.name), ['Epsilon']);
+
+    // Tag filtering (AND semantics, case-insensitive, leading #, override genres).
+    assert.deepEqual(await workNames('tag=%23fantasy'), ['Alpha', 'Beta', 'Delta']);
+    assert.deepEqual(await workNames('tag=fantasy&tag=action'), ['Alpha']);
+    assert.deepEqual(await workNames('tag=mystery'), ['Delta']);
+
+    // Combined status + category + tag cross-filtered facets.
+    const fantasyFilters = (await f.app.inject({ url: '/api/v1/catalog/filters?tag=fantasy&status=Ongoing', headers: f.headers })).json();
+    assert.deepEqual(fantasyFilters.sources, [{ id: 'source-a', workCount: 1 }]);
+    assert.deepEqual(fantasyFilters.statuses, [
+      { status: 'Ongoing', workCount: 1 },
+      { status: 'Completed', workCount: 1 },
+      { status: 'Cancelled', workCount: 1 },
+    ]);
+    assert.deepEqual(fantasyFilters.categories, [
+      { id: 'cat-reading', name: 'Reading', workCount: 1 },
+      { id: 'cat-done', name: 'Done', workCount: 1 },
+      { id: 'cat-empty', name: 'Empty', workCount: 0 },
+    ]);
+    assert.equal(fantasyFilters.uncategorizedCount, 0);
+    assert.deepEqual(fantasyFilters.tags, [
+      { tag: 'Action', workCount: 1 },
+      { tag: 'Fantasy', workCount: 1 },
+      { tag: 'Magic', workCount: 1 },
+    ]);
   } finally { await f.close(); }
 });

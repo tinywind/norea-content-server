@@ -118,7 +118,7 @@ identity is always that of the work being written.
   `cover.override.<ext>` beside `novel.json` and the untouched source `cover.<ext>`.
   Clearing `fields.cover` removes `cover.override.*` without deleting source
   `cover.<ext>`.
-- `/api/v1/catalog/works`, `/api/v1/catalog/works/:id/cover`,
+- `/api/v1/catalog/works`, `/api/v1/catalog/filters`, `/api/v1/catalog/works/:id/cover`,
   `/api/v1/admin/works`, and `/api/v1/admin/works/:id/cover` reflect active
   work overrides while `/api/v1/works/:id` and `/api/v1/works/:id/cover` remain
   strictly source metadata.
