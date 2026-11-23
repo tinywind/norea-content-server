@@ -14,7 +14,7 @@ env:
   CI: "true"
   IMAGE_NAME: tinywind0/norea-content-server
   LOCAL_IMAGE: norea-content-server-ci:${{ github.sha }}
-  NODE_IMAGE: node:24-bookworm-slim
+  NODE_IMAGE: node:24-trixie-slim
   PYTHON_IMAGE: python:3.14-slim
   PNPM_VERSION: "11.25.0"
 

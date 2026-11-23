@@ -1,4 +1,4 @@
-FROM node:26-bookworm-slim AS build
+FROM node:26-trixie-slim AS build
 WORKDIR /app
 RUN npm install -g pnpm@11.25.0
 COPY package.json pnpm-lock.yaml ./
@@ -7,15 +7,15 @@ COPY tsconfig.web.json ./
 COPY web ./web
 RUN pnpm build && pnpm prune --prod
 
-FROM node:26-bookworm-slim
+FROM node:26-trixie-slim
 WORKDIR /app
-RUN npm install -g pnpm@11.25.0
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/webdist ./webdist
-COPY --from=build /app/web ./web
-COPY package.json ./
-COPY src ./src
-RUN mkdir -p /data/contents /data/staging && chown -R node:node /data
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/* && npm install -g pnpm@11.25.0
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/webdist ./webdist
+COPY --from=build --chown=node:node /app/web ./web
+COPY --chown=node:node package.json ./
+COPY --chown=node:node src ./src
+RUN mkdir -p /data/contents /data/staging && chown -R node:node /data && chmod -R u+rX /app/src /app/web /app/webdist
 USER node
 ENV NOREA_HOST=0.0.0.0 NOREA_PORT=8787 NOREA_DATA_DIR=/data
 EXPOSE 8787
