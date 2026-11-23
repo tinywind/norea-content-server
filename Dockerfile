@@ -1,4 +1,4 @@
-FROM node:26-trixie-slim AS build
+FROM node:26-alpine AS build
 WORKDIR /app
 RUN npm install -g pnpm@11.25.0
 COPY package.json pnpm-lock.yaml ./
@@ -7,9 +7,9 @@ COPY tsconfig.web.json ./
 COPY web ./web
 RUN pnpm build && pnpm prune --prod
 
-FROM node:26-trixie-slim
+FROM node:26-alpine
 WORKDIR /app
-RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/* && npm install -g pnpm@11.25.0
+RUN apk update && apk upgrade --no-cache
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/webdist ./webdist
 COPY --from=build --chown=node:node /app/web ./web
